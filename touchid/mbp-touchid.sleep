@@ -1,0 +1,37 @@
+#!/bin/bash
+# systemd-sleep hook (/usr/lib/systemd/system-sleep/mbp-touchid): the T1Bridge
+# keybag relay loses its SEP link in every S3 and exits on resume; systemd
+# brings it back after RestartSec=2 with RestartSteps up to 60 s, and the
+# counter is never reset within a boot. Until the relay is active the broker
+# fails each verify at once (RelayInactive), so the lock screen burns its
+# 3 pam_fprintd tries in the first seconds after wake (2026-10-25: 3 failures
+# in 5 s, relay back after 7 s). On post: restart a failed relay at once (a
+# manual restart also resets the counter) and wait for it to be ready; logind
+# sends PrepareForSleep(false), which resumes fprintd's verify, only after the
+# hooks. A relay the broker stopped itself (inactive, SEP leased) is left alone.
+U=t1bridge-keybag.service
+log() { logger -t mbp-touchid "$*"; }
+state() { systemctl show -P ActiveState,SubState $U | paste -sd/; }
+[[ $1 == post ]] || exit 0
+# the unit is not enabled (started on demand); same condition as the unit
+[[ -e /var/lib/t1bridge/touch-id/keybag.state ]] || exit 0
+# the relay normally fails before the hooks run; give it 2 s if not yet
+for ((i = 0; i < 20; i++)); do
+	s=$(state)
+	case $s in
+	failed/* | */auto-restart*) break ;;
+	active/running) sleep 0.1 ;;
+	*) log "post: relay $s, left alone"; exit 0 ;;
+	esac
+done
+case $s in
+failed/* | */auto-restart*)
+	t0=$(date +%s%N)
+	if timeout 15 systemctl restart $U; then
+		log "post: relay was $s, restarted in $(( ($(date +%s%N) - t0) / 1000000 )) ms"
+	else
+		log "post: relay was $s, restart failed ($(state))"
+	fi ;;
+*) log "post: relay $s after 2 s" ;;
+esac
+exit 0

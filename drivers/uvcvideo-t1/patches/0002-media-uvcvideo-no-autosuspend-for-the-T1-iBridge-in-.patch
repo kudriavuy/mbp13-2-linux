@@ -1,0 +1,47 @@
+From e172350667b40b44bf08ed28b0faba1eb163ed47 Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 15:47:58 +0200
+Subject: [PATCH] media: uvcvideo: no autosuspend for the T1 iBridge in
+ configuration 2
+
+The T1 iBridge is a composite device: camera, Touch Bar display and
+digitizer, private network link and Secure Enclave transport. In USB
+configuration 2 (as macOS uses it) enabling autosuspend from the UVC probe
+changes power policy for all of them. Configuration 1 (camera, Touch Bar
+keys, ambient light) keeps the upstream behaviour.
+
+Same intent as t1bridge's 0002 (Andrew Boyd), which sets the quirk for the
+device in every configuration.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: Linux drivers/media/usb/uvc (https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git)
+---
+ drivers/media/usb/uvc/uvc_driver.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/media/usb/uvc/uvc_driver.c b/drivers/media/usb/uvc/uvc_driver.c
+index 22b1c30..0496d13 100644
+--- a/drivers/media/usb/uvc/uvc_driver.c
++++ b/drivers/media/usb/uvc/uvc_driver.c
+@@ -2441,6 +2441,17 @@ static int uvc_probe(struct usb_interface *intf,
+ 	if (dev->quirks & UVC_QUIRK_NO_RESET_RESUME)
+ 		udev->quirks &= ~USB_QUIRK_RESET_RESUME;
+ 
++	/*
++	 * The Apple T1 iBridge (05ac:8600) is one USB device for the camera,
++	 * Touch Bar, network link and Secure Enclave. In configuration 2 (the
++	 * one macOS uses) autosuspend from this probe would suspend the other
++	 * functions too; configuration 1 keeps the usual behaviour.
++	 */
++	if (le16_to_cpu(udev->descriptor.idVendor) == 0x05ac &&
++	    le16_to_cpu(udev->descriptor.idProduct) == 0x8600 &&
++	    udev->actconfig && udev->actconfig->desc.bConfigurationValue == 2)
++		dev->quirks |= UVC_QUIRK_DISABLE_AUTOSUSPEND;
++
+ 	if (!(dev->quirks & UVC_QUIRK_DISABLE_AUTOSUSPEND))
+ 		usb_enable_autosuspend(udev);
+ 
+-- 
+2.53.0
+

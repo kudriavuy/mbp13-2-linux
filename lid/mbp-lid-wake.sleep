@@ -1,0 +1,27 @@
+#!/bin/bash
+# systemd-sleep hook (/usr/lib/systemd/system-sleep/mbp-lid-wake): a sleep
+# begun with the lid OPEN would end at once, since the lid wake (LID0, GPE
+# 0x6F) fires on the "open" level, not on the opening: then turn the lid wake
+# off for that sleep and back on after. With the lid closed nothing changes,
+# opening it wakes the Mac as before. Power button and keyboard wake either
+# way (tested 2026-10-22). In a sleep begun open, closing and reopening the
+# lid does not wake it: use the power button or a key.
+M=/run/mbp-lid-wake
+W=/proc/acpi/wakeup
+log() { logger -t mbp-lid-wake "$*"; }
+lid_wake() { awk '$1 == "LID0" {print $3}' $W; }	# *enabled / *disabled
+case $1 in
+pre)
+	rm -f $M
+	[[ $(awk '{print $2}' /proc/acpi/button/lid/LID0/state) == open ]] || exit 0
+	[[ $(lid_wake) == '*enabled' ]] || exit 0
+	echo LID0 > $W	# toggles
+	[[ $(lid_wake) == '*disabled' ]] && touch $M
+	log "pre: lid open, lid wake off for this sleep" ;;
+post)
+	[[ -e $M ]] || exit 0
+	rm -f $M
+	[[ $(lid_wake) == '*disabled' ]] && echo LID0 > $W
+	log "post: lid wake $(lid_wake)" ;;
+esac
+exit 0

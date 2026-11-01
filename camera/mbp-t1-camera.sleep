@@ -1,0 +1,20 @@
+#!/bin/bash
+# systemd-sleep hook (/usr/lib/systemd/system-sleep/mbp-t1-camera): stop the
+# T1 camera before a sleep (no ffmpeg reading a suspended device) and let
+# mbp-t1-camera resume it afterwards. Nothing when the service is off.
+U=mbp-t1-camera.service
+systemctl -q is-active "$U" || exit 0
+case $1 in
+pre)
+	# only when the camera runs
+	cg=/sys/fs/cgroup$(systemctl show -p ControlGroup --value "$U")
+	running() { grep -qx ffmpeg <(for p in $(cat "$cg/cgroup.procs" 2>/dev/null); do cat /proc/$p/comm 2>/dev/null; done); }
+	running || exit 0
+	systemctl kill -s USR1 --kill-whom=main "$U"
+	# wait (at most 2 s) until no ffmpeg is left in the service's cgroup
+	for _ in $(seq 20); do running || break; sleep 0.1; done
+	logger -t mbp-t1-camera "sleep hook: camera stopped" ;;
+post)
+	systemctl kill -s USR2 --kill-whom=main "$U" ;;
+esac
+exit 0

@@ -1,0 +1,711 @@
+From d125300aea501d52cc94690bacd87d9ab342311c Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 21:00:07 +0100
+Subject: [PATCH] macOS-like slider, joined keys, keys without a box, render
+ timing
+
+The slider now looks like the macOS one: a capsule (SliderWidth, default
+720 px) that ends where the button that opened it starts, with a low and a
+high icon (SliderIconLow / SliderIconHigh of that button) around an 8 px
+track, filled in SliderFillColor up to a white key-high knob, and a round
+light-grey close button in the button's place; the rest of the bar goes
+dark, and a touch outside the capsule closes it. While the knob moves only
+the capsule is sent to the panel.
+
+Joined = true draws a button as one capsule with the one before it:
+JoinedSpacing apart, the gap in SeparatorColor, only the outer corners
+round (the collapsed Control Strip). Background = false leaves out the box
+and draws only the icon.
+
+TINY_DFR_RENDER_BENCH=<n> with TINY_DFR_RENDER_PNG times n frames of full
+rows, a pressed key and the slider (drawing and the copy to a frame buffer,
+not the USB transfer).
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ share/tiny-dfr/config.toml |  14 +++
+ src/config.rs              |  24 +++++
+ src/main.rs                | 202 ++++++++++++++++++++++++++-----------
+ src/slider.rs              | 138 +++++++++++++++----------
+ 4 files changed, 265 insertions(+), 113 deletions(-)
+
+diff --git a/share/tiny-dfr/config.toml b/share/tiny-dfr/config.toml
+index e0bb262..fc15d2c 100644
+--- a/share/tiny-dfr/config.toml
++++ b/share/tiny-dfr/config.toml
+@@ -57,6 +57,20 @@ FontTemplate = ":bold"
+ # start from is read from /run/tiny-dfr/bridge/volume); without a helper the
+ # slider sends VolumeUp/Down or BrightnessUp/Down, one per 5 % of the track.
+ # SliderTimeout = 3000
++# SliderWidth = 720                # the slider's capsule ends where its button
++#                                  # starts; a round close button takes the
++#                                  # button's place and the rest goes dark
++# SliderFillColor = "#3880d1"      # track up to the knob
++# SliderTrackColor = "#737373"     # track after it
++# Per slider button: SliderIconLow / SliderIconHigh (same Theme) left and right
++# of the track; without them the button's own icon is shown right of it.
++
++# Joined = true on a button: one capsule with the button before it, JoinedSpacing
++# px apart (default ButtonSpacing) and that gap in SeparatorColor (default
++# "#2b2b2b"); only the outer corners are round. Background = false: no box,
++# only the icon (for a round icon such as a close button).
++# SeparatorColor = "#2c2c2c"
++# JoinedSpacing = 4
+ 
+ # Set this to false if you want the brightness of the touchbar
+ # to be set to a static value instead of following the primary
+diff --git a/src/config.rs b/src/config.rs
+index cacbf33..f2dc6d8 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -33,6 +33,11 @@ pub struct Config {
+     pub font_size: f64,
+     pub control_strip_expanded: bool,
+     pub slider_timeout: std::time::Duration,
++    pub separator_color: (f64, f64, f64),
++    pub joined_spacing: f64,
++    pub slider_width: f64,
++    pub slider_fill_color: (f64, f64, f64),
++    pub slider_track_color: (f64, f64, f64),
+ }
+ 
+ /// What a button does inside tiny-dfr instead of (or besides) sending keys
+@@ -73,6 +78,11 @@ struct ConfigProxy {
+     app_layer_keys: Option<Vec<ButtonConfig>>,
+     control_strip_default: Option<String>,
+     slider_timeout: Option<u64>,
++    separator_color: Option<String>,
++    joined_spacing: Option<u32>,
++    slider_width: Option<u32>,
++    slider_fill_color: Option<String>,
++    slider_track_color: Option<String>,
+ }
+ 
+ fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<Key>, D::Error>
+@@ -120,6 +130,10 @@ pub struct ButtonConfig {
+     pub width: Option<u32>,
+     pub group: Option<bool>,
+     pub command: Option<Command>,
++    pub joined: Option<bool>,
++    pub background: Option<bool>,
++    pub slider_icon_low: Option<String>,
++    pub slider_icon_high: Option<String>,
+ }
+ 
+ // "#rrggbb" -> (r, g, b) in 0..1; a bad value keeps the default
+@@ -187,6 +201,11 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 3]) {
+         base.app_layer_keys = user.app_layer_keys.or(base.app_layer_keys);
+         base.control_strip_default = user.control_strip_default.or(base.control_strip_default);
+         base.slider_timeout = user.slider_timeout.or(base.slider_timeout);
++        base.separator_color = user.separator_color.or(base.separator_color);
++        base.joined_spacing = user.joined_spacing.or(base.joined_spacing);
++        base.slider_width = user.slider_width.or(base.slider_width);
++        base.slider_fill_color = user.slider_fill_color.or(base.slider_fill_color);
++        base.slider_track_color = user.slider_track_color.or(base.slider_track_color);
+     };
+     let media_layer_keys = base.media_layer_keys.unwrap();
+     let primary_layer_keys = base.primary_layer_keys.unwrap();
+@@ -252,6 +271,11 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 3]) {
+         font_size: base.font_size.unwrap_or(32) as f64,
+         control_strip_expanded,
+         slider_timeout: std::time::Duration::from_millis(base.slider_timeout.unwrap_or(3000)),
++        separator_color: parse_color("SeparatorColor", base.separator_color, (0.17, 0.17, 0.17)),
++        joined_spacing: base.joined_spacing.or(base.button_spacing).unwrap_or(16) as f64,
++        slider_width: base.slider_width.unwrap_or(720) as f64,
++        slider_fill_color: parse_color("SliderFillColor", base.slider_fill_color, (0.22, 0.5, 0.82)),
++        slider_track_color: parse_color("SliderTrackColor", base.slider_track_color, (0.45, 0.45, 0.45)),
+     };
+     (cfg, layers)
+ }
+diff --git a/src/main.rs b/src/main.rs
+index 78d85e6..8e87521 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -116,6 +116,12 @@ struct Button {
+     // a group gap before this button (Group)
+     group: bool,
+     command: Option<Command>,
++    // drawn as one capsule with the button before it, JoinedSpacing apart
++    joined: bool,
++    // false: no box, only the icon (Background = false)
++    background: bool,
++    // low and high icon of its slider
++    slider_icons: Option<Box<(Button, Button)>>,
+ }
+ 
+ fn try_load_svg(path: &str) -> Result<ButtonImage> {
+@@ -268,10 +274,22 @@ impl Button {
+         let fixed_width = cfg.width.map(f64::from);
+         let group = cfg.group.unwrap_or(false);
+         let command = cfg.command;
++        let joined = cfg.joined.unwrap_or(false);
++        let background = cfg.background.unwrap_or(true);
++        let slider_icons = match (&cfg.slider_icon_low, &cfg.slider_icon_high) {
++            (Some(low), Some(high)) => Some(Box::new((
++                Button::new_icon(low, cfg.theme.clone(), vec![], icon_size, icon_size),
++                Button::new_icon(high, cfg.theme.clone(), vec![], icon_size, icon_size),
++            ))),
++            _ => None,
++        };
+         let mut button = Button::from_image_config(cfg, icon_size);
+         button.fixed_width = fixed_width;
+         button.group = group;
+         button.command = command;
++        button.joined = joined;
++        button.background = background;
++        button.slider_icons = slider_icons;
+         button
+     }
+     fn from_image_config(cfg: ButtonConfig, icon_size: i32) -> Button {
+@@ -308,6 +326,9 @@ impl Button {
+             fixed_width: None,
+             group: false,
+             command: None,
++            joined: false,
++            background: true,
++            slider_icons: None,
+         }
+     }
+     fn new_text(text: String, action: Vec<Key>) -> Button {
+@@ -321,6 +342,9 @@ impl Button {
+             fixed_width: None,
+             group: false,
+             command: None,
++            joined: false,
++            background: true,
++            slider_icons: None,
+         }
+     }
+     fn new_icon(
+@@ -342,6 +366,9 @@ impl Button {
+             fixed_width: None,
+             group: false,
+             command: None,
++            joined: false,
++            background: true,
++            slider_icons: None,
+         }
+     }
+     fn load_battery_image(icon: &str, theme: Option<impl AsRef<str>>) -> Handle {
+@@ -398,6 +425,9 @@ impl Button {
+             fixed_width: None,
+             group: false,
+             command: None,
++            joined: false,
++            background: true,
++            slider_icons: None,
+         }
+     }
+ 
+@@ -428,6 +458,9 @@ impl Button {
+             fixed_width: None,
+             group: false,
+             command: None,
++            joined: false,
++            background: true,
++            slider_icons: None,
+         }
+     }
+     fn needs_faster_refresh(&self) -> bool {
+@@ -618,10 +651,11 @@ impl FunctionLayer {
+     /// widths first, the rest shared by Stretch; Group adds GroupSpacing before
+     /// a button instead of ButtonSpacing. Rounded so that the gaps stay even.
+     fn geometry(&self, config: &Config, width: f64) -> Vec<(f64, f64)> {
+-        let gap = |i: usize, b: &Button| match (i, b.group) {
+-            (0, _) => 0.0,
+-            (_, true) => config.group_spacing,
+-            (_, false) => config.button_spacing,
++        let gap = |i: usize, b: &Button| match (i, b.joined, b.group) {
++            (0, _, _) => 0.0,
++            (_, true, _) => config.joined_spacing,
++            (_, false, true) => config.group_spacing,
++            (_, false, false) => config.button_spacing,
+         };
+         let mut free = width;
+         let mut shares = 0usize;
+@@ -692,10 +726,14 @@ impl FunctionLayer {
+         c.set_font_face(&config.font_face);
+         c.set_font_size(config.font_size);
+ 
++        let joined: Vec<bool> = self.buttons.iter().map(|(_, b)| b.joined).collect();
+         for (i, (_, button)) in self.buttons.iter_mut().enumerate() {
+             if !button.changed && !complete_redraw {
+                 continue;
+             };
++            // in a joined run only the outer corners are round
++            let round_left = !joined[i];
++            let round_right = !joined.get(i + 1).copied().unwrap_or(false);
+ 
+             let left_edge = geometry[i].0 + pixel_shift_x + (pixel_shift_width / 2) as f64;
+             let button_width = geometry[i].1;
+@@ -713,40 +751,35 @@ impl FunctionLayer {
+                 c.rectangle(left_edge, 0.0, button_width, height as f64);
+                 c.fill().unwrap();
+             }
+-            if !matches!(button.image, ButtonImage::Spacer) {
++            if joined[i] && complete_redraw && i > 0 {
++                // the gap to the button before is part of the capsule
++                let (pl, pw) = geometry[i - 1];
++                let gap_left = pl + pw + pixel_shift_x + (pixel_shift_width / 2) as f64;
++                let (r, g, b) = config.separator_color;
++                c.set_source_rgb(r, g, b);
++                c.rectangle(gap_left, bot - radius, left_edge - gap_left, top - bot + radius * 2.0);
++                c.fill().unwrap();
++            }
++            if !matches!(button.image, ButtonImage::Spacer) && button.background {
+                 button.set_background_color(&c, color);
+-                // draw box with rounded corners
++                // draw box with rounded corners (square where joined)
+                 c.new_sub_path();
+                 let left = left_edge + radius;
+                 let right = (left_edge + button_width.ceil()) - radius;
+-                c.arc(
+-                    right,
+-                    bot,
+-                    radius,
+-                    (-90.0f64).to_radians(),
+-                    (0.0f64).to_radians(),
+-                );
+-                c.arc(
+-                    right,
+-                    top,
+-                    radius,
+-                    (0.0f64).to_radians(),
+-                    (90.0f64).to_radians(),
+-                );
+-                c.arc(
+-                    left,
+-                    top,
+-                    radius,
+-                    (90.0f64).to_radians(),
+-                    (180.0f64).to_radians(),
+-                );
+-                c.arc(
+-                    left,
+-                    bot,
+-                    radius,
+-                    (180.0f64).to_radians(),
+-                    (270.0f64).to_radians(),
+-                );
++                if round_right {
++                    c.arc(right, bot, radius, (-90.0f64).to_radians(), (0.0f64).to_radians());
++                    c.arc(right, top, radius, (0.0f64).to_radians(), (90.0f64).to_radians());
++                } else {
++                    c.line_to(right + radius, bot - radius);
++                    c.line_to(right + radius, top + radius);
++                }
++                if round_left {
++                    c.arc(left, top, radius, (90.0f64).to_radians(), (180.0f64).to_radians());
++                    c.arc(left, bot, radius, (180.0f64).to_radians(), (270.0f64).to_radians());
++                } else {
++                    c.line_to(left - radius, top + radius);
++                    c.line_to(left - radius, bot - radius);
++                }
+                 c.close_path();
+                 c.fill().unwrap();
+             }
+@@ -887,7 +920,7 @@ fn render_preview(path: &std::ffi::OsStr) {
+             rows.push((ROW_STRIP_COLLAPSED, None, Some(s)));
+         }
+     }
+-    let bar = ImageSurface::create(Format::ARgb32, height as i32, width as i32).unwrap();
++    let mut bar = ImageSurface::create(Format::ARgb32, height as i32, width as i32).unwrap();
+     let out = ImageSurface::create(
+         Format::ARgb32,
+         width as i32,
+@@ -903,12 +936,13 @@ fn render_preview(path: &std::ffi::OsStr) {
+         }
+         layers[layer].draw(&cfg, width as i32, height as i32, &bar, (0.0, 0.0), true);
+         if let Some(s) = slider {
+-            let layout = slider_layout(&cfg, &layers[layer], width);
++            let layout = slider_layout(&cfg, &layers[layer], width, s.source.1);
+             let bc = Context::new(&bar).unwrap();
+             bc.translate(height as f64, 0.0);
+             bc.rotate((90.0f64).to_radians());
+-            let icon = &layers[s.source.0].buttons[s.source.1].1;
+-            s.draw(&bc, &cfg, &layout, height as f64, (pixel_shift_width(&cfg) / 2.0, 0.0), icon);
++            let icons = slider_icons(&layers[s.source.0].buttons[s.source.1].1);
++            let shift = (pixel_shift_width(&cfg) / 2.0, 0.0);
++            s.draw(&bc, &cfg, &layout, (width as f64, height as f64), shift, true, icons);
+         }
+         bar.flush();
+         c.save().unwrap();
+@@ -921,6 +955,49 @@ fn render_preview(path: &std::ffi::OsStr) {
+     }
+     drop(c);
+     out.write_to_png(&mut File::create(path).unwrap()).unwrap();
++    // TINY_DFR_RENDER_BENCH=<n>: time n frames of each kind (drawing and the
++    // copy into a frame-sized buffer, not the USB transfer)
++    let n = env::var("TINY_DFR_RENDER_BENCH").ok().and_then(|v| v.parse::<u32>().ok());
++    if let Some(n) = n {
++        let mut fb = vec![0u8; bar.stride() as usize * width as usize];
++        macro_rules! time {
++            ($name:expr, $body:block) => {{
++                let start = Instant::now();
++                for _ in 0..n {
++                    $body
++                    bar.flush();
++                    fb.copy_from_slice(&bar.data().unwrap());
++                }
++                println!("{:<28} {:7.2} ms", $name, start.elapsed().as_secs_f64() * 1e3 / n as f64);
++            }};
++        }
++        for (name, row) in [("full row: collapsed", ROW_STRIP_COLLAPSED), ("full row: expanded", ROW_STRIP_EXPANDED), ("full row: F-keys", ROW_FKEYS)] {
++            time!(name, {
++                layers[row].draw(&cfg, width as i32, height as i32, &bar, (0.0, 0.0), true);
++            });
++        }
++        time!("one key (pressed)", {
++            let b = &mut layers[ROW_STRIP_EXPANDED].buttons[3].1;
++            b.active = !b.active;
++            b.changed = true;
++            layers[ROW_STRIP_EXPANDED].draw(&cfg, width as i32, height as i32, &bar, (0.0, 0.0), false);
++        });
++        if let Some(btn) = layers[ROW_STRIP_COLLAPSED].buttons.iter().position(|(_, b)| b.command == Some(Command::VolumeSlider)) {
++            let mut s = Slider::new(SliderKind::Volume, SliderMode::Tap { deadline: Instant::now() }, (ROW_STRIP_COLLAPSED, btn));
++            let layout = slider_layout(&cfg, &layers[ROW_STRIP_COLLAPSED], width, btn);
++            let icons = slider_icons(&layers[ROW_STRIP_COLLAPSED].buttons[btn].1);
++            let shift = (pixel_shift_width(&cfg) / 2.0, 0.0);
++            for (name, full) in [("slider: whole bar", true), ("slider: capsule (knob moves)", false)] {
++                time!(name, {
++                    s.value = (s.value + 0.013) % 1.0;
++                    let bc = Context::new(&bar).unwrap();
++                    bc.translate(height as f64, 0.0);
++                    bc.rotate((90.0f64).to_radians());
++                    s.draw(&bc, &cfg, &layout, (width as f64, height as f64), shift, full, icons);
++                });
++            }
++        }
++    }
+ }
+ 
+ fn main() {
+@@ -967,16 +1044,18 @@ fn pixel_shift_width(cfg: &Config) -> f64 {
+     }
+ }
+ 
+-/// The slider over `layer`: right of Esc (and its group gap) to the end
+-fn slider_layout(cfg: &Config, layer: &FunctionLayer, width: u16) -> SliderLayout {
++/// The slider opened by button `btn` of `layer`
++fn slider_layout(cfg: &Config, layer: &FunctionLayer, width: u16, btn: usize) -> SliderLayout {
+     let avail = width as f64 - pixel_shift_width(cfg);
+-    let left = if width >= 2170 {
+-        let (l, w) = layer.geometry(cfg, avail)[0];
+-        l + w + cfg.group_spacing
+-    } else {
+-        0.0
+-    };
+-    SliderLayout::new(cfg, left, avail)
++    SliderLayout::new(cfg, layer.geometry(cfg, avail)[btn])
++}
++
++/// Low and high icon of the slider opened by `button`
++fn slider_icons(button: &Button) -> (Option<&Button>, &Button) {
++    match &button.slider_icons {
++        Some(pair) => (Some(&pair.0), &pair.1),
++        None => (None, button),
++    }
+ }
+ 
+ fn slider_kind(command: Option<Command>) -> Option<SliderKind> {
+@@ -1213,20 +1292,22 @@ fn real_main(drm: &mut DrmBackend) {
+             };
+             // the slider lies over the row: redraw it whenever the row was drawn
+             if let Some(s) = &slider {
+-                let layout = slider_layout(&cfg, &layers[active_layer], width);
++                let layout = slider_layout(&cfg, &layers[s.source.0], width, s.source.1);
+                 let sx = shift.0 + pixel_shift_width(&cfg) / 2.0;
+                 let c = Context::new(&surface).unwrap();
+                 c.translate(height as f64, 0.0);
+                 c.rotate((90.0f64).to_radians());
+-                c.set_font_face(&cfg.font_face);
+-                c.set_font_size(cfg.font_size);
+-                let icon = &layers[s.source.0].buttons[s.source.1].1;
+-                s.draw(&c, &cfg, &layout, height as f64, (sx, shift.1), icon);
++                let icons = slider_icons(&layers[s.source.0].buttons[s.source.1].1);
++                let full = needs_complete_redraw || layer_changed;
++                s.draw(&c, &cfg, &layout, (width as f64, height as f64), (sx, shift.1), full, icons);
+                 drop(c);
+-                if !needs_complete_redraw {
++                if !full {
+                     let x1 = (layout.left + sx - 2.0).max(0.0) as u16;
+                     let x2 = ((layout.right + sx + 2.0) as u16).min(width);
+                     clips.push(ClipRect::new(0, x1, height, x2));
++                } else if !needs_complete_redraw {
++                    // it darkened the whole bar, not only the changed buttons
++                    clips = vec![ClipRect::new(0, 0, height, width)];
+                 }
+             }
+             slider_dirty = false;
+@@ -1279,15 +1360,16 @@ fn real_main(drm: &mut DrmBackend) {
+                             let x = dn.x_transformed(width as u32);
+                             let y = dn.y_transformed(height as u32);
+                             if let Some(s) = &mut slider {
+-                                let layout = slider_layout(&cfg, &layers[active_layer], width);
++                                let layout = slider_layout(&cfg, &layers[s.source.0], width, s.source.1);
+                                 match layout.hit(x - half_shift) {
+-                                    Some(SliderHit::Close) => {
++                                    // as on macOS a touch beside it closes it too
++                                    SliderHit::Close | SliderHit::Outside => {
+                                         apply_slider(s, &mut uinput, true);
+                                         slider = None;
+                                         needs_complete_redraw = true;
+                                         continue;
+                                     }
+-                                    Some(SliderHit::Track) => {
++                                    SliderHit::Track => {
+                                         // on the track the knob jumps to the finger
+                                         s.slot = Some(dn.seat_slot());
+                                         s.value = layout.value_at(x - half_shift);
+@@ -1297,13 +1379,11 @@ fn real_main(drm: &mut DrmBackend) {
+                                         slider_dirty = true;
+                                         continue;
+                                     }
+-                                    None => {} // Esc
+                                 }
+                             }
+                             let hit = layers[active_layer]
+                                 .hit(&cfg, width, height, x, y, None)
+-                                // under an open slider only Esc is left
+-                                .filter(|&btn| slider.is_none() || btn == 0);
++                                .filter(|_| slider.is_none());
+                             if let Some(btn) = hit {
+                                 touches.insert(dn.seat_slot(), (active_layer, btn));
+                                 let button = &mut layers[active_layer].buttons[btn].1;
+@@ -1318,7 +1398,7 @@ fn real_main(drm: &mut DrmBackend) {
+                             let y = mtn.y_transformed(height as u32);
+                             if let Some(s) = &mut slider {
+                                 if s.slot == Some(mtn.seat_slot()) {
+-                                    let layout = slider_layout(&cfg, &layers[active_layer], width);
++                                    let layout = slider_layout(&cfg, &layers[s.source.0], width, s.source.1);
+                                     s.value = match s.mode {
+                                         SliderMode::Drag { start_x, start_value } => (start_value
+                                             + (x - start_x) / layout.track_len())
+@@ -1338,7 +1418,7 @@ fn real_main(drm: &mut DrmBackend) {
+                                     let mut s = Slider::new(kind, SliderMode::Tap { deadline: Instant::now() }, (layer, btn));
+                                     s.mode = SliderMode::Drag { start_x: x0, start_value: s.value };
+                                     s.slot = Some(slot);
+-                                    let layout = slider_layout(&cfg, &layers[active_layer], width);
++                                    let layout = slider_layout(&cfg, &layers[layer], width, btn);
+                                     s.value = (s.value + (x - x0) / layout.track_len()).clamp(0.0, 1.0);
+                                     slider = Some(s);
+                                     needs_complete_redraw = true;
+diff --git a/src/slider.rs b/src/slider.rs
+index a95da29..199ec99 100644
+--- a/src/slider.rs
++++ b/src/slider.rs
+@@ -1,8 +1,10 @@
+ // Volume and brightness sliders (macOS style). A tap on a slider button opens
+ // the slider for SliderTimeout ms, where the value follows the finger on the
+ // track; holding the button and sliding opens it until release, the value
+-// moving with the finger from where it was. The slider covers the row right
+-// of Esc: a close button, the button's icon, the track.
++// moving with the finger from where it was. As on macOS the rest of the bar
++// goes dark: a capsule (SliderWidth px) ends where the button starts, with a
++// low and a high icon around the track, and a round close button takes the
++// button's place. A touch outside the capsule closes it too.
+ //
+ // The value goes to a helper in the desktop session (mbp-touchbar-bridge)
+ // through the FIFO /run/tiny-dfr/bridge/cmd, which sets it the way the desktop
+@@ -23,10 +25,17 @@ const BRIDGE_VOLUME: &str = "/run/tiny-dfr/bridge/volume";
+ const SEND_INTERVAL: Duration = Duration::from_millis(30);
+ // a hold turns into a slide after this many px sideways
+ pub const DRAG_THRESHOLD_PX: f64 = 12.0;
+-const CLOSE_WIDTH: f64 = 72.0;
+-const ICON_WIDTH: f64 = 72.0;
+-const TRACK_HEIGHT: f64 = 6.0;
+-const KNOB_RADIUS: f64 = 13.0;
++// parts of the capsule as fractions of its width (macOS, 720 px wide)
++const LOW_ICON_AT: f64 = 0.100;
++const TRACK_FROM: f64 = 0.218;
++const TRACK_TO: f64 = 0.764;
++const HIGH_ICON_AT: f64 = 0.900;
++const ICON_BOX: f64 = 72.0;
++const TRACK_HEIGHT: f64 = 8.0;
++const KNOB_WIDTH: f64 = 60.0;
++const KNOB_RADIUS: f64 = 10.0;
++const CLOSE_DIAMETER: f64 = 44.0;
++const CLOSE_COLOR: f64 = 0.70;
+ // keys of the fallback: one per this much of the track
+ const FALLBACK_STEP: f64 = 0.05;
+ 
+@@ -56,22 +65,25 @@ pub enum Mode {
+ /// Where the parts are, in bar coordinates without pixel shift.
+ pub struct Layout {
+     pub left: f64,
+-    pub close: (f64, f64),
+-    pub icon: (f64, f64),
+-    pub track: (f64, f64),
+     pub right: f64,
++    pub low_icon: f64,
++    pub high_icon: f64,
++    pub track: (f64, f64),
++    // the button that opened it: the close button sits there
++    pub close: (f64, f64),
+ }
+ 
+ pub enum Hit {
+     Close,
+     Track,
++    Outside,
+ }
+ 
+ pub struct Slider {
+     pub kind: Kind,
+     pub value: f64,
+     pub mode: Mode,
+-    // (row, button) that opened it: its icon is drawn on the slider
++    // (row, button) that opened it: its icons are drawn on the slider
+     pub source: (usize, usize),
+     // the touch moving the knob
+     pub slot: Option<u32>,
+@@ -82,27 +94,27 @@ pub struct Slider {
+ }
+ 
+ impl Layout {
+-    /// `left`: first px after Esc and its gap, `right`: end of the row
+-    pub fn new(cfg: &Config, left: f64, right: f64) -> Layout {
+-        let close = (left, CLOSE_WIDTH);
+-        let icon = (close.0 + close.1 + cfg.button_spacing, ICON_WIDTH);
+-        let track_left = icon.0 + icon.1 + cfg.button_spacing + KNOB_RADIUS;
+-        let track_right = (right - KNOB_RADIUS - cfg.button_spacing).max(track_left + 1.0);
++    /// `button`: left edge and width of the button that opened it
++    pub fn new(cfg: &Config, button: (f64, f64)) -> Layout {
++        let right = button.0;
++        let left = (right - cfg.slider_width).max(0.0);
++        let w = right - left;
+         Layout {
+             left,
+-            close,
+-            icon,
+-            track: (track_left, track_right),
+             right,
++            low_icon: left + LOW_ICON_AT * w,
++            high_icon: left + HIGH_ICON_AT * w,
++            track: (left + TRACK_FROM * w, left + TRACK_TO * w),
++            close: button,
+         }
+     }
+-    pub fn hit(&self, x: f64) -> Option<Hit> {
+-        if x < self.left - 4.0 {
+-            None
+-        } else if x < self.close.0 + self.close.1 + 4.0 {
+-            Some(Hit::Close)
++    pub fn hit(&self, x: f64) -> Hit {
++        if x >= self.close.0 && x < self.close.0 + self.close.1 {
++            Hit::Close
++        } else if x >= self.left && x < self.right {
++            Hit::Track
+         } else {
+-            Some(Hit::Track)
++            Hit::Outside
+         }
+     }
+     pub fn value_at(&self, x: f64) -> f64 {
+@@ -165,50 +177,72 @@ impl Slider {
+         }
+     }
+ 
+-    pub fn draw(&self, c: &Context, cfg: &Config, layout: &Layout, height: f64, shift: (f64, f64), icon: &Button) {
+-        let (sx, sy) = shift;
++    /// `full`: the whole bar (when it opens), else only the capsule.
++    /// `icons`: low and high icon (the button's own icon if it has no pair).
++    pub fn draw(
++        &self,
++        c: &Context,
++        cfg: &Config,
++        layout: &Layout,
++        (width, height): (f64, f64),
++        (sx, sy): (f64, f64),
++        full: bool,
++        icons: (Option<&Button>, &Button),
++    ) {
+         let button_height = if cfg.button_height > 0.0 {
+             cfg.button_height.min(height)
+         } else {
+             height * 0.7
+         };
+         let top = (height - button_height) / 2.0;
+-        // clear the whole slider area
+         c.set_source_rgb(0.0, 0.0, 0.0);
+-        c.rectangle(layout.left + sx - 1.0, 0.0, layout.right - layout.left + 2.0, height);
+-        c.fill().unwrap();
+-        // close button with an x
++        if full {
++            c.paint().unwrap();
++            // the round close button where the slider button was
++            let cx = layout.close.0 + layout.close.1 / 2.0 + sx;
++            let cy = height / 2.0;
++            c.set_source_rgb(CLOSE_COLOR, CLOSE_COLOR, CLOSE_COLOR);
++            c.arc(cx, cy, CLOSE_DIAMETER / 2.0, 0.0, std::f64::consts::TAU);
++            c.fill().unwrap();
++            let arm = 7.5;
++            c.set_source_rgb(0.0, 0.0, 0.0);
++            c.set_line_width(3.5);
++            c.set_line_cap(cairo::LineCap::Round);
++            c.move_to(cx - arm, cy - arm);
++            c.line_to(cx + arm, cy + arm);
++            c.move_to(cx + arm, cy - arm);
++            c.line_to(cx - arm, cy + arm);
++            c.stroke().unwrap();
++        } else {
++            c.rectangle(layout.left + sx - 1.0, 0.0, layout.right - layout.left + 2.0, height);
++            c.fill().unwrap();
++        }
++        let _ = width;
++        // capsule
+         let (r, g, b) = cfg.button_color;
+         c.set_source_rgb(r, g, b);
+-        rounded_rect(c, layout.close.0 + sx, top, layout.close.1, button_height, cfg.button_radius);
++        rounded_rect(c, layout.left + sx, top, layout.right - layout.left, button_height, cfg.button_radius);
+         c.fill().unwrap();
+-        let (cx, cy, arm) = (layout.close.0 + layout.close.1 / 2.0 + sx, height / 2.0 + sy, 9.0);
++        // icons: low left of the track, high right of it
+         c.set_source_rgb(1.0, 1.0, 1.0);
+-        c.set_line_width(2.5);
+-        c.move_to(cx - arm, cy - arm);
+-        c.line_to(cx + arm, cy + arm);
+-        c.move_to(cx + arm, cy - arm);
+-        c.line_to(cx - arm, cy + arm);
+-        c.stroke().unwrap();
+-        // the icon of the button that opened it
+-        c.set_source_rgb(1.0, 1.0, 1.0);
+-        icon.render(c, height as i32, layout.icon.0 + sx, layout.icon.1 as u64, sy);
+-        // capsule behind the track
+-        let cap_left = layout.track.0 - KNOB_RADIUS - cfg.button_spacing / 2.0 + sx;
+-        let cap_right = layout.track.1 + KNOB_RADIUS + cfg.button_spacing / 2.0 + sx;
+-        c.set_source_rgb(r, g, b);
+-        rounded_rect(c, cap_left, top, cap_right - cap_left, button_height, cfg.button_radius);
+-        c.fill().unwrap();
+-        // track: filled part white, the rest grey
++        if let Some(low) = icons.0 {
++            low.render(c, height as i32, layout.low_icon - ICON_BOX / 2.0 + sx, ICON_BOX as u64, sy);
++        }
++        icons.1.render(c, height as i32, layout.high_icon - ICON_BOX / 2.0 + sx, ICON_BOX as u64, sy);
++        // track: the rest grey, up to the knob the fill colour
+         let y = height / 2.0 - TRACK_HEIGHT / 2.0;
+         let knob_x = layout.track.0 + self.value * layout.track_len() + sx;
+-        c.set_source_rgb(0.45, 0.45, 0.47);
++        let (r, g, b) = cfg.slider_track_color;
++        c.set_source_rgb(r, g, b);
+         rounded_rect(c, layout.track.0 + sx, y, layout.track_len(), TRACK_HEIGHT, TRACK_HEIGHT / 2.0);
+         c.fill().unwrap();
+-        c.set_source_rgb(1.0, 1.0, 1.0);
++        let (r, g, b) = cfg.slider_fill_color;
++        c.set_source_rgb(r, g, b);
+         rounded_rect(c, layout.track.0 + sx, y, (knob_x - layout.track.0 - sx).max(TRACK_HEIGHT), TRACK_HEIGHT, TRACK_HEIGHT / 2.0);
+         c.fill().unwrap();
+-        c.arc(knob_x, height / 2.0, KNOB_RADIUS, 0.0, std::f64::consts::TAU);
++        // knob: a white key as tall as the buttons
++        c.set_source_rgb(1.0, 1.0, 1.0);
++        rounded_rect(c, knob_x - KNOB_WIDTH / 2.0, top, KNOB_WIDTH, button_height, KNOB_RADIUS);
+         c.fill().unwrap();
+     }
+ 
+-- 
+2.53.0
+

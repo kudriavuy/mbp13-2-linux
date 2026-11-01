@@ -1,0 +1,1031 @@
+From 1eaf81b66aacf1205b2775203cff6d2ba538c573 Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 17:06:03 +0100
+Subject: [PATCH] Browser tabs panel
+
+Command = "Tabs" opens a panel over the program's part of the row: a
+close button, a new-tab key (Ctrl+T) and the browser's tabs (icon and
+title, the active one - by the window title - lighter) in a row that
+scrolls and runs on after a flick, like the emoji row (now both use
+scroll.rs). The helper lists the tabs from plasma-browser-integration
+("tabs refresh" on opening and on every title change while open) into
+.../tabs and .../tab-<id>.png; a tapped tab is "tab <id>" to it.
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ src/config.rs |   2 +
+ src/emoji.rs  | 137 +++++++++----------------------
+ src/main.rs   | 153 +++++++++++++++++++++++++++++++++--
+ src/media.rs  |   2 +-
+ src/scroll.rs | 145 +++++++++++++++++++++++++++++++++
+ src/state.rs  |  19 ++++-
+ src/tabs.rs   | 217 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 568 insertions(+), 107 deletions(-)
+ create mode 100644 src/scroll.rs
+ create mode 100644 src/tabs.rs
+
+diff --git a/src/config.rs b/src/config.rs
+index 19daeb1..6ee5d4f 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -184,6 +184,8 @@ pub enum Command {
+     Open,
+     /// close the panel (its first key)
+     Close,
++    /// open the browser tabs panel
++    Tabs,
+ }
+ 
+ #[derive(Deserialize)]
+diff --git a/src/emoji.rs b/src/emoji.rs
+index d97364b..80ac93a 100644
+--- a/src/emoji.rs
++++ b/src/emoji.rs
+@@ -10,14 +10,14 @@
+ // recently used ones first (.../emoji-recent). Each emoji is drawn once by
+ // Pango (sequences, flags, colour glyphs; librsvg would draw them as black
+ // outlines) and kept.
+-use crate::{config::Config, media};
++use crate::{
++    config::Config,
++    media,
++    scroll::{Row, Scroll},
++};
+ use cairo::{Context, Format, ImageSurface};
+ use pangocairo::{functions as pc, pango};
+-use std::{
+-    collections::HashMap,
+-    fs::read_to_string,
+-    time::{Duration, Instant},
+-};
++use std::{collections::HashMap, fs::read_to_string};
+ 
+ const LIST: &str = "/usr/share/tiny-dfr/emoji.txt";
+ const CLOSE_BOX: f64 = 72.0;
+@@ -28,12 +28,6 @@ const GLYPH: i32 = 38;
+ // a category in the category row
+ const CATEGORY_PITCH: f64 = 84.0;
+ const RECENT_ICON: &str = "\u{1F552}";
+-// a flick: speed it keeps (px/s), how fast it fades, when it stops
+-const FLING_MIN: f64 = 150.0;
+-const FLING_TAU: f64 = 0.45;
+-const FLING_STOP: f64 = 15.0;
+-// the finger's speed: from its moves in the last this long
+-const VELOCITY_WINDOW: Duration = Duration::from_millis(80);
+ const MAX_CACHED: usize = 600;
+ 
+ pub struct Group {
+@@ -109,29 +103,15 @@ impl Layout {
+     }
+ }
+ 
+-/// A finger on the row
+-struct Touch {
+-    slot: u32,
+-    x0: f64,
+-    offset0: f64,
+-    dragging: bool,
+-    // recent (time, x) for the speed at release
+-    trail: Vec<(Instant, f64)>,
+-}
+-
+ pub struct Panel {
+     pub catalog: Catalog,
+-    /// how far the row is scrolled (px from the first emoji)
+-    offset: f64,
+-    touch: Option<Touch>,
+-    /// the emoji (or category, while choosing) under a finger that has not slid
++    scroll: Scroll,
++    /// the category under a finger, while choosing
+     pub pressed: Option<(u32, usize)>,
+     /// the category key held
+     pub category_held: Option<u32>,
+     /// the category row is shown instead of the emoji
+     pub choosing: bool,
+-    /// running on after a flick: speed in px/s (positive: towards the end)
+-    fling: Option<(f64, Instant)>,
+     cache: HashMap<String, ImageSurface>,
+     font: String,
+ }
+@@ -140,35 +120,31 @@ impl Panel {
+     pub fn new(cfg: &Config, recent: &[String]) -> Option<Panel> {
+         Some(Panel {
+             catalog: Catalog::load(recent)?,
+-            offset: 0.0,
+-            touch: None,
++            scroll: Scroll::default(),
+             pressed: None,
+             category_held: None,
+             choosing: false,
+-            fling: None,
+             cache: HashMap::new(),
+             font: cfg.emoji_font.clone(),
+         })
+     }
+ 
++    fn row(&self, layout: &Layout) -> Row {
++        Row { left: layout.strip.0, width: layout.strip.1, pitch: PITCH, count: self.catalog.items.len() }
++    }
++
+     /// The PNG preview: scrolled to `group`, an emoji pressed, choosing
+     pub fn preview(&mut self, layout: &Layout, group: usize, pressed: Option<usize>, choosing: bool) {
+         let start = self.catalog.groups.get(group).map_or(0, |g| g.start);
+-        self.offset = (start as f64 * PITCH).min(self.max_offset(layout));
+-        self.pressed = pressed.map(|i| (0, start + i));
++        self.scroll.show_from(&self.row(layout), start);
++        if choosing {
++            self.pressed = pressed.map(|i| (0, i));
++        } else {
++            self.scroll.pressed = pressed.map(|i| (0, start + i));
++        }
+         self.choosing = choosing;
+     }
+ 
+-    fn max_offset(&self, layout: &Layout) -> f64 {
+-        (self.catalog.items.len() as f64 * PITCH - layout.strip.1).max(0.0)
+-    }
+-
+-    /// The emoji at `x` (bar coordinates without pixel shift), if any
+-    fn item_at(&self, layout: &Layout, x: f64) -> Option<usize> {
+-        let i = ((x - layout.strip.0 + self.offset) / PITCH).floor();
+-        (i >= 0.0 && (i as usize) < self.catalog.items.len()).then_some(i as usize)
+-    }
+-
+     fn category_at(&self, layout: &Layout, x: f64) -> Option<usize> {
+         let i = ((x - layout.strip.0) / CATEGORY_PITCH).floor();
+         (i >= 0.0 && (i as usize) < self.catalog.groups.len()).then_some(i as usize)
+@@ -176,42 +152,32 @@ impl Panel {
+ 
+     /// The category the row's left end is in
+     pub fn current_group(&self) -> usize {
+-        let first = (self.offset / PITCH + 0.5) as usize;
++        let first = (self.scroll.offset / PITCH + 0.5) as usize;
+         self.catalog.groups.iter().rposition(|g| g.start <= first).unwrap_or(0)
+     }
+ 
+     /// Whether this finger scrolls or holds the row
+     pub fn touching(&self, slot: u32) -> bool {
+-        self.touch.as_ref().is_some_and(|t| t.slot == slot)
++        self.scroll.touching(slot)
+     }
+ 
+     pub fn moving(&self) -> bool {
+-        self.fling.is_some()
++        self.scroll.moving()
+     }
+ 
+     /// One step of a flick; false when it has stopped
+     pub fn step(&mut self, layout: &Layout) -> bool {
+-        let Some((v, at)) = self.fling else { return false };
+-        let dt = at.elapsed().as_secs_f64();
+-        let v1 = v * (-dt / FLING_TAU).exp();
+-        // the distance run over dt with the speed fading exponentially
+-        self.offset += v * FLING_TAU * (1.0 - (-dt / FLING_TAU).exp());
+-        let max = self.max_offset(layout);
+-        let stopped = v1.abs() < FLING_STOP || self.offset <= 0.0 || self.offset >= max;
+-        self.offset = self.offset.clamp(0.0, max);
+-        self.fling = (!stopped).then_some((v1, Instant::now()));
+-        true
++        let row = self.row(layout);
++        self.scroll.step(&row)
+     }
+ 
+     pub fn down(&mut self, layout: &Layout, slot: u32, x: f64) {
+-        // a touch stops a flick (and is then not a tap)
+-        let was_moving = self.fling.take().is_some();
+         if self.choosing {
+             self.pressed = self.category_at(layout, x).map(|i| (slot, i));
+             return;
+         }
+-        self.touch = Some(Touch { slot, x0: x, offset0: self.offset, dragging: was_moving, trail: vec![(Instant::now(), x)] });
+-        self.pressed = if was_moving { None } else { self.item_at(layout, x).map(|i| (slot, i)) };
++        let row = self.row(layout);
++        self.scroll.down(&row, slot, x);
+     }
+ 
+     /// true when it is this panel's finger
+@@ -223,52 +189,24 @@ impl Panel {
+             }
+             return false;
+         }
+-        let max = self.max_offset(layout);
+-        let Some(t) = self.touch.as_mut().filter(|t| t.slot == slot) else { return false };
+-        if !t.dragging && (x - t.x0).abs() > crate::slider::DRAG_THRESHOLD_PX {
+-            t.dragging = true;
+-            // the row follows the finger from where it is now, without a jump
+-            t.x0 = x;
+-            self.pressed = None;
+-        }
+-        if t.dragging {
+-            self.offset = (t.offset0 - (x - t.x0)).clamp(0.0, max);
+-        }
+-        let now = Instant::now();
+-        t.trail.push((now, x));
+-        t.trail.retain(|&(at, _)| now.duration_since(at) <= VELOCITY_WINDOW);
+-        true
++        let row = self.row(layout);
++        self.scroll.motion(&row, slot, x)
+     }
+ 
+     /// The finger went up: the emoji tapped, if any
+     pub fn up(&mut self, layout: &Layout, slot: u32) -> Option<String> {
+         if self.choosing {
+-            let Some((s, i)) = self.pressed.filter(|(s, _)| *s == slot) else { return None };
+-            let _ = s;
+-            self.pressed = None;
++            let (_, i) = self.pressed.take().filter(|(s, _)| *s == slot)?;
+             self.choosing = false;
+-            self.offset = (self.catalog.groups[i].start as f64 * PITCH).min(self.max_offset(layout));
+-            return None;
+-        }
+-        let t = self.touch.take().filter(|t| t.slot == slot)?;
+-        if t.dragging {
+-            if let (Some(&(t0, x0)), Some(&(t1, x1))) = (t.trail.first(), t.trail.last()) {
+-                let dt = t1.duration_since(t0).as_secs_f64();
+-                // recent moves only: a finger that stopped before lifting does not fling
+-                if dt > 0.005 && t1.elapsed() < VELOCITY_WINDOW {
+-                    let v = -(x1 - x0) / dt;
+-                    if v.abs() > FLING_MIN {
+-                        self.fling = Some((v, Instant::now()));
+-                    }
+-                }
+-            }
++            let row = self.row(layout);
++            self.scroll.show_from(&row, self.catalog.groups[i].start);
+             return None;
+         }
+-        let (_, i) = self.pressed.take().filter(|(s, _)| *s == slot)?;
++        let i = self.scroll.up(slot)?;
+         Some(self.catalog.items[i].clone())
+     }
+ 
+-    /// A ready-drawn emoji: drawn once by librsvg (Pango lays it out), its
++    /// A ready-drawn emoji: drawn once by Pango, its
+     /// ink centred in a GLYPH square
+     fn glyph(&mut self, text: &str) -> Option<&ImageSurface> {
+         if !self.cache.contains_key(text) {
+@@ -314,11 +252,10 @@ impl Panel {
+                 self.paint_glyph(c, &icon, x + CATEGORY_PITCH / 2.0 + sx, height / 2.0 + sy);
+             }
+         } else {
+-            let first = (self.offset / PITCH).floor().max(0.0) as usize;
+-            let last = (((self.offset + sw) / PITCH).ceil() as usize).min(self.catalog.items.len());
+-            for i in first..last {
+-                let x = sl + i as f64 * PITCH - self.offset;
+-                if self.pressed.is_some_and(|(_, p)| p == i) {
++            let (items, x0) = self.scroll.visible(&self.row(layout));
++            for i in items.clone() {
++                let x = x0 + (i - items.start) as f64 * PITCH;
++                if self.scroll.pressed.is_some_and(|(_, p)| p == i) {
+                     let (r, g, b) = cfg.button_active_color;
+                     c.set_source_rgb(r, g, b);
+                     media::rounded_rect(c, x + 2.0 + sx, top, PITCH - 4.0, bh, cfg.button_radius);
+diff --git a/src/main.rs b/src/main.rs
+index d006615..9c1d094 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -54,8 +54,10 @@ mod layer_switch;
+ mod media;
+ mod notice;
+ mod pixel_shift;
++mod scroll;
+ mod slider;
+ mod state;
++mod tabs;
+ mod touchid;
+ 
+ use crate::config::ConfigManager;
+@@ -1254,10 +1256,11 @@ fn render_preview(path: &std::ffi::OsStr) {
+     let mut bar = ImageSurface::create(Format::ARgb32, height as i32, width as i32).unwrap();
+     let has_np_row = layers[ROW_STRIP_COLLAPSED].buttons.iter().any(|(_, b)| b.command == Some(Command::NowPlaying));
+     let has_emoji = layers.iter().any(|l| l.buttons.iter().any(|(_, b)| b.command == Some(Command::Emoji)));
++    let has_tabs = layers.iter().any(|l| l.buttons.iter().any(|(_, b)| b.command == Some(Command::Tabs)));
+     let out = ImageSurface::create(
+         Format::ARgb32,
+         width as i32,
+-        (rows.len() + frames.len() + if has_np_row { 2 } else { 0 } + if has_emoji { 3 } else { 0 } + if cfg.touchid_hint { 4 } else { 0 } + cfg.notifications as usize) as i32
++        (rows.len() + frames.len() + if has_np_row { 2 } else { 0 } + if has_emoji { 3 } else { 0 } + has_tabs as usize + if cfg.touchid_hint { 4 } else { 0 } + cfg.notifications as usize) as i32
+             * (height as i32 + gap)
+             - gap,
+     )
+@@ -1374,6 +1377,36 @@ fn render_preview(path: &std::ffi::OsStr) {
+             }
+         }
+     }
++    // the tabs panel (made-up tabs, no icons): the second one active, the
++    // fourth pressed
++    if has_tabs {
++        let tabs: Vec<state::Tab> = ["Search", "Arch Linux - Wiki", "The Linux Kernel Archives", "Mail", "YouTube"]
++            .iter()
++            .enumerate()
++            .map(|(i, t)| state::Tab { id: format!("demo{i}"), title: t.to_string() })
++            .collect();
++        let layout = tabs_layout(&cfg, &layers[ROW_STRIP_COLLAPSED], width);
++        let mut panel = tabs::Panel::default();
++        panel.preview(Some(3));
++        layers[ROW_STRIP_COLLAPSED].draw(&cfg, width as i32, height as i32, &bar, (0.0, 0.0), true);
++        let bc = Context::new(&bar).unwrap();
++        bc.translate(height as f64, 0.0);
++        bc.rotate((90.0f64).to_radians());
++        let sx = pixel_shift_width(&cfg) / 2.0;
++        bc.set_source_rgb(0.0, 0.0, 0.0);
++        bc.rectangle(layout.left + sx - cfg.group_spacing / 2.0, 0.0, layout.right - layout.left + cfg.group_spacing, height as f64);
++        bc.fill().unwrap();
++        panel.draw(&bc, &cfg, &layout, &tabs, "Arch Linux - Wiki - Google Chrome", height as f64, (sx, 0.0));
++        drop(bc);
++        bar.flush();
++        c.save().unwrap();
++        let y0 = ((rows_len + extra) as i32 * (height as i32 + gap)) as f64;
++        c.transform(cairo::Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, y0 + height as f64));
++        c.set_source_surface(&bar, 0.0, 0.0).unwrap();
++        c.paint().unwrap();
++        c.restore().unwrap();
++        extra += 1;
++    }
+     // a notification (made up) over the collapsed row
+     if cfg.notifications {
+         let n = state::Notice { at_ms: 0, app: "Chat".into(), summary: "Alex: Are you home yet?".into() };
+@@ -1617,6 +1650,12 @@ fn app_area(cfg: &Config, layer: &FunctionLayer, width: u16) -> (f64, f64) {
+     (left, right.max(left))
+ }
+ 
++/// The tabs panel over the program's part of `layer` (the strip stays)
++fn tabs_layout(cfg: &Config, layer: &FunctionLayer, width: u16) -> tabs::Layout {
++    let (left, right) = app_area(cfg, layer, width);
++    tabs::Layout::new(cfg, left, right)
++}
++
+ /// The emoji panel over the program's part of `layer` (the strip stays)
+ fn emoji_layout(cfg: &Config, layer: &FunctionLayer, width: u16) -> emoji::Layout {
+     let (left, right) = app_area(cfg, layer, width);
+@@ -1752,6 +1791,9 @@ fn real_main(drm: &mut DrmBackend) {
+     let mut emoji_dirty = false;
+     let mut emoji_sent: (usize, Instant) = (0, Instant::now());
+     let mut paste_seen = session.paste;
++    // the browser tabs panel, and whether it needs drawing
++    let mut tabs_panel: Option<tabs::Panel> = None;
++    let mut tabs_dirty = false;
+     // animations: the row under a slider as it opened (fades out behind it),
+     // the strip changing rows, and whether the next row change is the strip's
+     let mut slider_backdrop: Option<ImageSurface> = None;
+@@ -1855,6 +1897,7 @@ fn real_main(drm: &mut DrmBackend) {
+             check_layer = true;
+             media = None;
+             emoji = None;
++            tabs_panel = None;
+             panel_row = None;
+             fingerprint = touchid_icon(&cfg);
+             bell = named_icon(cfg.notification_icon.as_ref());
+@@ -1903,10 +1946,23 @@ fn real_main(drm: &mut DrmBackend) {
+         if state_watch.changed() {
+             let old_title = session.title.clone();
+             let old_art = session.playing.as_ref().and_then(|n| n.art.clone());
++            let old_tabs = std::mem::take(&mut session.tabs);
+             session = state_watch.read();
+             // another web site: maybe another key set
+             if session.title != old_title {
+                 check_layer = true;
++                // another tab, or a new one: the list again
++                if tabs_panel.is_some() {
++                    let _ = slider::bridge_send("tabs refresh");
++                }
++            }
++            if let Some(t) = &mut tabs_panel {
++                if session.tabs != old_tabs {
++                    let layout = tabs_layout(&cfg, &layers[active_layer], width);
++                    t.tabs_changed(&layout, &session.tabs, session.title.as_deref().unwrap_or(""));
++                }
++                // the title: maybe another active tab
++                tabs_dirty = true;
+             }
+             let art = session.playing.as_ref().and_then(|n| n.art.clone());
+             if art != old_art {
+@@ -1976,7 +2032,7 @@ fn real_main(drm: &mut DrmBackend) {
+         }
+         // locked: only the lock row (Esc), nothing of the session on the bar
+         let wanted_row = if session.locked {
+-            if media.take().is_some() || emoji.take().is_some() {
++            if media.take().is_some() || emoji.take().is_some() || tabs_panel.take().is_some() {
+                 needs_complete_redraw = true;
+             }
+             cfg.lock_row
+@@ -2017,6 +2073,7 @@ fn real_main(drm: &mut DrmBackend) {
+             pending = None;
+             media = None;
+             emoji = None;
++            tabs_panel = None;
+         }
+         strip_animate = false;
+         // a flick runs on
+@@ -2026,6 +2083,12 @@ fn real_main(drm: &mut DrmBackend) {
+                 emoji_dirty |= e.step(&layout);
+             }
+         }
++        if let Some(t) = &mut tabs_panel {
++            if t.moving() {
++                let layout = tabs_layout(&cfg, &layers[active_layer], width);
++                tabs_dirty |= t.step(&layout, &session.tabs);
++            }
++        }
+         // a tapped slider closes after SliderTimeout without a touch
+         if let Some(s) = &mut slider {
+             if let SliderMode::Tap { deadline } = s.mode {
+@@ -2123,7 +2186,7 @@ fn real_main(drm: &mut DrmBackend) {
+             }
+         }
+         let notice_shown = notice_now(&cfg, &session, notice_dismissed)
+-            .filter(|_| slider.is_none() && media.is_none() && emoji.is_none())
++            .filter(|_| slider.is_none() && media.is_none() && emoji.is_none() && tabs_panel.is_none())
+             .map(|n| n.at_ms);
+         if notice_shown != notice_drawn {
+             needs_complete_redraw = true;
+@@ -2145,6 +2208,7 @@ fn real_main(drm: &mut DrmBackend) {
+             || (slider.is_some() && (slider_dirty || slider_moving))
+             || (media.is_some() && (media_dirty || media_full))
+             || (emoji.is_some() && emoji_dirty)
++            || (tabs_panel.is_some() && tabs_dirty)
+             || (touchid.is_some() && touchid_moving)
+         {
+             let shift = if cfg.enable_pixel_shift {
+@@ -2238,6 +2302,21 @@ fn real_main(drm: &mut DrmBackend) {
+                 let x2 = ((layout.right + sx + cfg.group_spacing) as u16).min(width);
+                 clips.push(ClipRect::new(0, x1, height, x2));
+             }
++            if let (Some(t), None) = (&mut tabs_panel, &slider) {
++                let layout = tabs_layout(&cfg, &layers[active_layer], width);
++                let sx = shift.0 + pixel_shift_width(&cfg) / 2.0;
++                let c = Context::new(&surface).unwrap();
++                c.translate(height as f64, 0.0);
++                c.rotate((90.0f64).to_radians());
++                c.set_source_rgb(0.0, 0.0, 0.0);
++                c.rectangle(layout.left + sx - cfg.group_spacing / 2.0, 0.0, layout.right - layout.left + cfg.group_spacing, height as f64);
++                c.fill().unwrap();
++                t.draw(&c, &cfg, &layout, &session.tabs, session.title.as_deref().unwrap_or(""), height as f64, (sx, shift.1));
++                drop(c);
++                let x1 = (layout.left + sx - cfg.group_spacing).max(0.0) as u16;
++                let x2 = ((layout.right + sx + cfg.group_spacing) as u16).min(width);
++                clips.push(ClipRect::new(0, x1, height, x2));
++            }
+             if let (Some(n), true) = (notice_now(&cfg, &session, notice_dismissed), notice_shown.is_some()) {
+                 let area = app_area(&cfg, &layers[active_layer], width);
+                 let sx = shift.0 + pixel_shift_width(&cfg) / 2.0;
+@@ -2284,6 +2363,7 @@ fn real_main(drm: &mut DrmBackend) {
+             media_dirty = false;
+             media_full = false;
+             emoji_dirty = false;
++            tabs_dirty = false;
+             let data = surface.data().unwrap();
+             drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
+             drm.dirty(&clips).unwrap();
+@@ -2316,7 +2396,7 @@ fn real_main(drm: &mut DrmBackend) {
+             next_timeout_ms = min(next_timeout_ms, 1);
+         }
+         // animating: come back for the next frame
+-        if fading || transition.is_some() || slider.as_ref().is_some_and(|s| s.animating()) || emoji.as_ref().is_some_and(|e| e.moving()) {
++        if fading || transition.is_some() || slider.as_ref().is_some_and(|s| s.animating()) || emoji.as_ref().is_some_and(|e| e.moving()) || tabs_panel.as_ref().is_some_and(|t| t.moving()) {
+             next_timeout_ms = min(next_timeout_ms, anim::FRAME.as_millis() as i32);
+         }
+         match epoll.wait(
+@@ -2478,12 +2558,33 @@ fn real_main(drm: &mut DrmBackend) {
+                                     emoji::Hit::Outside => {} // Esc, the strip
+                                 }
+                             }
++                            if let Some(t) = &mut tabs_panel {
++                                let layout = tabs_layout(&cfg, &layers[active_layer], width);
++                                match layout.hit(x - half_shift) {
++                                    tabs::Hit::Close => {
++                                        tabs_panel = None;
++                                        needs_complete_redraw = true;
++                                        continue;
++                                    }
++                                    tabs::Hit::New => {
++                                        t.new_held = Some(dn.seat_slot());
++                                        tabs_dirty = true;
++                                        continue;
++                                    }
++                                    tabs::Hit::Strip => {
++                                        t.down(&layout, &session.tabs, dn.seat_slot(), x - half_shift);
++                                        tabs_dirty = true;
++                                        continue;
++                                    }
++                                    tabs::Hit::Outside => {} // Esc, the strip
++                                }
++                            }
+                             let hit = layers[active_layer]
+                                 .hit(&cfg, width, height, x, y, None)
+                                 // under the slider nothing, beside the panel Esc and the strip
+                                 .filter(|&b| {
+                                     slider.is_none()
+-                                        && ((media.is_none() && emoji.is_none())
++                                        && ((media.is_none() && emoji.is_none() && tabs_panel.is_none())
+                                             || b == 0
+                                             || layers[active_layer].strip_start().is_some_and(|s| b >= s))
+                                 });
+@@ -2540,6 +2641,13 @@ fn real_main(drm: &mut DrmBackend) {
+                                     continue;
+                                 }
+                             }
++                            if let Some(t) = &mut tabs_panel {
++                                let layout = tabs_layout(&cfg, &layers[active_layer], width);
++                                if t.motion(&layout, &session.tabs, mtn.seat_slot(), x - half_shift) {
++                                    tabs_dirty = true;
++                                    continue;
++                                }
++                            }
+                             if let Some((slot, x0, start, shown)) = layout_hold {
+                                 if slot == mtn.seat_slot() {
+                                     let names = session.layout.as_ref().map(|l| l.1.clone()).unwrap_or_default();
+@@ -2654,6 +2762,22 @@ fn real_main(drm: &mut DrmBackend) {
+                                     continue;
+                                 }
+                             }
++                            if let Some(t) = &mut tabs_panel {
++                                if t.new_held == Some(up.seat_slot()) {
++                                    t.new_held = None;
++                                    toggle_keys(&mut uinput, &vec![Key::LeftCtrl, Key::T], 1);
++                                    toggle_keys(&mut uinput, &vec![Key::LeftCtrl, Key::T], 0);
++                                    tabs_dirty = true;
++                                    continue;
++                                }
++                                if t.touching(up.seat_slot()) {
++                                    if let Some(id) = t.up(&session.tabs, up.seat_slot()) {
++                                        let _ = slider::bridge_send(&format!("tab {id}"));
++                                    }
++                                    tabs_dirty = true;
++                                    continue;
++                                }
++                            }
+                             if let Some((slot, _, _, shown)) = layout_hold {
+                                 if slot == up.seat_slot() {
+                                     layout_hold = None;
+@@ -2713,11 +2837,28 @@ fn real_main(drm: &mut DrmBackend) {
+                                     panel_row = if panel_row == p { None } else { p };
+                                     media = None;
+                                     emoji = None;
++                                    tabs_panel = None;
+                                     slider = None;
+                                 }
+                                 Some(Command::Close) => {
+                                     panel_row = None;
+                                 }
++                                Some(Command::Tabs) => {
++                                    // a second tap closes it; open: the list from the helper
++                                    tabs_panel = if tabs_panel.is_some() {
++                                        None
++                                    } else {
++                                        let _ = slider::bridge_send("tabs refresh");
++                                        let mut t = tabs::Panel::default();
++                                        let layout = tabs_layout(&cfg, &layers[active_layer], width);
++                                        t.tabs_changed(&layout, &session.tabs, session.title.as_deref().unwrap_or(""));
++                                        Some(t)
++                                    };
++                                    media = None;
++                                    emoji = None;
++                                    slider = None;
++                                    needs_complete_redraw = true;
++                                }
+                                 Some(Command::Collapse) => {
+                                     expanded = false;
+                                     strip_animate = true;
+@@ -2731,12 +2872,14 @@ fn real_main(drm: &mut DrmBackend) {
+                                     // a second tap closes it
+                                     media = if media.is_some() { None } else { Some(media::Panel::new()) };
+                                     emoji = None;
++                                    tabs_panel = None;
+                                     slider = None;
+                                     needs_complete_redraw = true;
+                                 }
+                                 Some(Command::Emoji) => {
+                                     emoji = if emoji.is_some() { None } else { emoji::Panel::new(&cfg, &session.emoji_recent) };
+                                     media = None;
++                                    tabs_panel = None;
+                                     slider = None;
+                                     needs_complete_redraw = true;
+                                 }
+diff --git a/src/media.rs b/src/media.rs
+index 6613933..e725df2 100644
+--- a/src/media.rs
++++ b/src/media.rs
+@@ -149,7 +149,7 @@ fn time(us: i64) -> String {
+ }
+ 
+ /// `text` cut to fit `width` at the current font size, with an ellipsis
+-fn fit(c: &Context, text: &str, width: f64) -> String {
++pub fn fit(c: &Context, text: &str, width: f64) -> String {
+     if c.text_extents(text).map_or(0.0, |e| e.x_advance()) <= width {
+         return text.to_string();
+     }
+diff --git a/src/scroll.rs b/src/scroll.rs
+new file mode 100644
+index 0000000..7682878
+--- /dev/null
++++ b/src/scroll.rs
+@@ -0,0 +1,145 @@
++// A row of equal items that scrolls with the finger and runs on after a
++// flick (the emoji and tab panels). Positions are bar coordinates without
++// pixel shift; the row starts at `left`, is `width` wide, its items `pitch`.
++use std::time::{Duration, Instant};
++
++// a flick: speed it keeps (px/s), how fast it fades, when it stops
++const FLING_MIN: f64 = 150.0;
++const FLING_TAU: f64 = 0.45;
++const FLING_STOP: f64 = 15.0;
++// the finger's speed: from its moves in the last this long
++const VELOCITY_WINDOW: Duration = Duration::from_millis(80);
++
++#[derive(Clone, Copy)]
++pub struct Row {
++    pub left: f64,
++    pub width: f64,
++    pub pitch: f64,
++    pub count: usize,
++}
++
++impl Row {
++    fn max_offset(&self) -> f64 {
++        (self.count as f64 * self.pitch - self.width).max(0.0)
++    }
++}
++
++/// A finger on the row
++struct Touch {
++    slot: u32,
++    x0: f64,
++    offset0: f64,
++    dragging: bool,
++    // recent (time, x) for the speed at release
++    trail: Vec<(Instant, f64)>,
++}
++
++#[derive(Default)]
++pub struct Scroll {
++    /// how far the row is scrolled (px from the first item)
++    pub offset: f64,
++    touch: Option<Touch>,
++    /// the item under a finger that has not slid
++    pub pressed: Option<(u32, usize)>,
++    /// running on after a flick: speed in px/s (positive: towards the end)
++    fling: Option<(f64, Instant)>,
++}
++
++impl Scroll {
++    /// The item at `x`, if any
++    pub fn item_at(&self, row: &Row, x: f64) -> Option<usize> {
++        let i = ((x - row.left + self.offset) / row.pitch).floor();
++        (i >= 0.0 && (i as usize) < row.count).then_some(i as usize)
++    }
++
++    /// The items to draw and the x of the first one's left edge
++    pub fn visible(&self, row: &Row) -> (std::ops::Range<usize>, f64) {
++        let first = (self.offset / row.pitch).floor().max(0.0) as usize;
++        let last = (((self.offset + row.width) / row.pitch).ceil() as usize).min(row.count);
++        (first..last, row.left + first as f64 * row.pitch - self.offset)
++    }
++
++    /// Scroll to item `i` at the left end (as far as the row goes)
++    pub fn show_from(&mut self, row: &Row, i: usize) {
++        self.offset = (i as f64 * row.pitch).min(row.max_offset());
++    }
++
++    /// Scroll as little as needed for item `i` to be seen whole
++    pub fn reveal(&mut self, row: &Row, i: usize) {
++        let x = i as f64 * row.pitch;
++        if x < self.offset {
++            self.offset = x;
++        } else if x + row.pitch > self.offset + row.width {
++            self.offset = (x + row.pitch - row.width).min(row.max_offset());
++        }
++        self.offset = self.offset.clamp(0.0, row.max_offset());
++    }
++
++    /// Whether this finger scrolls or holds the row
++    pub fn touching(&self, slot: u32) -> bool {
++        self.touch.as_ref().is_some_and(|t| t.slot == slot)
++    }
++
++    pub fn moving(&self) -> bool {
++        self.fling.is_some()
++    }
++
++    /// One step of a flick; false when it has stopped
++    pub fn step(&mut self, row: &Row) -> bool {
++        let Some((v, at)) = self.fling else { return false };
++        let dt = at.elapsed().as_secs_f64();
++        let v1 = v * (-dt / FLING_TAU).exp();
++        // the distance run over dt with the speed fading exponentially
++        self.offset += v * FLING_TAU * (1.0 - (-dt / FLING_TAU).exp());
++        let max = row.max_offset();
++        let stopped = v1.abs() < FLING_STOP || self.offset <= 0.0 || self.offset >= max;
++        self.offset = self.offset.clamp(0.0, max);
++        self.fling = (!stopped).then_some((v1, Instant::now()));
++        true
++    }
++
++    pub fn down(&mut self, row: &Row, slot: u32, x: f64) {
++        // a touch stops a flick (and is then not a tap)
++        let was_moving = self.fling.take().is_some();
++        self.touch = Some(Touch { slot, x0: x, offset0: self.offset, dragging: was_moving, trail: vec![(Instant::now(), x)] });
++        self.pressed = if was_moving { None } else { self.item_at(row, x).map(|i| (slot, i)) };
++    }
++
++    /// true when it is this row's finger
++    pub fn motion(&mut self, row: &Row, slot: u32, x: f64) -> bool {
++        let max = row.max_offset();
++        let Some(t) = self.touch.as_mut().filter(|t| t.slot == slot) else { return false };
++        if !t.dragging && (x - t.x0).abs() > crate::slider::DRAG_THRESHOLD_PX {
++            t.dragging = true;
++            // the row follows the finger from where it is now, without a jump
++            t.x0 = x;
++            self.pressed = None;
++        }
++        if t.dragging {
++            self.offset = (t.offset0 - (x - t.x0)).clamp(0.0, max);
++        }
++        let now = Instant::now();
++        t.trail.push((now, x));
++        t.trail.retain(|&(at, _)| now.duration_since(at) <= VELOCITY_WINDOW);
++        true
++    }
++
++    /// The finger went up: the item tapped, if any
++    pub fn up(&mut self, slot: u32) -> Option<usize> {
++        let t = self.touch.take().filter(|t| t.slot == slot)?;
++        if t.dragging {
++            if let (Some(&(t0, x0)), Some(&(t1, x1))) = (t.trail.first(), t.trail.last()) {
++                let dt = t1.duration_since(t0).as_secs_f64();
++                // recent moves only: a finger that stopped before lifting does not fling
++                if dt > 0.005 && t1.elapsed() < VELOCITY_WINDOW {
++                    let v = -(x1 - x0) / dt;
++                    if v.abs() > FLING_MIN {
++                        self.fling = Some((v, Instant::now()));
++                    }
++                }
++            }
++            return None;
++        }
++        self.pressed.take().filter(|(s, _)| *s == slot).map(|(_, i)| i)
++    }
++}
+diff --git a/src/state.rs b/src/state.rs
+index 93e9088..55f7c35 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -36,6 +36,15 @@ pub struct State {
+     pub emoji_recent: Vec<String>,
+     /// the helper put an emoji on the clipboard: when (ms since the epoch)
+     pub paste: Option<i64>,
++    /// the browser's tabs (plasma-browser-integration), when last asked for
++    pub tabs: Vec<Tab>,
++}
++
++/// .../tabs: "<id>\t<title>" lines, in the order of their ids
++#[derive(Default, Clone, PartialEq, Debug)]
++pub struct Tab {
++    pub id: String,
++    pub title: String,
+ }
+ 
+ /// .../notification: when (ms since the epoch), the program, the title
+@@ -174,7 +183,15 @@ impl StateWatch {
+             .map(|s| s.split_whitespace().map(str::to_string).collect())
+             .unwrap_or_default();
+         let paste = read_to_string(format!("{DIR}/paste")).ok().and_then(|s| s.trim().parse().ok());
+-        State { volume, mic_muted, playing, layout, touchid, dnd, notice, locked, title, emoji_recent, paste }
++        let tabs = read_to_string(format!("{DIR}/tabs"))
++            .map(|s| {
++                s.lines()
++                    .filter_map(|l| l.split_once('\t'))
++                    .map(|(id, title)| Tab { id: id.to_string(), title: title.to_string() })
++                    .collect()
++            })
++            .unwrap_or_default();
++        State { volume, mic_muted, playing, layout, touchid, dnd, notice, locked, title, emoji_recent, paste, tabs }
+     }
+     pub fn fd(&self) -> &impl AsFd {
+         &self.inotify_fd
+diff --git a/src/tabs.rs b/src/tabs.rs
+new file mode 100644
+index 0000000..1d54cf2
+--- /dev/null
++++ b/src/tabs.rs
+@@ -0,0 +1,217 @@
++// The browser tabs panel (like Safari's Touch Bar): a key (Command = "Tabs")
++// opens it over the program's part of the row (Esc and the Control Strip
++// stay): a round close button, a new-tab key (Ctrl+T) and a row of the
++// browser's tabs - icon and title, the active one lighter - that scrolls
++// with the finger and runs on after a flick. A tapped tab goes to the helper
++// ("tab <id>"), which switches to it. The helper lists the tabs from
++// plasma-browser-integration (its KRunner tabs runner) into .../tabs and
++// .../tab-<id>.png when asked ("tabs refresh": on opening, and whenever the
++// window title changes while it is open).
++use crate::{
++    config::Config,
++    media,
++    scroll::{Row, Scroll},
++    state::Tab,
++};
++use cairo::{Context, ImageSurface};
++use std::{collections::HashMap, f64::consts::TAU, fs::File};
++
++const DIR: &str = "/run/tiny-dfr/bridge";
++const CLOSE_BOX: f64 = 72.0;
++const NEW_WIDTH: f64 = 90.0;
++// one tab's place in the row, the gap between tabs, its icon and title
++const PITCH: f64 = 300.0;
++const GAP: f64 = 8.0;
++const ICON: f64 = 28.0;
++const TITLE_SIZE: f64 = 20.0;
++const PAD: f64 = 14.0;
++
++pub enum Hit {
++    Close,
++    New,
++    Strip,
++    Outside,
++}
++
++/// Parts in bar coordinates without pixel shift
++pub struct Layout {
++    pub left: f64,
++    pub close: (f64, f64),
++    pub new: (f64, f64),
++    pub strip: (f64, f64),
++    pub right: f64,
++}
++
++impl Layout {
++    /// `left`..`right`: the program's part of the row
++    pub fn new(cfg: &Config, left: f64, right: f64) -> Layout {
++        let close = (left, CLOSE_BOX);
++        let new = (close.0 + close.1 + cfg.group_spacing, NEW_WIDTH);
++        let s = new.0 + new.1 + cfg.group_spacing;
++        let strip = (s, (right - s).max(PITCH));
++        Layout { left, close, new, strip, right: strip.0 + strip.1 }
++    }
++    pub fn hit(&self, x: f64) -> Hit {
++        let within = |(l, w): (f64, f64)| x >= l - 4.0 && x < l + w + 4.0;
++        if x < self.left - 4.0 || x >= self.right + 4.0 {
++            Hit::Outside
++        } else if within(self.close) {
++            Hit::Close
++        } else if within(self.new) {
++            Hit::New
++        } else if within(self.strip) {
++            Hit::Strip
++        } else {
++            Hit::Outside
++        }
++    }
++}
++
++/// The tab of the active window's title ("<tab title> - Google Chrome"):
++/// the longest tab title it starts with
++pub fn active(tabs: &[Tab], title: &str) -> Option<usize> {
++    tabs.iter()
++        .enumerate()
++        .filter(|(_, t)| !t.title.is_empty() && title.starts_with(&t.title))
++        .max_by_key(|(_, t)| t.title.len())
++        .map(|(i, _)| i)
++}
++
++#[derive(Default)]
++pub struct Panel {
++    scroll: Scroll,
++    /// the new-tab key held
++    pub new_held: Option<u32>,
++    // tab icons by id (None: it has none), dropped when the list changes
++    icons: HashMap<String, Option<ImageSurface>>,
++    // the active tab was scrolled into view (once the list came)
++    revealed: bool,
++}
++
++impl Panel {
++    fn row(layout: &Layout, tabs: &[Tab]) -> Row {
++        Row { left: layout.strip.0, width: layout.strip.1, pitch: PITCH, count: tabs.len() }
++    }
++
++    /// The list changed: icons again; the active tab into view the first time
++    pub fn tabs_changed(&mut self, layout: &Layout, tabs: &[Tab], title: &str) {
++        self.icons.clear();
++        if !self.revealed && !tabs.is_empty() {
++            self.revealed = true;
++            if let Some(i) = active(tabs, title) {
++                self.scroll.reveal(&Self::row(layout, tabs), i);
++            }
++        }
++    }
++
++    pub fn touching(&self, slot: u32) -> bool {
++        self.scroll.touching(slot)
++    }
++
++    pub fn moving(&self) -> bool {
++        self.scroll.moving()
++    }
++
++    pub fn step(&mut self, layout: &Layout, tabs: &[Tab]) -> bool {
++        self.scroll.step(&Self::row(layout, tabs))
++    }
++
++    pub fn down(&mut self, layout: &Layout, tabs: &[Tab], slot: u32, x: f64) {
++        self.scroll.down(&Self::row(layout, tabs), slot, x);
++    }
++
++    pub fn motion(&mut self, layout: &Layout, tabs: &[Tab], slot: u32, x: f64) -> bool {
++        self.scroll.motion(&Self::row(layout, tabs), slot, x)
++    }
++
++    /// The finger went up: the tab tapped, if any
++    pub fn up(&mut self, tabs: &[Tab], slot: u32) -> Option<String> {
++        let i = self.scroll.up(slot)?;
++        tabs.get(i).map(|t| t.id.clone())
++    }
++
++    /// The PNG preview: a tab pressed
++    pub fn preview(&mut self, pressed: Option<usize>) {
++        self.scroll.pressed = pressed.map(|i| (0, i));
++    }
++
++    fn icon(&mut self, id: &str) -> Option<&ImageSurface> {
++        self.icons
++            .entry(id.to_string())
++            .or_insert_with(|| {
++                let mut f = File::open(format!("{DIR}/tab-{id}.png")).ok()?;
++                ImageSurface::create_from_png(&mut f).ok()
++            })
++            .as_ref()
++    }
++
++    /// Draw it all; the bar under it is cleared by the caller
++    pub fn draw(&mut self, c: &Context, cfg: &Config, layout: &Layout, tabs: &[Tab], title: &str, height: f64, (sx, sy): (f64, f64)) {
++        let bh = if cfg.button_height > 0.0 { cfg.button_height.min(height) } else { height * 0.7 };
++        let top = (height - bh) / 2.0 + sy;
++        let cy = height / 2.0 + sy;
++        media::close_button(c, layout.close.0 + layout.close.1 / 2.0 + sx, height);
++        // new tab: a plus
++        let (l, w) = layout.new;
++        let (r, g, b) = if self.new_held.is_some() { cfg.button_active_color } else { cfg.button_color };
++        c.set_source_rgb(r, g, b);
++        media::rounded_rect(c, l + sx, top, w, bh, cfg.button_radius);
++        c.fill().unwrap();
++        let mx = l + w / 2.0 + sx;
++        c.set_source_rgb(1.0, 1.0, 1.0);
++        c.set_line_width(3.0);
++        c.set_line_cap(cairo::LineCap::Round);
++        c.move_to(mx - 11.0, cy);
++        c.line_to(mx + 11.0, cy);
++        c.move_to(mx, cy - 11.0);
++        c.line_to(mx, cy + 11.0);
++        c.stroke().unwrap();
++        // the tabs, cut at the row's ends
++        let (sl, sw) = layout.strip;
++        c.save().unwrap();
++        c.rectangle(sl + sx, 0.0, sw, height);
++        c.clip();
++        c.set_font_face(&cfg.font_face);
++        c.set_font_size(TITLE_SIZE);
++        if tabs.is_empty() {
++            c.set_source_rgb(0.6, 0.6, 0.6);
++            c.move_to(sl + PAD + sx, cy + 7.0);
++            let _ = c.show_text("—");
++        }
++        let current = active(tabs, title);
++        let (items, x0) = self.scroll.visible(&Self::row(layout, tabs));
++        for i in items.clone() {
++            let x = x0 + (i - items.start) as f64 * PITCH + sx;
++            let w = PITCH - GAP;
++            let pressed = self.scroll.pressed.is_some_and(|(_, p)| p == i);
++            let (r, g, b) = if pressed || current == Some(i) { cfg.button_active_color } else { cfg.button_color };
++            c.set_source_rgb(r, g, b);
++            media::rounded_rect(c, x, top, w, bh, cfg.button_radius);
++            c.fill().unwrap();
++            let mut text_left = x + PAD;
++            let id = tabs[i].id.clone();
++            if let Some(icon) = self.icon(&id) {
++                let scale = ICON / icon.width().max(icon.height()).max(1) as f64;
++                c.save().unwrap();
++                c.translate(x + PAD, (cy - ICON / 2.0).round());
++                c.scale(scale, scale);
++                c.set_source_surface(icon, 0.0, 0.0).unwrap();
++                c.source().set_filter(cairo::Filter::Good);
++                c.paint().unwrap();
++                c.restore().unwrap();
++                text_left += ICON + 10.0;
++            } else {
++                // no icon: a dot in its place
++                c.set_source_rgb(0.55, 0.55, 0.55);
++                c.arc(x + PAD + ICON / 2.0, cy, 5.0, 0.0, TAU);
++                c.fill().unwrap();
++                text_left += ICON + 10.0;
++            }
++            c.set_source_rgb(1.0, 1.0, 1.0);
++            let t = media::fit(c, &tabs[i].title, x + w - PAD - text_left);
++            c.move_to(text_left, cy + 7.0);
++            let _ = c.show_text(&t);
++        }
++        c.restore().unwrap();
++    }
++}
+-- 
+2.53.0
+

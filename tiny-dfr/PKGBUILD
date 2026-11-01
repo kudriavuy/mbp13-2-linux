@@ -1,0 +1,82 @@
+# tiny-dfr (AsahiLinux, MIT; icons Apache-2.0) for the MacBookPro13,2 Touch
+# Bar (T1) with local patches. Built by build.sh (makepkg or a container).
+pkgname=tiny-dfr
+pkgver=0.3.7
+pkgrel=20
+_commit=285faff8b8cae893e9babd673b904929dd6f7f9c
+pkgdesc="The most basic dynamic function row daemon possible (MacBookPro13,2 T1 patches)"
+arch=(x86_64)
+url="https://github.com/AsahiLinux/tiny-dfr"
+license=(MIT Apache-2.0)
+# inter-font, noto-fonts-emoji: the fonts of config.toml
+depends=(cairo pango librsvg libinput freetype2 fontconfig glib2 systemd-libs gcc-libs glibc inter-font noto-fonts-emoji)
+makedepends=(rust git)
+source=("git+https://github.com/AsahiLinux/tiny-dfr.git#commit=$_commit"
+        0001-Choose-the-base-layer-from-run-tiny-dfr-layer.patch
+        0002-Log-why-etc-tiny-dfr-config.toml-is-not-used.patch
+        0003-Exit-after-a-panic-when-TINY_DFR_EXIT_ON_PANIC-1.patch
+        0004-Configurable-button-look-and-a-PNG-preview-mode.patch
+        0005-Control-Strip-collapsed-and-expanded-rows.patch
+        0006-Volume-and-brightness-sliders.patch
+        0007-macOS-like-slider-joined-keys-keys-without-a-box-ren.patch
+        0008-Animations-key-highlight-Control-Strip-slide-slider-.patch
+        0009-Key-sets-per-program.patch
+        0010-Live-icons-sliders-on-keys-keyboard-light-slider-qui.patch
+        0011-Now-playing-a-key-and-a-panel-for-the-media-player.patch
+        0012-Keyboard-layout-key.patch
+        0013-Touch-ID-hint.patch
+        0014-Notifications-do-not-disturb-F-key-labels-a-fuller-n.patch
+        0015-No-frames-while-the-Touch-Bar-is-dark-battery-redraw.patch
+        0016-Touch-ID-hint-flash-only-a-new-result.patch
+        0017-Lock-screen-rules-by-window-title-covers-hidden-batt.patch
+        0018-Lock-screen-call-up-its-form-so-that-a-finger-unlock.patch
+        0019-Emoji-panel.patch
+        0020-Panels-an-AppSets-entry-opened-over-the-program-s-ke.patch
+        0021-Browser-tabs-panel.patch)
+sha256sums=('SKIP'
+            '56d08c866726c75638d2bafa53a5b7428aa7bd114d4ecc75bf290a376eb5b67e'
+            'f4008b7a2723aed66d253b78e8501a60e0d179a483818180daa358b8a5c2ee45'
+            '6da1c77e8cdef573fe9748fd1245f970dfc7afc54221cf79ed226eb0342203a6'
+            '66baba957c903c42d9417d42578fd4657fe6f68be133c6103472b660bc5ff59b'
+            '75b64c6d6831fefdbbde4ab5647b288c3de240d331d2baa946c780d678ef221c'
+            '740341a2e15094c30e53fd9a578da8ed0ecb6f73c03e599398cf2a1a53bbed76'
+            'e32861000c01d60e20b8628ecba1a97f688417ff47c9fa0ba7b461ae8ae30489'
+            '4cd1eea3316dd2c8ac0b968ed1149f2e265540bb99ee61ea547bebbcb9cbfe89'
+            '3caeca220c99a1e4f5f9632ddb6265e3d7301e52fa66f5c812bedef4601284aa'
+            '0be74b452573acda31c24e0a2b2b93099d9eb5ec941de724e41414b32c469c3b'
+            '8fcc436d6d112fa84be96873709777a3b3767f3a219e820ec01676ba0e79892a'
+            '792290794d33b295faa6977974f83efaea923ab4a7a39628bba79271c1f028ed'
+            'c9139d80bc53cff7371a4d8dca826dce8d1ead20ceaebfdd9ad491b61b034adf'
+            '0e57dd4d921eae8cc8ebd4ca2e2527fe56fbb39c7ae7560ec505f6e8867e8e26'
+            'f0bed2d3704182d40f64cbff042a160c640d8e787c608b9b8e951fa36d93707a'
+            'a047c746fec9368a4bef4f5f6ee9d2d487d53733767496c50e50be7f4f89a664'
+            'fb734458b12cc0c5198cc0dd2e5bf8d371023da731471a4e36219ea62d56d70c'
+            'b65e6cdbb6e5b96b7c7cd30921f8b386de8e14bfb1b50016ba2264879549fa3a'
+            '3cffa97d9a018f99dee739befb37d27153b8d751677d6ab300ba35a03c35d5d7'
+            'c679f38e365ab5b0437af2c91c45ed467f34f636f1439f5fb94901bc5cc05b82'
+            'f4e567e2ec75c79c4f9c6032e45a6c1b8b9a3ebf762a6a0db4519385e9bb03f7')
+
+prepare() {
+	cd tiny-dfr
+	for p in "$srcdir"/0*.patch; do
+		patch -Np1 -i "$p"
+	done
+	export RUSTUP_TOOLCHAIN=stable
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+	cd tiny-dfr
+	export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+	cargo build --frozen --release
+}
+
+package() {
+	cd tiny-dfr
+	install -Dm755 target/release/tiny-dfr "$pkgdir/usr/bin/tiny-dfr"
+	install -Dm644 -t "$pkgdir/usr/share/tiny-dfr/" share/tiny-dfr/*
+	# the unit only; its udev rules are for T2/Apple silicon, ours are in this repository
+	install -Dm644 etc/systemd/system/tiny-dfr.service "$pkgdir/usr/lib/systemd/system/tiny-dfr.service"
+	install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname/" LICENSE LICENSE.material
+	install -Dm644 "$srcdir"/0*.patch -t "$pkgdir/usr/share/doc/$pkgname/patches/"
+}

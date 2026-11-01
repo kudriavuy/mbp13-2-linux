@@ -1,0 +1,3 @@
+# Touch Bar mode (hid-appletb-kbd 'mode' attribute) writable by wheel, so the
+# KWin script (through mbp-touchbar-mode@.service) can switch F1-F12/media.
+ACTION=="bind", SUBSYSTEM=="hid", DRIVER=="hid-appletb-kbd", RUN+="/bin/sh -c 'chgrp wheel /sys%p/mode && chmod 0664 /sys%p/mode'"

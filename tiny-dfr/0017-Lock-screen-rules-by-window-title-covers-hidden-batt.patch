@@ -1,0 +1,652 @@
+From 8d1c97cae48e39a7f9a4f3e07a11a8a9ab6c2b41 Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 00:13:12 +0100
+Subject: [PATCH] Lock screen, rules by window title, covers, hidden battery,
+ real maximum
+
+- While the screen is locked (the helper's .../locked) the bar shows a
+  row of its own, Esc and LockScreenKeys (none by default): no
+  notification, now-playing panel or slider of the session.
+- MatchTitle in an [[Apps]] rule: parts of the window title (the helper's
+  .../title), any of which must be in it; Match may be left out. A title
+  change alone looks at the rules again, so a web site gets its own keys.
+- The now-playing key and panel show the player's cover (nowplaying "art
+  <file>", an SVG around the picture next to the state files); the
+  scrubber starts after it.
+- ShowBelow on a Battery key: shown only below that charge or while
+  charging, taking no room otherwise.
+- AdaptiveBrightness divides by the display backlight's own maximum, not
+  Apple silicon's 509 (acpi_video0 here goes to 90: the bar was always on
+  its lowest level).
+- TINY_DFR_WHICH_SET takes "class|title" too.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01M5fvpySRgDHQss3fsr2hF6
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ share/tiny-dfr/config.toml |  11 ++++
+ src/backlight.rs           |  16 ++++-
+ src/config.rs              |  37 +++++++++---
+ src/main.rs                | 119 ++++++++++++++++++++++++++++++++-----
+ src/media.rs               |  27 +++++++--
+ src/state.rs               |  11 +++-
+ 6 files changed, 187 insertions(+), 34 deletions(-)
+
+diff --git a/share/tiny-dfr/config.toml b/share/tiny-dfr/config.toml
+index aee03b7..ec656db 100644
+--- a/share/tiny-dfr/config.toml
++++ b/share/tiny-dfr/config.toml
+@@ -111,6 +111,17 @@ FontTemplate = ":bold"
+ # Text with a line break ("Run\nF5") is drawn as two smaller lines.
+ # FnSet = "<AppSets entry>" in an [[Apps]] rule: that entry over the whole row
+ # while Fn is held in the program (labels for its F-keys), instead of F1-F12.
++# While the screen is locked (the helper's .../locked) the bar shows only Esc
++# and LockScreenKeys (default none), and no notification, media or slider.
++# LockScreenKeys = []
++# MatchTitle = ["part of a title", ...] in an [[Apps]] rule: the window title
++# (from the helper's .../title) must contain one of them; Match may be left out
++# (any program). Put such rules before the general ones.
++# ShowBelow = 20 on a Battery key: shown only below that charge or while
++# charging (it takes no room otherwise).
++# Command = "NowPlaying" keys show the player's cover when the helper gives
++# one (nowplaying "art <file>": an SVG next to the state files).
++# AdaptiveBrightness uses the display backlight's own max_brightness.
+ # PixelShiftSmooth = true   # false: one whole pixel every 10 s instead of a
+ #                           # 4 s animation (fewer frames); no shifting at all
+ #                           # while the bar is dark
+diff --git a/src/backlight.rs b/src/backlight.rs
+index 85d6a6c..5e06d0e 100644
+--- a/src/backlight.rs
++++ b/src/backlight.rs
+@@ -72,6 +72,9 @@ pub struct BacklightManager {
+     lid_state: SwitchState,
+     bl_file: File,
+     display_bl_path: Option<PathBuf>,
++    // the display backlight's own maximum (MAX_DISPLAY_BRIGHTNESS is Apple
++    // silicon's 509; acpi_video0 on a MacBookPro13,2 goes to 90)
++    display_max: u32,
+ }
+ 
+ impl BacklightManager {
+@@ -84,7 +87,14 @@ impl BacklightManager {
+             .write(true)
+             .open(bl_path.join("brightness"))
+             .unwrap();
++        let display_max = display_bl_path
++            .as_ref()
++            .and_then(|p| fs::read_to_string(p.join("max_brightness")).ok())
++            .and_then(|s| s.trim().parse::<u32>().ok())
++            .filter(|m| *m > 0)
++            .unwrap_or(MAX_DISPLAY_BRIGHTNESS);
+         BacklightManager {
++            display_max,
+             bl_file,
+             lid_state: SwitchState::Off,
+             max_bl: read_attr(&bl_path, "max_brightness"),
+@@ -93,8 +103,8 @@ impl BacklightManager {
+             display_bl_path,
+         }
+     }
+-    fn display_to_touchbar(display: u32, active_brightness: u32) -> u32 {
+-        let normalized = display as f64 / MAX_DISPLAY_BRIGHTNESS as f64;
++    fn display_to_touchbar(display: u32, display_max: u32, active_brightness: u32) -> u32 {
++        let normalized = (display as f64 / display_max as f64).min(1.0);
+         // Add one so that the touch bar does not turn off
+         let adjusted = (normalized.powf(0.5) * active_brightness as f64) as u32 + 1;
+         adjusted.min(MAX_TOUCH_BAR_BRIGHTNESS) // Clamp the value to the maximum allowed brightness
+@@ -129,7 +139,7 @@ impl BacklightManager {
+                     } else {
+                         self.max_bl / 2
+                     };
+-                    BacklightManager::display_to_touchbar(brightness, cfg.active_brightness)
++                    BacklightManager::display_to_touchbar(brightness, self.display_max, cfg.active_brightness)
+                 } else {
+                     cfg.active_brightness
+                 }
+diff --git a/src/config.rs b/src/config.rs
+index 9401733..5efbf64 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -53,6 +53,8 @@ pub struct Config {
+     pub notification_icon: Option<String>,
+     // FnSet of a rule -> its full-width row (Fn held in that program)
+     pub fn_rows: HashMap<String, usize>,
++    // the row shown while the screen is locked (LockScreenKeys after Esc)
++    pub lock_row: usize,
+ }
+ 
+ /// Icons that follow the session (Live = ...)
+@@ -83,7 +85,11 @@ pub enum SlideKind {
+ #[derive(Deserialize, Clone)]
+ #[serde(rename_all = "PascalCase")]
+ pub struct AppRule {
++    /// window classes (none: any program)
++    #[serde(default)]
+     pub r#match: Vec<String>,
++    /// parts of the window title, any of them (a web site in a browser)
++    pub match_title: Option<Vec<String>>,
+     pub set: String,
+     /// an [AppSets] entry shown over the whole row while Fn is held (labels
+     /// for the F-keys), instead of the plain F1-F12
+@@ -100,26 +106,31 @@ pub enum AppSet {
+ }
+ 
+ impl Config {
+-    /// The first rule matching window class `class`
+-    fn rule_for(&self, class: &str) -> Option<&AppRule> {
++    /// The first rule matching window class `class` and title `title`
++    fn rule_for(&self, class: &str, title: &str) -> Option<&AppRule> {
+         let class = class.to_lowercase();
++        let title = title.to_lowercase();
+         self.apps.iter().find(|r| {
+-            r.r#match.iter().any(|p| {
++            let title_fits = r
++                .match_title
++                .as_ref()
++                .is_none_or(|parts| parts.iter().any(|t| title.contains(&t.to_lowercase())));
++            title_fits && (r.r#match.is_empty() || r.r#match.iter().any(|p| {
+                 let p = p.to_lowercase();
+                 match p.strip_suffix('*') {
+                     Some(prefix) => class.starts_with(prefix),
+                     None => class == p,
+                 }
+-            })
++            }))
+         })
+     }
+     /// The F-key row of that program (FnSet), if it has one
+-    pub fn fn_row_for(&self, class: &str) -> Option<usize> {
+-        self.fn_rows.get(self.rule_for(class)?.fn_set.as_ref()?).copied()
++    pub fn fn_row_for(&self, class: &str, title: &str) -> Option<usize> {
++        self.fn_rows.get(self.rule_for(class, title)?.fn_set.as_ref()?).copied()
+     }
+-    /// The set of the first rule matching window class `class`
+-    pub fn set_for(&self, class: &str) -> Option<AppSet> {
+-        let rule = self.rule_for(class)?;
++    /// The set of the first rule matching window class `class` and title
++    pub fn set_for(&self, class: &str, title: &str) -> Option<AppSet> {
++        let rule = self.rule_for(class, title)?;
+         match rule.set.as_str() {
+             "fn" => Some(AppSet::Fn),
+             "strip" => Some(AppSet::Strip),
+@@ -194,6 +205,7 @@ struct ConfigProxy {
+     notifications: Option<bool>,
+     notification_seconds: Option<u64>,
+     notification_icon: Option<String>,
++    lock_screen_keys: Option<Vec<ButtonConfig>>,
+ }
+ 
+ fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<Key>, D::Error>
+@@ -247,6 +259,8 @@ pub struct ButtonConfig {
+     pub slider_icon_high: Option<String>,
+     pub live: Option<Live>,
+     pub slider: Option<SlideKind>,
++    /// a Battery key only below this charge (%) or while charging
++    pub show_below: Option<u32>,
+     // filled in from VolumeIcons / MicIcons for a Live button
+     #[serde(skip)]
+     pub live_icons: Vec<String>,
+@@ -337,6 +351,7 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+         base.notifications = user.notifications.or(base.notifications);
+         base.notification_seconds = user.notification_seconds.or(base.notification_seconds);
+         base.notification_icon = user.notification_icon.or(base.notification_icon);
++        base.lock_screen_keys = user.lock_screen_keys.or(base.lock_screen_keys);
+     };
+     let media_layer_keys = base.media_layer_keys.unwrap();
+     let primary_layer_keys = base.primary_layer_keys.unwrap();
+@@ -385,6 +400,9 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+             }
+         }
+     }
++    // while the screen is locked: Esc and LockScreenKeys (none by default)
++    let lock_row = rows.len();
++    rows.push(base.lock_screen_keys.clone().unwrap_or_default());
+     let apps = base.apps.clone().unwrap_or_default();
+     for rule in &apps {
+         if !["fn", "strip"].contains(&rule.set.as_str()) && !app_sets.contains_key(&rule.set) {
+@@ -474,6 +492,7 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+         notification_time: std::time::Duration::from_secs(base.notification_seconds.unwrap_or(4)),
+         notification_icon: base.notification_icon.clone(),
+         fn_rows,
++        lock_row,
+     };
+     crate::anim::set_enabled(cfg.animations);
+     (cfg, layers)
+diff --git a/src/main.rs b/src/main.rs
+index 0601b54..98b9f19 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -88,6 +88,7 @@ fn notice_now<'a>(cfg: &Config, session: &'a state::State, dismissed: i64) -> Op
+     let n = session.notice.as_ref()?;
+     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+     (cfg.notifications
++        && !session.locked
+         && n.at_ms != dismissed
+         && now_ms - n.at_ms < cfg.notification_time.as_millis() as i64
+         && now_ms >= n.at_ms - 1000
+@@ -106,6 +107,11 @@ fn named_icon(name: Option<&String>) -> Option<Button> {
+     })
+ }
+ 
++/// The cover the helper wrote (an SVG around the picture)
++fn load_cover(path: &str) -> Option<ButtonImage> {
++    try_load_svg(path).ok()
++}
++
+ /// What the Touch ID hint shows now: a recent result, else a fresh wait
+ fn touchid_now(cfg: &Config, session: &state::State, flash: Option<(state::TouchId, Instant)>) -> Option<state::TouchId> {
+     if !cfg.touchid_hint {
+@@ -197,6 +203,10 @@ struct Button {
+     slide: Option<SlideKind>,
+     // not shown and taking no room (NowPlaying without a player)
+     hidden: bool,
++    // NowPlaying: its own icon while a cover is shown instead
++    own_image: Option<ButtonImage>,
++    // Battery with ShowBelow: shown only below this charge or charging
++    show_below: Option<u32>,
+ }
+ 
+ fn try_load_svg(path: &str) -> Result<ButtonImage> {
+@@ -371,7 +381,9 @@ impl Button {
+             (kind, images, shown)
+         });
+         let slide = cfg.slider;
++        let show_below = cfg.show_below;
+         let mut button = Button::from_image_config(cfg, icon_size);
++        button.show_below = show_below;
+         if let Some((_, images, shown)) = live.as_ref().filter(|l| !l.1.is_empty()) {
+             button.image = images[*shown].clone();
+             if let (ButtonImage::Svg(_), true) = (&button.image, button.icon_width == 0.0) {
+@@ -430,6 +442,8 @@ impl Button {
+             live: None,
+             slide: None,
+             hidden: false,
++            own_image: None,
++            show_below: None,
+         }
+     }
+     fn new_text(text: String, action: Vec<Key>) -> Button {
+@@ -450,6 +464,8 @@ impl Button {
+             live: None,
+             slide: None,
+             hidden: false,
++            own_image: None,
++            show_below: None,
+         }
+     }
+     fn new_icon(
+@@ -478,6 +494,8 @@ impl Button {
+             live: None,
+             slide: None,
+             hidden: false,
++            own_image: None,
++            show_below: None,
+         }
+     }
+     fn load_battery_image(icon: &str, theme: Option<impl AsRef<str>>) -> Handle {
+@@ -541,6 +559,8 @@ impl Button {
+             live: None,
+             slide: None,
+             hidden: false,
++            own_image: None,
++            show_below: None,
+         }
+     }
+ 
+@@ -578,6 +598,8 @@ impl Button {
+             live: None,
+             slide: None,
+             hidden: false,
++            own_image: None,
++            show_below: None,
+         }
+     }
+     fn needs_faster_refresh(&self) -> bool {
+@@ -785,6 +807,38 @@ impl Button {
+             self.changed = true;
+         }
+     }
++    /// NowPlaying: the player's cover instead of the icon, or the icon again
++    fn show_cover(&mut self, cover: Option<&ButtonImage>) {
++        if self.command != Some(Command::NowPlaying) {
++            return;
++        }
++        match cover {
++            Some(c) => {
++                if self.own_image.is_none() {
++                    self.own_image = Some(self.image.clone());
++                }
++                self.image = c.clone();
++            }
++            None => {
++                if let Some(own) = self.own_image.take() {
++                    self.image = own;
++                }
++            }
++        }
++        self.changed = true;
++    }
++    /// Battery with ShowBelow: hidden unless low or charging; true if that changed
++    fn battery_visibility(&mut self) -> bool {
++        let (Some(limit), ButtonImage::Battery(battery, _, _)) = (self.show_below, &self.image) else {
++            return false;
++        };
++        let (capacity, state) = get_battery_state(battery);
++        let charging = state == BatteryState::Charging && capacity < 100;
++        let hidden = !(capacity < limit || charging);
++        let changed = hidden != self.hidden;
++        self.hidden = hidden;
++        changed
++    }
+     /// Show a layout's short name (upper case) as the key's text
+     fn show_layout(&mut self, name: &str) {
+         let text = name.to_uppercase();
+@@ -1164,8 +1218,9 @@ fn render_preview(path: &std::ffi::OsStr) {
+         (ROW_STRIP_EXPANDED, Some(1), None),
+         (ROW_FKEYS, None, None),
+     ];
+-    // one row per program key set, and the F-key label rows
++    // one row per program key set, the F-key label rows, the lock row
+     let mut sets: Vec<_> = cfg.app_sets.values().chain(cfg.fn_rows.values()).copied().collect();
++    sets.push(cfg.lock_row);
+     sets.sort();
+     for r in sets {
+         rows.push((r, None, None));
+@@ -1240,6 +1295,7 @@ fn render_preview(path: &std::ffi::OsStr) {
+         can_seek: true,
+         player: "Chrome".into(),
+         players: 2,
++        art: None,
+     };
+     let has_np = layers[ROW_STRIP_COLLAPSED].buttons.iter().any(|(_, b)| b.command == Some(Command::NowPlaying));
+     let mut extra = 0;
+@@ -1252,7 +1308,7 @@ fn render_preview(path: &std::ffi::OsStr) {
+         for with_panel in [false, true] {
+             layers[ROW_STRIP_COLLAPSED].draw(&cfg, width as i32, height as i32, &bar, (0.0, 0.0), true);
+             if with_panel {
+-                let layout = media_layout(&cfg, &layers[ROW_STRIP_COLLAPSED], width, demo.players);
++                let layout = media_layout(&cfg, &layers[ROW_STRIP_COLLAPSED], width, demo.players, false);
+                 let bc = Context::new(&bar).unwrap();
+                 bc.translate(height as f64, 0.0);
+                 bc.rotate((90.0f64).to_radians());
+@@ -1261,7 +1317,7 @@ fn render_preview(path: &std::ffi::OsStr) {
+                 bc.rectangle(layout.left + sx - cfg.group_spacing / 2.0, 0.0, layout.right - layout.left + cfg.group_spacing, height as f64);
+                 bc.fill().unwrap();
+                 bc.set_font_face(&cfg.font_face);
+-                media::Panel::new().draw(&bc, &cfg, &layout, Some(&demo), height as f64, (sx, 0.0), true);
++                media::Panel::new().draw(&bc, &cfg, &layout, Some(&demo), None, height as f64, (sx, 0.0), true);
+             }
+             bar.flush();
+             c.save().unwrap();
+@@ -1446,14 +1502,16 @@ fn main() {
+     if let Ok(classes) = env::var("TINY_DFR_WHICH_SET") {
+         let (cfg, _) = ConfigManager::new().load_config(2170);
+         let names: HashMap<usize, &String> = cfg.app_sets.iter().map(|(n, r)| (*r, n)).collect();
+-        for class in classes.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+-            let set = match cfg.set_for(class) {
++        for entry in classes.split(',').map(str::trim).filter(|c| !c.is_empty()) {
++            // "class" or "class|window title"
++            let (class, title) = entry.split_once('|').unwrap_or((entry, ""));
++            let set = match cfg.set_for(class, title) {
+                 Some(AppSet::Fn) => "fn (F1-F12)".to_string(),
+                 Some(AppSet::Strip) => "strip (expanded Control Strip)".to_string(),
+                 Some(AppSet::Keys(r)) => format!("{} (keys + collapsed strip)", names[&r]),
+                 None => "no rule: default (MediaLayerDefault / ControlStripDefault)".to_string(),
+             };
+-            println!("{class}: {set}");
++            println!("{entry}: {set}");
+         }
+         return;
+     }
+@@ -1520,9 +1578,9 @@ fn app_area(cfg: &Config, layer: &FunctionLayer, width: u16) -> (f64, f64) {
+ }
+ 
+ /// The now-playing panel over the program's part of `layer` (the strip stays)
+-fn media_layout(cfg: &Config, layer: &FunctionLayer, width: u16, players: usize) -> media::Layout {
++fn media_layout(cfg: &Config, layer: &FunctionLayer, width: u16, players: usize, cover: bool) -> media::Layout {
+     let (left, right) = app_area(cfg, layer, width);
+-    media::Layout::new(cfg, left, right, players > 1)
++    media::Layout::new(cfg, left, right, players > 1, cover)
+ }
+ 
+ /// A key of the now-playing panel: to the helper (MPRIS), else as a media key
+@@ -1652,6 +1710,8 @@ fn real_main(drm: &mut DrmBackend) {
+     let mut layout_hold: Option<(u32, f64, usize, Option<usize>)> = None;
+     // the battery key: redraw due, and the minute it was last due
+     let mut battery_due = true;
++    // the player's cover (NowPlaying key, panel), if it gives one
++    let mut cover: Option<ButtonImage> = None;
+     let mut battery_minute = u32::MAX;
+     // Touch ID: the icon, a result being shown (kind, since), what is drawn
+     let mut fingerprint = touchid_icon(&cfg);
+@@ -1752,7 +1812,8 @@ fn real_main(drm: &mut DrmBackend) {
+             // the program's key set ([[Apps]] for its window class), else the
+             // layer file (fn/media), else MediaLayerDefault
+             let app = layer_switch.app();
+-            let (want_media, want_row, want_expanded) = match app.as_deref().and_then(|a| cfg.set_for(a)) {
++            let title = session.title.clone().unwrap_or_default();
++            let (want_media, want_row, want_expanded) = match app.as_deref().and_then(|a| cfg.set_for(a, &title)) {
+                 Some(AppSet::Fn) => (false, ROW_STRIP_COLLAPSED, cfg.control_strip_expanded),
+                 Some(AppSet::Strip) => (true, ROW_STRIP_COLLAPSED, true),
+                 Some(AppSet::Keys(r)) => (true, r, false),
+@@ -1762,7 +1823,7 @@ fn real_main(drm: &mut DrmBackend) {
+                     cfg.control_strip_expanded,
+                 ),
+             };
+-            let want_fn_row = app.as_deref().and_then(|a| cfg.fn_row_for(a)).unwrap_or(ROW_FKEYS);
++            let want_fn_row = app.as_deref().and_then(|a| cfg.fn_row_for(a, &title)).unwrap_or(ROW_FKEYS);
+             if app != current_app || want_media != base_is_media || want_row != collapsed_row || want_fn_row != fn_row {
+                 // release what is held: another program, another row
+                 for (_, (layer, btn)) in touches.drain() {
+@@ -1778,7 +1839,23 @@ fn real_main(drm: &mut DrmBackend) {
+         }
+         // the session changed (volume, mute): icons that follow it
+         if state_watch.changed() {
++            let old_title = session.title.clone();
++            let old_art = session.playing.as_ref().and_then(|n| n.art.clone());
+             session = state_watch.read();
++            // another web site: maybe another key set
++            if session.title != old_title {
++                check_layer = true;
++            }
++            let art = session.playing.as_ref().and_then(|n| n.art.clone());
++            if art != old_art {
++                cover = art.as_ref().and_then(|p| load_cover(p));
++                for layer in layers.iter_mut() {
++                    for (_, b) in &mut layer.buttons {
++                        b.show_cover(cover.as_ref());
++                    }
++                }
++                media_full = true;
++            }
+             // a new result: show it a moment even if "idle" follows at once.
+             // The file is read again whenever anything in its directory
+             // changes (the program, the layer): an old result is not new.
+@@ -1805,7 +1882,15 @@ fn real_main(drm: &mut DrmBackend) {
+                 needs_complete_redraw = true;
+             }
+         }
+-        let wanted_row = row(base_is_media, fn_held, expanded, collapsed_row, fn_row);
++        // locked: only the lock row (Esc), nothing of the session on the bar
++        let wanted_row = if session.locked {
++            if media.take().is_some() {
++                needs_complete_redraw = true;
++            }
++            cfg.lock_row
++        } else {
++            row(base_is_media, fn_held, expanded, collapsed_row, fn_row)
++        };
+         if wanted_row != active_layer {
+             active_layer = wanted_row;
+             needs_complete_redraw = true;
+@@ -1905,6 +1990,10 @@ fn real_main(drm: &mut DrmBackend) {
+             for button in &mut layers[active_layer].buttons {
+                 if let ButtonImage::Battery(_, _, _) = button.1.image {
+                     button.1.changed = true;
++                    // it came or went: the others move
++                    if button.1.battery_visibility() {
++                        needs_complete_redraw = true;
++                    }
+                 }
+             }
+         }
+@@ -2004,7 +2093,7 @@ fn real_main(drm: &mut DrmBackend) {
+             }
+             // the panel lies over the program's part (under a slider: hidden)
+             if let (Some(m), None) = (&media, &slider) {
+-                let layout = media_layout(&cfg, &layers[active_layer], width, session.playing.as_ref().map_or(1, |n| n.players));
++                let layout = media_layout(&cfg, &layers[active_layer], width, session.playing.as_ref().map_or(1, |n| n.players), cover.is_some());
+                 let sx = shift.0 + pixel_shift_width(&cfg) / 2.0;
+                 let full = needs_complete_redraw || layer_changed;
+                 let c = Context::new(&surface).unwrap();
+@@ -2017,7 +2106,7 @@ fn real_main(drm: &mut DrmBackend) {
+                     c.fill().unwrap();
+                 }
+                 c.set_font_face(&cfg.font_face);
+-                m.draw(&c, &cfg, &layout, session.playing.as_ref(), height as f64, (sx, shift.1), full || media_full);
++                m.draw(&c, &cfg, &layout, session.playing.as_ref(), cover.as_ref(), height as f64, (sx, shift.1), full || media_full);
+                 drop(c);
+                 if full || media_full {
+                     let x1 = (layout.left + sx - cfg.group_spacing).max(0.0) as u16;
+@@ -2196,7 +2285,7 @@ fn real_main(drm: &mut DrmBackend) {
+                                 continue;
+                             }
+                             if let Some(m) = &mut media {
+-                                let layout = media_layout(&cfg, &layers[active_layer], width, session.playing.as_ref().map_or(1, |n| n.players));
++                                let layout = media_layout(&cfg, &layers[active_layer], width, session.playing.as_ref().map_or(1, |n| n.players), cover.is_some());
+                                 match layout.hit(x - half_shift) {
+                                     media::Hit::Close => {
+                                         media = None;
+@@ -2271,7 +2360,7 @@ fn real_main(drm: &mut DrmBackend) {
+                             if let Some(m) = &mut media {
+                                 if let Some((slot, _)) = m.scrub {
+                                     if slot == mtn.seat_slot() {
+-                                        let layout = media_layout(&cfg, &layers[active_layer], width, session.playing.as_ref().map_or(1, |n| n.players));
++                                        let layout = media_layout(&cfg, &layers[active_layer], width, session.playing.as_ref().map_or(1, |n| n.players), cover.is_some());
+                                         m.scrub = Some((slot, layout.fraction_at(x - half_shift)));
+                                         media_dirty = true;
+                                         continue;
+diff --git a/src/media.rs b/src/media.rs
+index 34711b0..a36a33e 100644
+--- a/src/media.rs
++++ b/src/media.rs
+@@ -5,7 +5,7 @@
+ // to the next player when there are several, and a capsule with title,
+ // artist, player, time and a scrubber. Dragging the scrubber seeks on release. Commands go to the helper (mbp-touchbar-bridge:
+ // MPRIS of that player); without it the three keys are media keys.
+-use crate::{config::Config, state::NowPlaying};
++use crate::{config::Config, state::NowPlaying, ButtonImage};
+ use cairo::Context;
+ use std::f64::consts::TAU;
+ 
+@@ -49,7 +49,8 @@ pub struct Layout {
+ 
+ impl Layout {
+     /// `left`..`right`: the program's part of the row
+-    pub fn new(cfg: &Config, left: f64, right: f64, switch: bool) -> Layout {
++    /// `cover`: the player's cover sits at the capsule's left end
++    pub fn new(cfg: &Config, left: f64, right: f64, switch: bool, cover: bool) -> Layout {
+         let close = (left, CLOSE_BOX);
+         let mut x = close.0 + close.1 + cfg.group_spacing;
+         let mut keys = [(0.0, 0.0); 3];
+@@ -64,7 +65,9 @@ impl Layout {
+         });
+         let capsule = (x - cfg.button_spacing + cfg.group_spacing, 0.0);
+         let capsule = (capsule.0, (right - capsule.0).max(KEY_WIDTH));
+-        let track = (capsule.0 + PAD + KNOB_RADIUS, capsule.0 + capsule.1 - PAD - KNOB_RADIUS);
++        let bh = if cfg.button_height > 0.0 { cfg.button_height } else { 42.0 };
++        let cover_room = if cover { bh - 8.0 + 8.0 } else { 0.0 };
++        let track = (capsule.0 + PAD + cover_room + KNOB_RADIUS, capsule.0 + capsule.1 - PAD - KNOB_RADIUS);
+         Layout { left, close, keys, switch, capsule, right: capsule.0 + capsule.1, track }
+     }
+     pub fn hit(&self, x: f64) -> Hit {
+@@ -152,7 +155,7 @@ impl Panel {
+ 
+     /// `full`: also the close button and the keys (else only the capsule,
+     /// for the running time). The bar around it must be cleared by the caller.
+-    pub fn draw(&self, c: &Context, cfg: &Config, layout: &Layout, np: Option<&NowPlaying>, height: f64, (sx, sy): (f64, f64), full: bool) {
++    pub fn draw(&self, c: &Context, cfg: &Config, layout: &Layout, np: Option<&NowPlaying>, cover: Option<&ButtonImage>, height: f64, (sx, sy): (f64, f64), full: bool) {
+         let bh = if cfg.button_height > 0.0 { cfg.button_height.min(height) } else { height * 0.7 };
+         let top = (height - bh) / 2.0;
+         let cy = height / 2.0 + sy;
+@@ -231,6 +234,18 @@ impl Panel {
+         c.set_source_rgb(r, g, b);
+         rounded_rect(c, cl + sx, top, cw, bh, cfg.button_radius);
+         c.fill().unwrap();
++        // the cover at the capsule's left end
++        let mut text_left = cl + PAD;
++        if let Some(ButtonImage::Svg(svg)) = cover {
++            let side = bh - 8.0;
++            let rect = librsvg_rebind::Rectangle::new(cl + 4.0 + sx, top + 4.0, side, side);
++            c.save().unwrap();
++            rounded_rect(c, cl + 4.0 + sx, top + 4.0, side, side, 6.0);
++            c.clip();
++            let _ = librsvg_rebind::prelude::HandleExt::render_document(svg, c, &rect);
++            c.restore().unwrap();
++            text_left = cl + 4.0 + side + 12.0;
++        }
+         let Some(np) = np else {
+             c.set_font_size(TITLE_SIZE);
+             c.set_source_rgb(0.6, 0.6, 0.6);
+@@ -253,10 +268,10 @@ impl Panel {
+         c.move_to(cl + cw - PAD - tw + sx, top + 23.0 + sy);
+         let _ = c.show_text(&times);
+         c.set_font_size(TITLE_SIZE);
+-        let room = cw - 2.0 * PAD - tw - 16.0;
++        let room = cl + cw - PAD - tw - 16.0 - text_left;
+         let title = fit(c, &np.title, room);
+         c.set_source_rgb(1.0, 1.0, 1.0);
+-        c.move_to(cl + PAD + sx, top + 24.0 + sy);
++        c.move_to(text_left + sx, top + 24.0 + sy);
+         let _ = c.show_text(&title);
+         let used = c.text_extents(&title).map_or(0.0, |e| e.x_advance());
+         if !np.artist.is_empty() && used < room - 40.0 {
+diff --git a/src/state.rs b/src/state.rs
+index ef690d4..8230c03 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -28,6 +28,10 @@ pub struct State {
+     pub dnd: Option<bool>,
+     /// the latest notification
+     pub notice: Option<Notice>,
++    /// the screen is locked
++    pub locked: bool,
++    /// the active window's title (rules with MatchTitle)
++    pub title: Option<String>,
+ }
+ 
+ /// .../notification: when (ms since the epoch), the program, the title
+@@ -63,6 +67,8 @@ pub struct NowPlaying {
+     /// the player's name, and how many players have a track
+     pub player: String,
+     pub players: usize,
++    /// the cover (an SVG around the picture), if the player gives one
++    pub art: Option<String>,
+ }
+ 
+ impl NowPlaying {
+@@ -82,6 +88,7 @@ impl NowPlaying {
+                 "can_seek" => np.can_seek = value == "1",
+                 "player" => np.player = value.to_string(),
+                 "players" => np.players = value.parse().unwrap_or(1),
++                "art" if !value.is_empty() => np.art = Some(format!("{DIR}/{value}")),
+                 _ => {}
+             }
+         }
+@@ -157,7 +164,9 @@ impl StateWatch {
+             let summary = lines.next().unwrap_or("").to_string();
+             Some(Notice { at_ms, app, summary })
+         });
+-        State { volume, mic_muted, playing, layout, touchid, dnd, notice }
++        let locked = read_to_string(format!("{DIR}/locked")).is_ok_and(|s| s.trim() == "1");
++        let title = read_to_string(format!("{DIR}/title")).ok().map(|s| s.trim_end().to_string());
++        State { volume, mic_muted, playing, layout, touchid, dnd, notice, locked, title }
+     }
+     pub fn fd(&self) -> &impl AsFd {
+         &self.inotify_fd
+-- 
+2.53.0
+

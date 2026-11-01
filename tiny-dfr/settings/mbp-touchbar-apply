@@ -1,0 +1,43 @@
+#!/usr/bin/python3 -I
+"""Write /etc/tiny-dfr/config.toml from standard input (as root, through
+pkexec for mbp-touchbar-settings; polkit action org.mbp.touchbar.apply).
+Only TOML that parses, at most 1 MB. Written in place, so the running
+tiny-dfr sees it closed and reloads it; the file before goes to
+config.toml.prev, and .gui-edited tells install.sh that /etc has changes of
+its own (it keeps a copy before installing the repository's config)."""
+import os
+import sys
+import tomllib
+
+CFG = "/etc/tiny-dfr/config.toml"
+MAX = 1 << 20
+
+
+def main():
+    data = sys.stdin.buffer.read(MAX + 1)
+    if len(data) > MAX:
+        sys.exit("too big")
+    try:
+        text = data.decode("utf-8")
+        tomllib.loads(text)
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        sys.exit(f"not a valid config: {e}")
+    try:
+        with open(CFG, "rb") as f:
+            old = f.read()
+    except FileNotFoundError:
+        old = None
+    if old == data:
+        return
+    if old is not None:
+        with open(CFG + ".prev", "wb") as f:
+            f.write(old)
+        os.chmod(CFG + ".prev", 0o644)
+    with open(CFG, "wb") as f:
+        f.write(data)
+    os.chmod(CFG, 0o644)
+    open("/etc/tiny-dfr/.gui-edited", "w").close()
+
+
+if __name__ == "__main__":
+    main()

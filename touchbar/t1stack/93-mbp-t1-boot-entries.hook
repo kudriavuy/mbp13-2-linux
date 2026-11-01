@@ -1,0 +1,14 @@
+# Stage 7: keep the "Touch Bar config 1" systemd-boot entries (mbp.t1=1) in
+# step with the base entries after kernel and boot loader updates.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = linux
+Target = linux-lts
+Target = systemd
+
+[Action]
+Description = Touch Bar: checking the configuration-1 boot entries...
+When = PostTransaction
+Exec = /usr/local/lib/mbp-t1/boot-entries

@@ -1,0 +1,7 @@
+# Stage 7: tiny-dfr and the fallback both failed: next boot in configuration 1.
+[Unit]
+Description=Touch Bar: give up on configuration 2 until a reboot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/mbp-t1/giveup

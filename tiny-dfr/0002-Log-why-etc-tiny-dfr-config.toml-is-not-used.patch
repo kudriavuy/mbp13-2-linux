@@ -1,0 +1,38 @@
+From 396a2a4f6e828fc59a289b7977aa7489425b9451 Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 00:50:46 +0200
+Subject: [PATCH] Log why /etc/tiny-dfr/config.toml is not used
+
+A file that does not parse (for example an unknown key name in Action) was
+ignored without a word and the defaults were used. Say so on stderr (the
+journal), with the parser's line and column. A missing file stays quiet.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ src/config.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/config.rs b/src/config.rs
+index af694ef..44d7cb7 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -106,6 +106,12 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
+     let user = read_to_string(USER_CFG_PATH)
+         .map_err::<Error, _>(|e| e.into())
+         .and_then(|r| Ok(toml::from_str::<ConfigProxy>(&r)?));
++    // a missing file is fine; a broken one would otherwise be dropped silently
++    if let Err(e) = &user {
++        if e.downcast_ref::<std::io::Error>().map(|e| e.kind()) != Some(std::io::ErrorKind::NotFound) {
++            eprintln!("{USER_CFG_PATH}: {e:#}; using the defaults");
++        }
++    }
+     if let Ok(user) = user {
+         base.media_layer_default = user.media_layer_default.or(base.media_layer_default);
+         base.show_button_outlines = user.show_button_outlines.or(base.show_button_outlines);
+-- 
+2.53.0
+

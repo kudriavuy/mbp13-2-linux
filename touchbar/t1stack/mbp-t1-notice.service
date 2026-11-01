@@ -1,0 +1,11 @@
+# Stage 7 (user unit, enabled globally): Touch Bar notices at login.
+[Unit]
+Description=Touch Bar notices
+After=plasma-workspace.target graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/mbp-t1/notice
+
+[Install]
+WantedBy=graphical-session.target

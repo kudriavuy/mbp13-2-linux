@@ -1,0 +1,92 @@
+From 2e4c98c4238c62758e97b7321e938a85ecb8893c Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 00:58:33 +0200
+Subject: [PATCH] t1bridge: refuse recovery, USB cycles and automatic import in
+ this build
+
+machine-data recover --online contacts Apple servers and resets the T1;
+validate usb-cycle / usb-live-loss reconfigure the T1 on USB; machine-data
+import without --from discovers and mounts EFI partitions. This build is for
+Touch ID with an explicit backup only: these commands exit with a message
+before anything runs. Enroll, match, status and import --from are unchanged.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: https://github.com/standardagents/t1bridge (applies to 81cbdf81026a16e02f0bea74735c6b029a8ffae2, v0.1.12)
+---
+ crates/t1-import/src/bin/t1bridge.rs | 43 ++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/crates/t1-import/src/bin/t1bridge.rs b/crates/t1-import/src/bin/t1bridge.rs
+index a81969a..64b18e4 100644
+--- a/crates/t1-import/src/bin/t1bridge.rs
++++ b/crates/t1-import/src/bin/t1bridge.rs
+@@ -66,6 +66,10 @@ fn main() -> ExitCode {
+         );
+         return ExitCategory::Usage.into();
+     };
++    if let Some(reason) = disabled_here(&command) {
++        eprintln!("t1bridge: {reason}");
++        return ExitCategory::Permission.into();
++    }
+     let is_root = preserved_efi_discovery::is_root();
+     if !authority_allows(&command, is_root) {
+         diagnostics::native(
+@@ -194,6 +198,25 @@ fn run(command: Command) -> Result<(), CommandError> {
+     }
+ }
+ 
++/// Commands this build refuses before anything else runs: online recovery
++/// (Apple servers, T1 reset), the USB cycle validations (they reconfigure the
++/// T1 on USB) and automatic import (it discovers and mounts EFI partitions).
++/// Only the explicit backup import, enroll, match and status remain.
++const fn disabled_here(command: &Command) -> Option<&'static str> {
++    match command {
++        Command::OnlineRecovery(_) => Some(
++            "machine-data recover is disabled in this build (it contacts Apple servers and resets the T1)",
++        ),
++        Command::UsbCycle | Command::UsbLiveLoss => Some(
++            "validate usb-cycle / usb-live-loss are disabled in this build (they reconfigure the T1 on USB)",
++        ),
++        Command::AutomaticImport => Some(
++            "automatic machine-data import is disabled in this build (it mounts EFI partitions); use --from ABSOLUTE_PATH",
++        ),
++        Command::BackupImport(_) | Command::Enroll | Command::Match | Command::Status => None,
++    }
++}
++
+ const fn authority_allows(command: &Command, is_root: bool) -> bool {
+     match command {
+         Command::AutomaticImport
+@@ -299,6 +322,26 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn this_build_refuses_recovery_usb_cycles_and_automatic_import() {
++        for command in [
++            Command::OnlineRecovery(PathBuf::from("/synthetic-esp")),
++            Command::UsbCycle,
++            Command::UsbLiveLoss,
++            Command::AutomaticImport,
++        ] {
++            assert!(disabled_here(&command).is_some());
++        }
++        for command in [
++            Command::BackupImport(PathBuf::from("/synthetic/backup")),
++            Command::Enroll,
++            Command::Match,
++            Command::Status,
++        ] {
++            assert!(disabled_here(&command).is_none());
++        }
++    }
++
+     fn arguments(values: &[&str]) -> Vec<OsString> {
+         values.iter().map(OsString::from).collect()
+     }
+-- 
+2.53.0
+

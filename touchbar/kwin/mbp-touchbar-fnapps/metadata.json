@@ -1,0 +1,13 @@
+{
+    "KPackageStructure": "KWin/Script",
+    "KPlugin": {
+        "Id": "mbp-touchbar-fnapps",
+        "Name": "Touch Bar: keys for the active program",
+        "Description": "Tells the Touch Bar (tiny-dfr, mbp-touchbar) which program is active; the key sets are in /etc/tiny-dfr/config.toml (MacBookPro13,2).",
+        "Version": "2.0",
+        "License": "GPL-2.0-or-later",
+        "EnabledByDefault": false
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

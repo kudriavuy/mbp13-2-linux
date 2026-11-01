@@ -1,0 +1,54 @@
+From d172ddb6a31a9aa8dab16cb6354fbcd7331d4d2a Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 23:56:52 +0100
+Subject: [PATCH] Touch ID hint: flash only a new result
+
+The touchid file is read again whenever anything in /run/tiny-dfr changes,
+the active program's file among them, and the last result ("match") stays
+there until the next verification. Every switch to another program showed
+it again. A result is shown only when its time stamp is new and less than
+3 s old.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01M5fvpySRgDHQss3fsr2hF6
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ src/main.rs | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/main.rs b/src/main.rs
+index 5febcb6..0601b54 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1656,6 +1656,8 @@ fn real_main(drm: &mut DrmBackend) {
+     // Touch ID: the icon, a result being shown (kind, since), what is drawn
+     let mut fingerprint = touchid_icon(&cfg);
+     let mut touchid_flash: Option<(state::TouchId, Instant)> = None;
++    // the time stamp of the result shown last
++    let mut touchid_flashed_at = 0i64;
+     let mut touchid_drawn: Option<state::TouchId> = None;
+     // notifications: the icon, the one tapped away, the one on the bar
+     let mut bell = named_icon(cfg.notification_icon.as_ref());
+@@ -1777,9 +1779,13 @@ fn real_main(drm: &mut DrmBackend) {
+         // the session changed (volume, mute): icons that follow it
+         if state_watch.changed() {
+             session = state_watch.read();
+-            // a result: show it a moment even if "idle" follows at once
+-            if let Some((k @ (state::TouchId::Match | state::TouchId::NoMatch), _)) = session.touchid {
+-                if touchid_flash.is_none_or(|(fk, t)| fk != k || t.elapsed() > TOUCHID_FLASH) {
++            // a new result: show it a moment even if "idle" follows at once.
++            // The file is read again whenever anything in its directory
++            // changes (the program, the layer): an old result is not new.
++            if let Some((k @ (state::TouchId::Match | state::TouchId::NoMatch), at)) = session.touchid {
++                let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
++                if at != touchid_flashed_at && now_ms - at < 3000 {
++                    touchid_flashed_at = at;
+                     touchid_flash = Some((k, Instant::now()));
+                 }
+             }
+-- 
+2.53.0
+

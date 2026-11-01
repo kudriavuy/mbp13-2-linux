@@ -1,0 +1,15 @@
+mbp13-2-linux: MacBookPro13,2 support for Arch Linux
+
+Copyright (c) 2026 kudriavuy
+
+The code written for this repository is licensed under the GNU General
+Public License, version 2 or (at your option) any later version
+(SPDX: GPL-2.0-or-later). The license text is in LICENSES/GPL-2.0.txt.
+
+Exceptions, where a file or directory says otherwise:
+- our patches to tiny-dfr (tiny-dfr/0*.patch) and to t1bridge
+  (touchid/0001-*.patch) are MIT, as the projects they change
+  (LICENSES/MIT-tiny-dfr.txt, LICENSES/MIT-T1Bridge.txt);
+- kernel modules are GPL-2.0, as the kernel code they build on.
+
+Code from other projects keeps its own license: see THIRD_PARTY_NOTICES.md.

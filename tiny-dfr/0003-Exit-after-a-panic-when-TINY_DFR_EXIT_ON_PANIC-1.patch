@@ -1,0 +1,56 @@
+From 33d84b1d24a9f65dec58f9c39496a71da0928ad9 Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 00:57:51 +0200
+Subject: [PATCH] Exit after a panic when TINY_DFR_EXIT_ON_PANIC=1
+
+After a panic tiny-dfr draws the crash bitmap and waits for SIGTERM, so a
+service manager sees a running daemon and never starts anything else. With
+TINY_DFR_EXIT_ON_PANIC=1 in the environment it shows the bitmap for 2 s and
+exits with status 1 instead (for systemd Restart= / OnFailure=). Without the
+variable nothing changes.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ src/main.rs | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/main.rs b/src/main.rs
+index df4290f..87fbda3 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -30,6 +30,7 @@ use privdrop::PrivDrop;
+ use std::{
+     cmp::min,
+     collections::HashMap,
++    env,
+     fs::{self, File, OpenOptions},
+     os::{
+         fd::{AsFd, AsRawFd},
+@@ -37,6 +38,7 @@ use std::{
+     },
+     panic::{self, AssertUnwindSafe},
+     path::{Path, PathBuf},
++    process, thread,
+     time::{Duration, Instant},
+ };
+ use udev::MonitorBuilder;
+@@ -837,6 +839,12 @@ fn main() {
+     }
+     drop(map);
+     drm.dirty(&[ClipRect::new(0, 0, height, width)]).unwrap();
++    // A watchdog (systemd OnFailure) sees nothing while we wait here: let it
++    // ask for an exit instead, after the bitmap has been visible for a moment.
++    if env::var_os("TINY_DFR_EXIT_ON_PANIC").is_some_and(|v| v == "1") {
++        thread::sleep(Duration::from_secs(2));
++        process::exit(1);
++    }
+     let mut sigset = SigSet::empty();
+     sigset.add(Signal::SIGTERM);
+     sigset.wait().unwrap();
+-- 
+2.53.0
+

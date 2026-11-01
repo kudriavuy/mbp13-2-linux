@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Touch Bar
+Name[uk]=Налаштування Touch Bar
+Comment=Arrange the Touch Bar keys
+Comment[uk]=Розставити кнопки Touch Bar
+Exec=/usr/local/bin/mbp-touchbar-settings
+Icon=preferences-desktop-keyboard
+Categories=Settings;HardwareSettings;
+Keywords=touch bar;tiny-dfr;keys;

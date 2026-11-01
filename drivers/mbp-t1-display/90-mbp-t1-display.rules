@@ -1,0 +1,6 @@
+# The Touch Bar's DRM device is not a desktop output: keep it off seat0 so
+# KWin does not take it (as tiny-dfr and t1bridge do).
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DRIVERS=="appletbdrm", TAG-="master-of-seat", TAG-="uaccess", ENV{ID_SEAT}="seat-touchbar"
+# Its touch surface (hid-t1-touchbar) is not a desktop touchscreen either:
+# libinput on seat0 would map it onto the screen. tiny-dfr reads seat-touchbar.
+SUBSYSTEM=="input", ATTRS{name}=="Apple Inc. iBridge Touch Bar", ENV{ID_SEAT}="seat-touchbar"

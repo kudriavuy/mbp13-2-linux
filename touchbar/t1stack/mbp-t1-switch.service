@@ -1,0 +1,14 @@
+# Stage 7: T1 to USB configuration 2 at boot, only when everything for it is
+# there (see /usr/local/lib/mbp-t1/mbp-t1-switch); otherwise configuration 1.
+[Unit]
+Description=Touch Bar: switch the T1 to configuration 2 (tiny-dfr, H.264 camera)
+After=systemd-udevd.service systemd-modules-load.service
+ConditionKernelCommandLine=!mbp.t1=1
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/mbp-t1/mbp-t1-switch
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

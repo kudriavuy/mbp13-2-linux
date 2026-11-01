@@ -1,0 +1,9 @@
+[Match]
+Driver=apple_t1_ncm
+Type=ether
+
+[Link]
+# ours: a name of its own (a USB Ethernet adapter could become eth0 too, and
+# the firewall rule for the T1's xART port names this interface)
+Name=t1ncm0
+Property=ID_NET_MANAGED_BY=org.t1bridge NM_UNMANAGED=1

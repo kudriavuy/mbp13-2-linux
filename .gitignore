@@ -1,0 +1,23 @@
+# build output
+out/
+*.pkg.tar.zst
+audio/speakerguard/*.so
+audio/speakerguard/test_guard
+audio/speakerguard/test_host
+touchbar/fallback/mbp-t1-fallback
+drivers/mbp-t1-display/t1-testpattern
+drivers/mbp-t1-display/t1-fpsbench
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+__pycache__/
+# machine data: never commit (Apple's numbers, MAC address, calibration)
+local/
+layout54.json
+*.icc
+FDRData
+srom*.bin

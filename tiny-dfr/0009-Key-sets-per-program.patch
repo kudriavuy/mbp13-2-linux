@@ -1,0 +1,392 @@
+From b51f4c90e0af42a7be17a717a487e8b002793049 Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 21:46:22 +0100
+Subject: [PATCH] Key sets per program
+
+A helper (on MacBookPro13,2 a KWin script through mbp-touchbar) writes the
+active window's class to /run/tiny-dfr/app. [[Apps]] rules in the config
+match it (case-insensitive, a trailing * matches the start) and choose
+Set = "fn" (F1-F12), "strip" (the expanded Control Strip) or the name of
+an [AppSets] entry: those keys left of the collapsed Control Strip, the
+strip expanding and collapsing over them as before. Each program starts
+with its own state; without a rule or a class the layer file and
+MediaLayerDefault decide as before. The sets are rows after the three
+fixed ones, built like the collapsed row. A Set name that is unknown, or
+an AppSets entry called fn or strip, is reported and ignored.
+
+TINY_DFR_WHICH_SET=<class>,... prints what the installed config gives
+those classes; the PNG preview shows a row per set.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ share/tiny-dfr/config.toml | 17 +++++++
+ src/config.rs              | 92 +++++++++++++++++++++++++++++++++-----
+ src/layer_switch.rs        |  7 +++
+ src/main.rs                | 64 +++++++++++++++++++++-----
+ 4 files changed, 158 insertions(+), 22 deletions(-)
+
+diff --git a/share/tiny-dfr/config.toml b/share/tiny-dfr/config.toml
+index bf741ca..bed9a91 100644
+--- a/share/tiny-dfr/config.toml
++++ b/share/tiny-dfr/config.toml
+@@ -75,6 +75,23 @@ FontTemplate = ":bold"
+ #                      # shrinks back (120 ms). Keys go out at once; a new touch
+ #                      # ends any animation.
+ # SeparatorColor = "#2c2c2c"
++
++# Key sets per program: a helper writes the active window's class to
++# /run/tiny-dfr/app; the first [[Apps]] rule whose Match fits (case does not
++# matter, a trailing * matches the start) chooses Set = "fn" (F1-F12), "strip"
++# (the expanded Control Strip) or the name of an [AppSets] entry: its keys left
++# of the collapsed strip (needs ControlStripKeys). No rule, or no class: the
++# layer file (/run/tiny-dfr/layer) and MediaLayerDefault decide as before.
++# TINY_DFR_WHICH_SET=<class>,... tiny-dfr prints what each class gets.
++# These tables go after all other keys of the file.
++# [AppSets]
++# browser = [
++#     { Icon = "fast_rewind", Action = ["LeftAlt", "Left"] },
++#     { Text = "F5", Action = "F5" }
++# ]
++# [[Apps]]
++# Match = ["firefox*", "google-chrome*"]
++# Set = "browser"
+ # JoinedSpacing = 4
+ 
+ # Set this to false if you want the brightness of the touchbar
+diff --git a/src/config.rs b/src/config.rs
+index 8d8a6a3..fba354f 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -12,7 +12,7 @@ use serde::{
+     de::{self, Visitor},
+     Deserialize, Deserializer,
+ };
+-use std::{fmt, fs::read_to_string, os::fd::AsFd};
++use std::{collections::HashMap, fmt, fs::read_to_string, os::fd::AsFd};
+ 
+ const USER_CFG_PATH: &str = "/etc/tiny-dfr/config.toml";
+ 
+@@ -39,6 +39,50 @@ pub struct Config {
+     pub slider_fill_color: (f64, f64, f64),
+     pub slider_track_color: (f64, f64, f64),
+     pub animations: bool,
++    // key sets per program: rules in order, set name -> row
++    pub apps: Vec<AppRule>,
++    pub app_sets: HashMap<String, usize>,
++}
++
++/// [[Apps]]: windows whose class matches one of Match (case does not matter,
++/// a trailing * matches the start) get Set: "fn" (F1-F12), "strip" (the
++/// expanded Control Strip) or the name of an [AppSets] entry (its keys and the
++/// collapsed strip).
++#[derive(Deserialize, Clone)]
++#[serde(rename_all = "PascalCase")]
++pub struct AppRule {
++    pub r#match: Vec<String>,
++    pub set: String,
++}
++
++/// What a program gets on the bar
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum AppSet {
++    Fn,
++    Strip,
++    /// the collapsed strip with these keys: a row index
++    Keys(usize),
++}
++
++impl Config {
++    /// The set of the first rule matching window class `class`
++    pub fn set_for(&self, class: &str) -> Option<AppSet> {
++        let class = class.to_lowercase();
++        let rule = self.apps.iter().find(|r| {
++            r.r#match.iter().any(|p| {
++                let p = p.to_lowercase();
++                match p.strip_suffix('*') {
++                    Some(prefix) => class.starts_with(prefix),
++                    None => class == p,
++                }
++            })
++        })?;
++        match rule.set.as_str() {
++            "fn" => Some(AppSet::Fn),
++            "strip" => Some(AppSet::Strip),
++            name => self.app_sets.get(name).map(|&row| AppSet::Keys(row)),
++        }
++    }
+ }
+ 
+ /// What a button does inside tiny-dfr instead of (or besides) sending keys
+@@ -85,6 +129,8 @@ struct ConfigProxy {
+     slider_fill_color: Option<String>,
+     slider_track_color: Option<String>,
+     animations: Option<bool>,
++    app_sets: Option<HashMap<String, Vec<ButtonConfig>>>,
++    apps: Option<Vec<AppRule>>,
+ }
+ 
+ fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<Key>, D::Error>
+@@ -167,7 +213,7 @@ fn load_font(name: &str) -> FontFace {
+     FontFace::create_from_ft(&face).unwrap()
+ }
+ 
+-fn load_config(width: u16) -> (Config, [FunctionLayer; 3]) {
++fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+     let mut base =
+         toml::from_str::<ConfigProxy>(&read_to_string("/usr/share/tiny-dfr/config.toml").unwrap())
+             .unwrap();
+@@ -209,16 +255,19 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 3]) {
+         base.slider_fill_color = user.slider_fill_color.or(base.slider_fill_color);
+         base.slider_track_color = user.slider_track_color.or(base.slider_track_color);
+         base.animations = user.animations.or(base.animations);
++        base.app_sets = user.app_sets.or(base.app_sets);
++        base.apps = user.apps.or(base.apps);
+     };
+     let media_layer_keys = base.media_layer_keys.unwrap();
+     let primary_layer_keys = base.primary_layer_keys.unwrap();
+     // With ControlStripKeys the media row is the expanded Control Strip and the
+     // collapsed one is: app keys, free space, the strip at the right end.
+     // Without them both are the media row, as before.
+-    let collapsed_keys = match base.control_strip_keys {
+-        Some(mut strip) => {
+-            let mut row = base.app_layer_keys.unwrap_or_default();
++    let collapsed = |app_keys: Vec<ButtonConfig>| match &base.control_strip_keys {
++        Some(strip) => {
++            let mut row = app_keys;
+             row.push(ButtonConfig::default()); // a spacer takes the free space
++            let mut strip = strip.clone();
+             if let Some(first) = strip.first_mut() {
+                 first.group.get_or_insert(true);
+             }
+@@ -227,7 +276,26 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 3]) {
+         }
+         None => media_layer_keys.clone(),
+     };
+-    let mut rows = [primary_layer_keys, collapsed_keys, media_layer_keys];
++    let collapsed_keys = collapsed(base.app_layer_keys.clone().unwrap_or_default());
++    // F-keys, collapsed strip, expanded strip, then one collapsed row per set
++    let mut rows = vec![primary_layer_keys, collapsed_keys, media_layer_keys.clone()];
++    let mut app_sets = HashMap::new();
++    let mut set_names: Vec<_> = base.app_sets.clone().unwrap_or_default().into_iter().collect();
++    set_names.sort_by(|a, b| a.0.cmp(&b.0));
++    for (name, keys) in set_names {
++        if name == "fn" || name == "strip" {
++            eprintln!("AppSets.{name}: the name is taken (F-keys / the strip); ignored");
++            continue;
++        }
++        app_sets.insert(name, rows.len());
++        rows.push(collapsed(keys));
++    }
++    let apps = base.apps.clone().unwrap_or_default();
++    for rule in &apps {
++        if !["fn", "strip"].contains(&rule.set.as_str()) && !app_sets.contains_key(&rule.set) {
++            eprintln!("Apps: Set = \"{}\" is not fn, strip or an AppSets entry; the rule is ignored", rule.set);
++        }
++    }
+     if width >= 2170 {
+         for layer in &mut rows {
+             // the key after Esc starts a new group (a wider gap)
+@@ -247,8 +315,8 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 3]) {
+     }
+     // the defaults are the upstream look
+     let icon_size = base.icon_size.unwrap_or(DEFAULT_ICON_SIZE);
+-    // fixed order: F-keys, collapsed strip, expanded strip (see View in main)
+-    let layers = rows.map(|keys| FunctionLayer::with_config(keys, icon_size));
++    // rows 0..2 have fixed places (ROW_* in main), the sets follow
++    let layers = rows.into_iter().map(|keys| FunctionLayer::with_config(keys, icon_size)).collect();
+     let control_strip_expanded = match base.control_strip_default.as_deref() {
+         None | Some("Expanded") => true,
+         Some("Collapsed") => false,
+@@ -281,6 +349,8 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 3]) {
+         slider_track_color: parse_color("SliderTrackColor", base.slider_track_color, (0.45, 0.45, 0.45)),
+         // off unless asked for: the upstream behaviour
+         animations: base.animations.unwrap_or(false),
++        apps,
++        app_sets,
+     };
+     crate::anim::set_enabled(cfg.animations);
+     (cfg, layers)
+@@ -309,13 +379,13 @@ impl ConfigManager {
+             watch_desc,
+         }
+     }
+-    pub fn load_config(&self, width: u16) -> (Config, [FunctionLayer; 3]) {
++    pub fn load_config(&self, width: u16) -> (Config, Vec<FunctionLayer>) {
+         load_config(width)
+     }
+     pub fn update_config(
+         &mut self,
+         cfg: &mut Config,
+-        layers: &mut [FunctionLayer; 3],
++        layers: &mut Vec<FunctionLayer>,
+         width: u16,
+     ) -> bool {
+         if self.watch_desc.is_none() {
+@@ -328,7 +398,7 @@ impl ConfigManager {
+         }
+     }
+     #[cold]
+-    fn handle_events(&mut self, cfg: &mut Config, layers: &mut [FunctionLayer; 3], width: u16, evts: Result<Vec<InotifyEvent>, Errno>) -> bool {
++    fn handle_events(&mut self, cfg: &mut Config, layers: &mut Vec<FunctionLayer>, width: u16, evts: Result<Vec<InotifyEvent>, Errno>) -> bool {
+         let mut ret = false;
+         for evt in evts.unwrap() {
+             if Some(evt.wd) != self.watch_desc {
+diff --git a/src/layer_switch.rs b/src/layer_switch.rs
+index 28eab11..ec1cac1 100644
+--- a/src/layer_switch.rs
++++ b/src/layer_switch.rs
+@@ -6,6 +6,8 @@ use std::{fs::read_to_string, os::fd::AsFd};
+ 
+ const LAYER_DIR: &str = "/run/tiny-dfr";
+ const LAYER_FILE: &str = "/run/tiny-dfr/layer";
++// the window class of the active program (mbp-touchbar app, KWin script)
++const APP_FILE: &str = "/run/tiny-dfr/app";
+ 
+ pub struct LayerSwitch {
+     inotify_fd: Inotify,
+@@ -29,6 +31,11 @@ impl LayerSwitch {
+             _ => None,
+         }
+     }
++    /// Window class of the active program, if a helper writes it
++    pub fn app(&self) -> Option<String> {
++        let app = read_to_string(APP_FILE).ok()?.trim().to_string();
++        (!app.is_empty()).then_some(app)
++    }
+     /// whether the directory changed since the last call
+     pub fn changed(&self) -> bool {
+         self.inotify_fd.read_events().is_ok_and(|evts| !evts.is_empty())
+diff --git a/src/main.rs b/src/main.rs
+index b656e6a..14dc1d9 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -54,14 +54,14 @@ mod slider;
+ 
+ use crate::config::ConfigManager;
+ use backlight::BacklightManager;
+-use config::{ButtonConfig, Command, Config};
++use config::{AppSet, ButtonConfig, Command, Config};
+ use display::DrmBackend;
+ use layer_switch::LayerSwitch;
+ use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
+ use slider::{Hit as SliderHit, Kind as SliderKind, Layout as SliderLayout, Mode as SliderMode, Slider};
+ 
+ pub const DEFAULT_ICON_SIZE: i32 = 48;
+-// rows from config::load_config
++// rows from config::load_config (the key sets of [AppSets] follow)
+ const ROW_FKEYS: usize = 0;
+ const ROW_STRIP_COLLAPSED: usize = 1;
+ const ROW_STRIP_EXPANDED: usize = 2;
+@@ -952,6 +952,12 @@ fn render_preview(path: &std::ffi::OsStr) {
+         (ROW_STRIP_EXPANDED, Some(1), None),
+         (ROW_FKEYS, None, None),
+     ];
++    // one row per program key set
++    let mut sets: Vec<_> = cfg.app_sets.values().copied().collect();
++    sets.sort();
++    for r in sets {
++        rows.push((r, None, None));
++    }
+     for (kind, value) in [(SliderKind::Volume, 0.4), (SliderKind::Brightness, 0.7)] {
+         let source = layers[ROW_STRIP_COLLAPSED]
+             .buttons
+@@ -1121,6 +1127,22 @@ fn render_preview(path: &std::ffi::OsStr) {
+ }
+ 
+ fn main() {
++    // TINY_DFR_WHICH_SET=<class>[,<class>...]: what [[Apps]] gives these
++    // window classes with the installed config, then exit
++    if let Ok(classes) = env::var("TINY_DFR_WHICH_SET") {
++        let (cfg, _) = ConfigManager::new().load_config(2170);
++        let names: HashMap<usize, &String> = cfg.app_sets.iter().map(|(n, r)| (*r, n)).collect();
++        for class in classes.split(',').map(str::trim).filter(|c| !c.is_empty()) {
++            let set = match cfg.set_for(class) {
++                Some(AppSet::Fn) => "fn (F1-F12)".to_string(),
++                Some(AppSet::Strip) => "strip (expanded Control Strip)".to_string(),
++                Some(AppSet::Keys(r)) => format!("{} (keys + collapsed strip)", names[&r]),
++                None => "no rule: default (MediaLayerDefault / ControlStripDefault)".to_string(),
++            };
++            println!("{class}: {set}");
++        }
++        return;
++    }
+     if let Some(path) = env::var_os("TINY_DFR_RENDER_PNG") {
+         render_preview(&path);
+         return;
+@@ -1232,14 +1254,18 @@ fn real_main(drm: &mut DrmBackend) {
+     // strip is collapsed or expanded
+     let mut expanded = cfg.control_strip_expanded;
+     let mut fn_held = false;
+-    let row = |base_is_media: bool, fn_held: bool, expanded: bool| {
++    // the collapsed row: the default one or the active program's key set
++    let mut collapsed_row = ROW_STRIP_COLLAPSED;
++    // the program it was chosen for (window class), to notice a change
++    let mut current_app: Option<String> = None;
++    let row = |base_is_media: bool, fn_held: bool, expanded: bool, collapsed_row: usize| {
+         match (base_is_media != fn_held, expanded) {
+             (false, _) => ROW_FKEYS,
+-            (true, false) => ROW_STRIP_COLLAPSED,
++            (true, false) => collapsed_row,
+             (true, true) => ROW_STRIP_EXPANDED,
+         }
+     };
+-    let mut active_layer = row(base_is_media, fn_held, expanded);
++    let mut active_layer = row(base_is_media, fn_held, expanded, collapsed_row);
+     let mut slider: Option<Slider> = None;
+     let mut slider_dirty = false;
+     // animations: the row under a slider as it opened (fades out behind it),
+@@ -1313,6 +1339,8 @@ fn real_main(drm: &mut DrmBackend) {
+             needs_complete_redraw = true;
+             base_is_media = cfg.media_layer_default;
+             expanded = cfg.control_strip_expanded;
++            collapsed_row = ROW_STRIP_COLLAPSED;
++            current_app = None;
+             check_layer = true;
+             slider = None;
+             pending = None;
+@@ -1320,18 +1348,32 @@ fn real_main(drm: &mut DrmBackend) {
+         }
+         if layer_switch.changed() || check_layer {
+             check_layer = false;
+-            let want = layer_switch.wanted().unwrap_or(cfg.media_layer_default);
+-            if want != base_is_media {
++            // the program's key set ([[Apps]] for its window class), else the
++            // layer file (fn/media), else MediaLayerDefault
++            let app = layer_switch.app();
++            let (want_media, want_row, want_expanded) = match app.as_deref().and_then(|a| cfg.set_for(a)) {
++                Some(AppSet::Fn) => (false, ROW_STRIP_COLLAPSED, cfg.control_strip_expanded),
++                Some(AppSet::Strip) => (true, ROW_STRIP_COLLAPSED, true),
++                Some(AppSet::Keys(r)) => (true, r, false),
++                None => (
++                    layer_switch.wanted().unwrap_or(cfg.media_layer_default),
++                    ROW_STRIP_COLLAPSED,
++                    cfg.control_strip_expanded,
++                ),
++            };
++            if app != current_app || want_media != base_is_media || want_row != collapsed_row {
+                 // release what is held: another program, another row
+                 for (_, (layer, btn)) in touches.drain() {
+                     layers[layer].buttons[btn].1.set_active(&mut uinput, false);
+                 }
+-                base_is_media = want;
+-                // each program starts with the configured strip
+-                expanded = cfg.control_strip_expanded;
++                base_is_media = want_media;
++                collapsed_row = want_row;
++                // each program starts with its own strip state
++                expanded = want_expanded;
++                current_app = app;
+             }
+         }
+-        let wanted_row = row(base_is_media, fn_held, expanded);
++        let wanted_row = row(base_is_media, fn_held, expanded, collapsed_row);
+         if wanted_row != active_layer {
+             active_layer = wanted_row;
+             needs_complete_redraw = true;
+-- 
+2.53.0
+

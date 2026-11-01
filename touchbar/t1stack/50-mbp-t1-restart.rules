@@ -1,0 +1,10 @@
+// Stage 7: the Touch Bar hotkey (mbp-t1-restart) may restart tiny-dfr
+// without a password: local active wheel sessions, this one unit, these verbs.
+polkit.addRule(function(action, subject) {
+	if (action.id == "org.freedesktop.systemd1.manage-units" &&
+	    action.lookup("unit") == "tiny-dfr.service" &&
+	    ["start", "restart", "reset-failed"].indexOf(action.lookup("verb")) >= 0 &&
+	    subject.isInGroup("wheel") && subject.local && subject.active) {
+		return polkit.Result.YES;
+	}
+});

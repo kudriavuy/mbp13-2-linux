@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Virtual camera for the T1 FaceTime camera in USB configuration 2.
+
+The T1 camera gives only H.264 there, which browsers do not take from V4L2.
+This daemon is the only producer of a v4l2loopback device (exclusive_caps=1,
+"FaceTime HD Camera"): it announces 1280x720 I420 with one black frame and
+waits for v4l2loopback's client-usage event. While a program streams from
+the virtual camera, ffmpeg decodes the T1's H.264 (VA-API) and the frames are
+written to it; 3 s after the last program stops, ffmpeg is stopped (the
+camera LED goes off; programs often stop and restart a stream while probing). If ffmpeg dies while a program still streams (after a sleep),
+it is started again. Around a sleep the systemd-sleep hook sends SIGUSR1
+(stop the camera now: a streaming T1 wakes the Mac through USB) and SIGUSR2
+(resume it if a program still streams).
+
+   mbp-t1-camera [--loopback /dev/video42] [--hwaccel vaapi|none]
+Runs as an unprivileged user with access to video devices and the render node
+(mbp-t1-camera.service). Stdlib only, plus ffmpeg.
+"""
+import argparse, errno, fcntl, glob, os, select, signal, struct, subprocess, sys, time
+
+W, H = 1280, 720
+FRAME = W * H * 3 // 2                      # I420
+LINGER = 3.0                                # s the camera stays on after the last program
+STATS = 10.0                                # s between frame counters in the log
+BLACK = bytes([16]) * (W * H) + bytes([128]) * (W * H // 2)
+
+# V4L2 ioctls (x86_64) and constants
+VIDIOC_S_FMT = 0xC0D05605                   # _IOWR('V', 5, struct v4l2_format), 208 bytes
+VIDIOC_SUBSCRIBE_EVENT = 0x4020565A         # _IOW('V', 90, struct v4l2_event_subscription)
+VIDIOC_DQEVENT = 0x80885659                 # _IOR('V', 89, struct v4l2_event), 136 bytes
+BUF_TYPE_VIDEO_OUTPUT = 2
+FIELD_NONE = 1
+COLORSPACE_SRGB = 8
+YU12 = struct.unpack("<I", b"YU12")[0]
+# v4l2loopback.c: V4L2_EVENT_PRIVATE_START + 0x08E00000 + 1
+EVENT_CLIENT_USAGE = 0x08000000 + 0x08E00000 + 1
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+def t1_h264_node():
+    """The T1 camera's capture node in configuration 2 (interface 1-3:2.0)."""
+    for v in sorted(glob.glob("/sys/class/video4linux/video*")):
+        if os.path.realpath(v + "/device").endswith(":2.0") and \
+                "8600" in open(os.path.realpath(v + "/device/../idProduct")).read() \
+                and int(open(v + "/index").read()) == 0:
+            return "/dev/" + os.path.basename(v)
+    return None
+
+
+class Loopback:
+    def __init__(self, path):
+        self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        fmt = bytearray(208)
+        struct.pack_into("<I", fmt, 0, BUF_TYPE_VIDEO_OUTPUT)
+        struct.pack_into("<8I", fmt, 8, W, H, YU12, FIELD_NONE, W, FRAME, COLORSPACE_SRGB, 0)
+        fcntl.ioctl(self.fd, VIDIOC_S_FMT, fmt)
+        sub = struct.pack("<8I", EVENT_CLIENT_USAGE, 0, 0, 0, 0, 0, 0, 0)
+        fcntl.ioctl(self.fd, VIDIOC_SUBSCRIBE_EVENT, sub)
+        self.write(BLACK)               # makes it a capture device for programs
+
+    def write(self, frame):
+        """True if written; waits up to 50 ms for a free buffer."""
+        for _ in range(2):
+            try:
+                os.write(self.fd, frame)
+                return True
+            except BlockingIOError:
+                select.select([], [self.fd], [], 0.05)
+        return False
+
+    def usage(self):
+        """Pending client-usage events: the last count, or None."""
+        last = None
+        while True:
+            ev = bytearray(136)
+            try:
+                fcntl.ioctl(self.fd, VIDIOC_DQEVENT, ev)
+            except OSError as e:
+                if e.errno in (errno.ENOENT, errno.EAGAIN):
+                    return last
+                raise
+            if struct.unpack_from("<I", ev, 0)[0] == EVENT_CLIENT_USAGE:
+                last = struct.unpack_from("<I", ev, 8)[0]
+
+
+class Decoder:
+    def __init__(self, hwaccel):
+        self.hwaccel, self.p, self.buf = hwaccel, None, bytearray()
+
+    def start(self):
+        src = t1_h264_node()
+        if not src:
+            log("no T1 H.264 camera node (configuration 2, uvcvideo-t1?)")
+            return False
+        hw = ["-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128"] if self.hwaccel == "vaapi" else []
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", *hw,
+               "-f", "v4l2", "-input_format", "h264", "-video_size", f"{W}x{H}", "-framerate", "30",
+               "-i", src, "-pix_fmt", "yuv420p", "-f", "rawvideo", "-"]
+        self.p = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=0)
+        os.set_blocking(self.p.stdout.fileno(), False)
+        self.buf.clear()
+        log(f"camera on: {src} ({self.hwaccel})")
+        return True
+
+    def stop(self):
+        if self.p:
+            self.p.terminate()
+            try:
+                self.p.wait(0.5)
+            except subprocess.TimeoutExpired:
+                self.p.kill(); self.p.wait()   # a decoder: nothing to flush
+            log("camera off")
+        self.p = None
+
+    def frames(self):
+        """Whole frames read so far; [] at EOF too (check alive())."""
+        try:
+            chunk = os.read(self.p.stdout.fileno(), 1 << 20)
+        except BlockingIOError:
+            return []
+        self.buf += chunk
+        out = []
+        while len(self.buf) >= FRAME:
+            out.append(bytes(self.buf[:FRAME])); del self.buf[:FRAME]
+        return out
+
+    def alive(self):
+        return self.p is not None and self.p.poll() is None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--loopback", default="/dev/video42")
+    ap.add_argument("--hwaccel", choices=["vaapi", "none"], default="vaapi")
+    a = ap.parse_args()
+    lb, dec = Loopback(a.loopback), Decoder(a.hwaccel)
+    users, retry, off_at = 0, 0.0, None
+    got = put = 0
+    next_stats = time.monotonic() + STATS
+    paused = False
+
+    def pause(*_):
+        nonlocal paused
+        paused = True
+
+    def resume(*_):
+        nonlocal paused, retry
+        paused, retry = False, 0.0
+
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGUSR1, pause)
+    signal.signal(signal.SIGUSR2, resume)
+    log(f"ready: {a.loopback} {W}x{H} I420")
+    try:
+        while True:
+            fds = [lb.fd] + ([dec.p.stdout.fileno()] if dec.alive() else [])
+            r, _, x = select.select([d for d in fds[1:]], [], [lb.fd], 0.5)
+            if lb.fd in x:
+                n = lb.usage()
+                if n is not None and n != users:
+                    users = n
+                    log(f"programs streaming: {users}")
+                    if users:
+                        off_at = None
+                        if not dec.alive() and not paused:
+                            dec.start()
+                    else:
+                        off_at = time.monotonic() + LINGER
+            if paused and dec.p is not None:
+                log("sleep: camera off")
+                dec.stop(); lb.write(BLACK)
+            if off_at is not None and time.monotonic() >= off_at:
+                off_at = None
+                dec.stop(); lb.write(BLACK)
+            if dec.alive():
+                for f in dec.frames():
+                    got += 1
+                    put += lb.write(f)
+            elif dec.p is not None:                 # ffmpeg died (after a sleep?)
+                log(f"ffmpeg exited ({dec.p.returncode})" + ("; restarting" if users else ""))
+                dec.p, retry = None, time.monotonic() + 1
+            if users and not paused and dec.p is None and time.monotonic() >= retry:
+                if not dec.start():
+                    retry = time.monotonic() + 2
+            if time.monotonic() >= next_stats:
+                if dec.alive():
+                    log(f"frames: decoded {got}, written {put}, dropped {got - put}")
+                got = put = 0
+                next_stats = time.monotonic() + STATS
+    finally:
+        dec.stop()
+
+
+if __name__ == "__main__":
+    main()

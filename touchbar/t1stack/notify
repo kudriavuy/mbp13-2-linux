@@ -1,0 +1,17 @@
+#!/bin/bash
+# notify TITLE BODY: a desktop notification for every graphical session now,
+# and the same text kept in /run/mbp-t1/notice for a session that starts
+# later (shown by the user unit mbp-t1-notice.service). Root.
+title=$1 body=$2
+mkdir -p /run/mbp-t1
+printf '%s\t%s\n' "$title" "$body" >> /run/mbp-t1/notice
+chmod 0644 /run/mbp-t1/notice
+for s in $(loginctl list-sessions --no-legend | awk '{print $1}'); do
+	[[ $(loginctl show-session "$s" -p Type --value) == wayland || $(loginctl show-session "$s" -p Type --value) == x11 ]] || continue
+	u=$(loginctl show-session "$s" -p Name --value)
+	uid=$(id -u "$u")
+	runuser -u "$u" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+		notify-send -u critical -a "Touch Bar" -i input-keyboard "$title" "$body" 2>/dev/null || true
+done
+logger -t mbp-t1 "$title: $body"
+exit 0

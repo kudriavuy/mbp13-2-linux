@@ -1,0 +1,287 @@
+# The author's /etc/tiny-dfr/config.toml (Ukrainian labels, Slovak/Ukrainian/US
+# layouts), as an example of what the patches can do. Copy it over
+# /etc/tiny-dfr/config.toml to try it (tiny-dfr reloads on save).
+# /etc/tiny-dfr/config.toml for MacBookPro13,2 (T1). Merged over
+# /usr/share/tiny-dfr/config.toml; Esc is added by tiny-dfr itself (bar 2170 px).
+# Look: sizes, gaps, corners and colours measured on macOS Touch Bar
+# screenshots (2170x60, the same pixels), drawn by tiny-dfr; font Inter, icons
+# Lucide (ISC), Material (tiny-dfr's, Apache-2.0) and own drawings (mbp-*),
+# installed into /etc/tiny-dfr by icons/install-icons.sh.
+# Control Strip by default (patch 0005), Fn shows F1-F12; /run/tiny-dfr/layer
+# (mbp-touchbar, KWin script) switches the default per program, and each switch
+# starts with ControlStripDefault again.
+MediaLayerDefault = true
+# the T1 has three levels (hid-t1-touchbar 0.3: 1-84 10 %, 85-169 15 %,
+# 170-255 full): follow the screen (patch 0017 reads its real maximum), so a
+# dim screen in the evening dims the bar too
+AdaptiveBrightness = true
+ActiveBrightness = 255
+# OLED: shift everything by up to 11 px sideways, slowly (macOS does not):
+# one pixel every 10 s (fewer frames than the smooth 4 s animation), and not
+# at all while the bar is dark
+EnablePixelShift = true
+PixelShiftSmooth = false
+FontTemplate = "Inter"
+FontSize = 28
+IconSize = 36
+# macOS: keys the full 60 px high, corners 8, #363636 on black; 4 px within a
+# group, 34 px between groups; joined keys (the collapsed strip) are one
+# capsule with 4 px #2c2c2c separators
+ButtonColor = "#363636"
+ButtonActiveColor = "#5e5e5e"
+SeparatorColor = "#2c2c2c"
+ButtonHeight = 60
+ButtonRadius = 8
+ButtonSpacing = 4
+JoinedSpacing = 4
+GroupSpacing = 34
+EscWidth = 128
+# Slider (patch 0006/0007): a 720 px capsule ending at the button, which
+# becomes a round close button; blue up to the knob, grey after it
+SliderTimeout = 3000
+# short animations (patch 0008): key highlight, strip slide, slider growing;
+# false switches them off (then the bar looks exactly as before)
+Animations = true
+# icons that follow the session (mbp-touchbar-bridge): volume muted / 0 /
+# up to half / more, microphone muted / on
+VolumeIcons = ["lucide-volume-x", "lucide-volume", "lucide-volume-1", "lucide-volume-2"]
+MicIcons = ["lucide-mic-off", "lucide-mic"]
+DndIcons = ["lucide-bell", "lucide-bell-off"]
+# notifications on the bar (patch 0014): the program and the title for a few
+# seconds over the program's keys (not while do not disturb is on; a tap
+# takes one away; the text of a notification is never shown or kept)
+Notifications = true
+NotificationSeconds = 4
+NotificationIcon = "lucide-bell"
+# Touch ID hint (patch 0013): while sudo or the lock screen waits for a finger
+# (mbp-touchid-hint watches fprintd) the bar points to the sensor
+TouchIdHint = true
+TouchIdText = "Touch ID"
+TouchIdRetryText = "Ще раз"
+TouchIdFailText = "Не розпізнано"
+TouchIdIcon = "lucide-fingerprint"
+SliderWidth = 720
+SliderFillColor = "#3880d1"
+SliderTrackColor = "#737373"
+# The strip: expanded (MediaLayerKeys, x collapses it) or collapsed (app keys,
+# then ControlStripKeys at the right end, < expands it)
+# collapsed, as on macOS: the program's keys (or the quick keys) and the
+# strip at the right end; < shows the media keys and the rest
+ControlStripDefault = "Collapsed"
+# Expanded Control Strip
+MediaLayerKeys = [
+    { Icon = "mbp-close-circle", Command = "Collapse", Background = false, Width = 64, IconWidth = 44, IconHeight = 44 },
+    # tap: one step; hold and slide: the slider (Slider = ...)
+    { Icon = "lucide-sun-dim",   Action = "BrightnessDown", Group = true, IconWidth = 38, IconHeight = 38, Slider = "Brightness", SliderIconLow = "lucide-sun-dim", SliderIconHigh = "lucide-sun" },
+    { Icon = "lucide-sun",       Action = "BrightnessUp", IconWidth = 38, IconHeight = 38, Slider = "Brightness", SliderIconLow = "lucide-sun-dim", SliderIconHigh = "lucide-sun" },
+    # Lucide has no keyboard light: these two are tiny-dfr's (Material)
+    { Icon = "backlight_low",    Action = "IllumDown", Group = true, IconWidth = 42, IconHeight = 42, Slider = "Keyboard", SliderIconLow = "backlight_low", SliderIconHigh = "backlight_high" },
+    { Icon = "backlight_high",   Action = "IllumUp", IconWidth = 44, IconHeight = 44, Slider = "Keyboard", SliderIconLow = "backlight_low", SliderIconHigh = "backlight_high" },
+    # Mission Control -> KWin Overview, Launchpad -> application menu (KDE shortcuts);
+    # KEY_DASHBOARD (204) is named AllApplications in input-linux. An unknown name
+    # makes tiny-dfr drop this whole file (the journal says why).
+    { Icon = "mbp-overview",     Action = "Scale", Group = true, IconWidth = 44, IconHeight = 34 },
+    { Icon = "mbp-app-grid",     Action = "AllApplications", IconWidth = 44, IconHeight = 28 },
+    # media keys are filled on macOS too: Material
+    { Icon = "fast_rewind",      Action = "PreviousSong", Group = true, IconWidth = 58, IconHeight = 58 },
+    { Icon = "play_pause",       Action = "PlayPause", IconWidth = 46, IconHeight = 46 },
+    { Icon = "fast_forward",     Action = "NextSong", IconWidth = 58, IconHeight = 58 },
+    { Icon = "lucide-volume-x",  Action = "Mute", Group = true, IconWidth = 46, IconHeight = 46 },
+    { Icon = "lucide-volume-1",  Action = "VolumeDown", IconWidth = 40, IconHeight = 40, Slider = "Volume", SliderIconLow = "lucide-volume-1", SliderIconHigh = "lucide-volume-2" },
+    { Icon = "lucide-volume-2",  Action = "VolumeUp", IconWidth = 44, IconHeight = 44, Slider = "Volume", SliderIconLow = "lucide-volume-1", SliderIconHigh = "lucide-volume-2" }
+]
+# Collapsed Control Strip, one capsule at the right end. Brightness and volume:
+# a tap opens the slider for SliderTimeout ms, holding and sliding moves it
+# until release (values through mbp-touchbar-bridge, else as keys).
+# The note: only while a media player has a track; it opens the now-playing
+# panel (previous, play/pause, next, title, time, scrubber).
+ControlStripKeys = [
+    { Icon = "lucide-music",     Command = "NowPlaying", Width = 140 },
+    # keyboard layout (SK / UA / US): tap the next one, hold and slide to choose;
+    # without the bridge a tap is Alt+Shift (the KDE layout toggle here)
+    { Text = "—", Command = "Layout", Live = "Layout", Action = ["LeftAlt", "LeftShift"], Width = 100, Group = true },
+    { Icon = "mbp-chevron-left", Command = "Expand", Width = 30, IconWidth = 36, IconHeight = 36, Group = true },
+    { Icon = "lucide-sun",       Command = "BrightnessSlider", Joined = true, Width = 140, IconWidth = 38, IconHeight = 38, SliderIconLow = "lucide-sun-dim", SliderIconHigh = "lucide-sun" },
+    { Icon = "lucide-volume-2",  Command = "VolumeSlider", Joined = true, Width = 140, IconWidth = 44, IconHeight = 44, Live = "Volume", SliderIconLow = "lucide-volume-1", SliderIconHigh = "lucide-volume-2" },
+    { Icon = "lucide-volume-x",  Action = "Mute", Joined = true, Width = 142, IconWidth = 46, IconHeight = 46 }
+]
+# Keys left of the collapsed strip for a program without its own set (below):
+# screenshots (the panel AppSets.screenshot, patch 0020), lock, do not
+# disturb (its icon follows the state), clock , battery
+AppLayerKeys = [
+    { Icon = "lucide-camera",   Command = "Open", Open = "screenshot", Width = 120 },
+    { Icon = "lucide-lock",     Action = "Screensaver",           Width = 120 },
+    { Icon = "lucide-bell",     Command = "Dnd", Live = "Dnd",    Width = 120 },
+    { Time = "%H:%M", Locale = "uk_UA",                           Width = 140 },
+    # only below 20 % or while charging (ShowBelow, patch 0017)
+    { Battery = "both", ShowBelow = 20,                           Width = 190 }
+]
+
+# While the screen is locked: Esc only. KDE's lock screen starts the
+# fingerprint check only once its form is shown, so tiny-dfr presses Shift
+# (types nothing) 1.5 s after the screen locks, when the lid opens on a
+# locked screen and on a touch beside Esc: a finger unlocks at once, and the
+# Touch ID hint shows while the check runs (patch 0018)
+LockScreenKeys = []
+LockScreenWakeKey = "LeftShift"
+
+# Panels (Command = "Open", Open = "<AppSets entry>", patch 0020): that set
+# over the program's keys, this close key first; a used key closes it
+PanelCloseIcon = "mbp-close-circle"
+
+# The emoji panel (Command = "Emoji", patch 0019; add { Icon = "lucide-smile", Command = "Emoji" } to a set to use it): a tapped emoji goes to the
+# clipboard through mbp-touchbar-bridge (the old clipboard text comes back
+# after it) and is pasted with Ctrl+V, in these programs with Ctrl+Shift+V
+EmojiFont = "Noto Color Emoji"
+EmojiPasteShift = ["org.kde.konsole", "konsole", "org.kde.yakuake", "yakuake", "kitty", "alacritty", "org.wezfurlong.wezterm", "foot"]
+
+# Key sets per program (patch 0009). The KWin script mbp-touchbar-fnapps
+# reports the active window's class (mbp-touchbar app <class> ->
+# /run/tiny-dfr/app); the first [[Apps]] rule whose Match fits (case does not
+# matter, a trailing * matches the start) chooses:
+#   Set = "fn"      F1-F12 (Fn shows the strip)
+#   Set = "strip"   the expanded Control Strip
+#   Set = "<name>"  the keys of AppSets.<name> left of the collapsed strip
+# No rule: the quick keys (AppLayerKeys) and the strip as ControlStripDefault
+# says. Changes apply as soon as
+# the file is saved (sudo); a mistake makes tiny-dfr ignore the whole file and
+# say why in the journal (journalctl -u tiny-dfr). Classes of open windows:
+# see touchbar/README.md. In Touch Bar configuration 1 (T1 draws) only "fn"
+# counts: F1-F12 instead of the media keys; a rule can say otherwise with
+# Config1 = "fn" or "media".
+[AppSets]
+# web browsers: back, forward | reload | new tab
+browser = [
+    { Icon = "lucide-chevron-left",  Action = ["LeftAlt", "Left"],  Width = 140, IconWidth = 40, IconHeight = 40 },
+    { Icon = "lucide-chevron-right", Action = ["LeftAlt", "Right"], Width = 140, IconWidth = 40, IconHeight = 40 },
+    { Icon = "lucide-rotate-cw",     Action = "F5",                 Width = 140, Group = true },
+    { Icon = "lucide-copy-plus",     Action = ["LeftCtrl", "T"],    Width = 140, Group = true },
+    # the tabs panel (patch 0021): the browser's tabs, tap to switch
+    { Icon = "lucide-panels-top-left", Command = "Tabs",            Width = 140 }
+]
+# Dolphin: back, forward | up | icons, details | search
+files = [
+    { Icon = "lucide-chevron-left",  Action = ["LeftAlt", "Left"],  Width = 140, IconWidth = 40, IconHeight = 40 },
+    { Icon = "lucide-chevron-right", Action = ["LeftAlt", "Right"], Width = 140, IconWidth = 40, IconHeight = 40 },
+    { Icon = "lucide-arrow-up",      Action = ["LeftAlt", "Up"],    Width = 140, Group = true },
+    { Icon = "lucide-layout-grid",   Action = ["LeftCtrl", "Num1"],    Width = 140, Group = true },
+    { Icon = "lucide-list",          Action = ["LeftCtrl", "Num3"],    Width = 140 },
+    { Icon = "lucide-search",        Action = ["LeftCtrl", "F"],    Width = 140, Group = true }
+]
+# VS Code: debugging (Fn: F1-F12) - continue, step over, into, out | restart, stop
+code = [
+    { Icon = "lucide-play",              Action = "F5",                   Width = 120 },
+    { Icon = "lucide-redo-dot",          Action = "F10",                  Width = 120 },
+    { Icon = "lucide-arrow-down-to-dot", Action = "F11",                  Width = 120 },
+    { Icon = "lucide-arrow-up-from-dot", Action = ["LeftShift", "F11"],   Width = 120 },
+    { Icon = "lucide-rotate-ccw",        Action = ["LeftCtrl", "LeftShift", "F5"], Width = 120, Group = true },
+    { Icon = "lucide-square",            Action = ["LeftShift", "F5"],    Width = 120 }
+]
+# Google Meet in a browser (rule by window title): microphone, camera, hand
+meet = [
+    { Icon = "lucide-mic",   Action = ["LeftCtrl", "D"],            Width = 140 },
+    { Icon = "lucide-video", Action = ["LeftCtrl", "E"],            Width = 140 },
+    { Icon = "lucide-hand",  Action = ["LeftCtrl", "LeftAlt", "H"], Width = 140, Group = true }
+]
+# YouTube: back 10 s, play/pause, on 10 s | captions, full screen (its own keys)
+youtube = [
+    { Text = "−10 с",        Action = "J", Width = 120 },
+    { Icon = "play_pause",   Action = "K", Width = 120, IconWidth = 46, IconHeight = 46 },
+    { Text = "+10 с",        Action = "L", Width = 120 },
+    { Icon = "lucide-captions", Action = "C", Width = 120, Group = true },
+    { Icon = "lucide-maximize", Action = "F", Width = 120 }
+]
+# Konsole: new tab, close tab | split left/right, top/bottom | find (Fn: F1-F12)
+terminal = [
+    { Icon = "lucide-plus", Action = ["LeftCtrl", "LeftShift", "T"],   Width = 120 },
+    { Icon = "lucide-x",    Action = ["LeftCtrl", "LeftShift", "W"],   Width = 120 },
+    { Icon = "lucide-square-split-horizontal", Action = ["LeftCtrl", "LeftShift", "Num9"], Width = 120, Group = true },
+    { Icon = "lucide-square-split-vertical",   Action = ["LeftCtrl", "LeftShift", "Num0"], Width = 120 },
+    { Icon = "lucide-search", Action = ["LeftCtrl", "LeftShift", "F"], Width = 120, Group = true }
+]
+# The screenshot panel (camera key): Spectacle's own shortcuts - region,
+# active window, whole screen | record a region, record the screen (the same
+# key again stops the recording; Spectacle's tray icon stops it too). Where
+# shots go (file, clipboard) is Spectacle's setting.
+screenshot = [
+    { Icon = "lucide-square-dashed", Action = ["LeftMeta", "LeftShift", "Sysrq"], Width = 120 },
+    { Icon = "lucide-app-window",    Action = ["LeftMeta", "Sysrq"],              Width = 120 },
+    { Icon = "lucide-monitor",       Action = ["LeftShift", "Sysrq"],             Width = 120 },
+    { Icon = "mbp-record-region",    Action = ["LeftMeta", "LeftShift", "R"],     Width = 120, Group = true },
+    { Icon = "mbp-record-screen",    Action = ["LeftMeta", "LeftAlt", "R"],       Width = 120 }
+]
+# F-key labels (FnSet of a rule): what Fn shows in that program
+code-fn = [
+    { Text = "Палітра\nF1",   Action = "F1"  },
+    { Text = "Перейм.\nF2",   Action = "F2"  },
+    { Text = "Пошук\nF3",     Action = "F3"  },
+    { Text = "F4",             Action = "F4"  },
+    { Text = "Запуск\nF5",    Action = "F5"  },
+    { Text = "F6",             Action = "F6"  },
+    { Text = "F7",             Action = "F7"  },
+    { Text = "Помилка\nF8",   Action = "F8"  },
+    { Text = "Зупинка\nF9",   Action = "F9"  },
+    { Text = "Крок\nF10",     Action = "F10" },
+    { Text = "Всередину\nF11", Action = "F11" },
+    { Text = "Визнач.\nF12",  Action = "F12" }
+]
+files-fn = [
+    { Text = "Довідка\nF1",   Action = "F1"  },
+    { Text = "Перейм.\nF2",   Action = "F2"  },
+    { Text = "Поділ\nF3",     Action = "F3"  },
+    { Text = "Термінал\nF4",  Action = "F4"  },
+    { Text = "Оновити\nF5",   Action = "F5"  },
+    { Text = "Адреса\nF6",    Action = "F6"  },
+    { Text = "F7",             Action = "F7"  },
+    { Text = "F8",             Action = "F8"  },
+    { Text = "Місця\nF9",     Action = "F9"  },
+    { Text = "Тека\nF10",     Action = "F10" },
+    { Text = "F11",            Action = "F11" },
+    { Text = "Повний\nF12",   Action = "F12" }
+]
+# calls: the microphone of the whole session (KDE), its icon shows the state
+calls = [
+    { Icon = "lucide-mic", Action = "MicMute", Width = 140, Live = "Mic" }
+]
+
+# web sites first (MatchTitle: part of the window title, kept only in /run)
+[[Apps]]
+Match = ["google-chrome*", "chromium*", "firefox*", "org.mozilla.firefox*"]
+MatchTitle = ["Google Meet", "Meet – ", "Meet - "]
+Set = "meet"
+
+[[Apps]]
+Match = ["google-chrome*", "chromium*", "firefox*", "org.mozilla.firefox*"]
+MatchTitle = ["- YouTube"]
+Set = "youtube"
+
+[[Apps]]
+Match = ["google-chrome*", "chromium*", "firefox*", "org.mozilla.firefox*"]
+Set = "browser"
+
+[[Apps]]
+Match = ["org.kde.dolphin", "dolphin"]
+Set = "files"
+FnSet = "files-fn"
+
+[[Apps]]
+Match = ["code", "code-oss", "code-url-handler", "codium", "vscodium"]
+Set = "code"
+FnSet = "code-fn"
+# configuration 1 (T1 draws, no sets): F1-F12 there, as before
+Config1 = "fn"
+
+[[Apps]]
+Match = ["zoom", "discord", "slack", "teams-for-linux", "skype"]
+Set = "calls"
+
+[[Apps]]
+Match = ["org.kde.konsole", "konsole"]
+Set = "terminal"
+# configuration 1 (no sets): F1-F12 there, as before
+Config1 = "fn"
+
+[[Apps]]
+# terminals and editors (the list the KWin script had, without VS Code)
+Match = ["org.kde.yakuake", "yakuake", "jetbrains-*", "kitty", "alacritty", "org.wezfurlong.wezterm", "foot"]
+Set = "fn"

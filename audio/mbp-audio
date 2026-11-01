@@ -1,0 +1,257 @@
+#!/bin/bash
+# Internal speakers of the MacBookPro13,2 through PipeWire ("MacBook Speakers").
+#
+#   mbp-audio gen          build the filter graph (/var/lib/mbp-audio/speakers.conf)
+#                          from the macOS data, the speaker map and the EQ state
+#   mbp-audio eq on|off    switch only the EQ and the make-up gain, live and
+#                          persistent; the crossover, the per-speaker filters
+#                          and the speaker guard stay on
+#   mbp-audio eq           EQ state
+#   mbp-audio status       nodes, EQ, guard temperatures and gain reduction
+#   mbp-audio reload       re-create the filter (restarts WirePlumber)
+#   mbp-audio bass 0|2|3   bass boost (low shelf under 250 Hz, dB), live and
+#                          persistent; before the protection, off by default
+#   mbp-audio bass         bass boost state
+#   mbp-audio dac          DAC volume of the amps and the voltage of the thermal model
+#   sudo mbp-audio dac DB  set the DAC volume of the four SSM3515 (-3 = driver
+#                          default, up to +18, steps of 0.375 dB): persistent
+#                          (modprobe.d) and live from the next stream; the
+#                          thermal model and the limiter follow (raised voltage
+#                          and lowered limiter before the amps get louder, the
+#                          other way round after they got quieter)
+#
+# gen/eq run as the user who owns /var/lib/mbp-audio (set up by install.sh),
+# no sudo needed. Live changes go to the filter node with pw-cli.
+set -euo pipefail
+
+LIB=/usr/local/lib/mbp-audio
+STATE=/var/lib/mbp-audio
+GRAPH=$STATE/speakers.conf
+META=$STATE/speakers.meta.json
+EQ_STATE=$STATE/eq
+BASS_STATE=$STATE/bass
+NODE=mbp_speakers
+DAC_PARAM=/sys/module/snd_hda_codec_cs8409/parameters/ssm_dac_vol
+DAC_CONF=/etc/modprobe.d/mbp13-2-audio.conf
+
+die() { echo "mbp-audio: $*" >&2; exit 1; }
+
+speaker_map() { grep -v '^\s*#' "$LIB/speaker-map" | grep -v '^\s*$' | tail -1; }
+# DAC volume: register code 0x40 = 0 dB, 0.375 dB per step, lower = louder;
+# the driver uses 0x48 (-3 dB) for anything outside 0x10..0xfe.
+code_db() { python3 -I -c 'import sys; c = int(sys.argv[1], 0); c = c if 0x10 <= c <= 0xfe else 0x48; print("%g" % ((0x40 - c) * 0.375))' "$1"; }
+dac_live() { [[ -r $DAC_PARAM ]] && code_db "$(cat "$DAC_PARAM")" || echo -3; }
+dac_conf() {
+	local c
+	c=$(sed -n 's/^options snd_hda_codec_cs8409 .*ssm_dac_vol=\([0-9a-fA-Fx]*\).*/\1/p' "$DAC_CONF" 2>/dev/null | tail -1)
+	[[ -n $c ]] && code_db "$c" || echo -3
+}
+# for the thermal model: the louder of the running and the configured value
+dac_model() { python3 -I -c 'import sys; print("%g" % max(map(float, sys.argv[1:])))' "$(dac_live)" "$(dac_conf)" "$@"; }
+
+bass_state() { [[ -s $BASS_STATE ]] && cat "$BASS_STATE" || echo 0; }
+
+eq_state() { [[ -s $EQ_STATE ]] && cat "$EQ_STATE" || echo on; }
+
+cmd_gen() {
+	local eq=${1:-$(eq_state)} tmp
+	[[ $(cat /sys/class/dmi/id/product_name 2>/dev/null) == MacBookPro13,2 ]] ||
+		die "not a MacBookPro13,2: these speaker parameters can damage other speakers, no graph written"
+	[[ -s $LIB/layout54.json ]] || die "no $LIB/layout54.json: sudo $LIB/get-layout.sh <layout54.xml.zlib from this Mac's macOS> (audio/README.md)"
+	[[ -w $STATE ]] || die "$STATE not writable"
+	tmp=$(mktemp "$STATE/.speakers.XXXXXX")
+	if ! MBP_BASS_DB=$(bass_state) MBP_DAC_DB=${MBP_DAC_DB:-$(dac_model)} python3 -I "$LIB/mkgraph.py" "$LIB/layout54.json" "$(speaker_map)" "$eq" "$META" > "$tmp"; then
+		rm -f "$tmp"; die "graph not generated, the old one is kept"
+	fi
+	chmod 644 "$tmp"
+	mv "$tmp" "$GRAPH"
+	echo "$eq" > "$EQ_STATE"
+	echo "mbp-audio: graph written (EQ $eq): $GRAPH"
+}
+
+node_id() {
+	pw-dump 2>/dev/null | python3 -I -c '
+import json, sys
+for o in json.load(sys.stdin):
+    if o.get("type", "").endswith("Node") and o.get("info", {}).get("props", {}).get("node.name") == sys.argv[1]:
+        print(o["id"]); break' "$NODE"
+}
+
+# Set the EQ controls of the running filter to on/off values from the meta file.
+apply_live() {
+	local id params
+	id=$(node_id) || true
+	[[ -n $id ]] || { echo "mbp-audio: filter not running, applies when it starts"; return 0; }
+	params=$(python3 -I -c '
+import json, sys
+m = json.load(open(sys.argv[1])); on = sys.argv[2] == "on"
+p = []
+for name, v_on, v_off in m["toggles"]:
+    p += ["\"%s\"" % name, "%.6f" % (v_on if on else v_off)]
+print("{ params = [ " + " ".join(p) + " ] }")' "$META" "$1")
+	# stderr: pw-cli also complains about the hidden raw node, harmless
+	pw-cli set-param "$id" Props "$params" >/dev/null 2>&1
+	echo "mbp-audio: EQ $1 on the running filter (node $id)"
+}
+
+cmd_eq() {
+	case "${1:-}" in
+	on|off) cmd_gen "$1"; apply_live "$1" ;;
+	"") echo "EQ: $(eq_state)" ;;
+	*) die "usage: mbp-audio eq on|off" ;;
+	esac
+}
+
+cmd_bass() {
+	local id
+	case "${1:-}" in
+	0|2|3)
+		[[ -w $STATE ]] || die "$STATE not writable"
+		echo "$1" > "$BASS_STATE"
+		cmd_gen
+		id=$(node_id) || true
+		if [[ -n $id ]]; then
+			pw-cli set-param "$id" Props "{ params = [ \"bassb_l:Gain\" $1 \"bassb_r:Gain\" $1 ] }" >/dev/null 2>&1
+			echo "mbp-audio: bass boost +$1 dB on the running filter (node $id)"
+		else
+			echo "mbp-audio: filter not running, bass boost +$1 dB applies when it starts"
+		fi ;;
+	"") echo "bass:    +$(bass_state) dB" ;;
+	*) die "usage: mbp-audio bass 0|2|3" ;;
+	esac
+}
+
+graph_vfs() { grep -o '"Vfs": [0-9.]*' "$GRAPH" 2>/dev/null | grep -o '[0-9.]*$' || echo ?; }
+# the guard's controls in the graph file that follow the DAC volume, as pw-cli params
+guard_params() {
+	python3 -I -c '
+import json, sys
+g = json.load(open(sys.argv[1]))
+c = [n for n in g["filter.graph"]["nodes"] if n["name"] == "guard"][0]["control"]
+print("\"guard:Vfs\" %s \"guard:Ceiling\" %s" % (c["Vfs"], c["Ceiling"]))' "$GRAPH"
+}
+
+# Set the guard of the running filter to the graph file (as the session user):
+# the thermal model voltage and the limiter, both follow the DAC volume.
+guard_live() {
+	local id p
+	p=$(guard_params)
+	id=$(node_id) || true
+	[[ -n $id ]] || { echo "mbp-audio: filter not running, the graph file has $p"; return 0; }
+	pw-cli set-param "$id" Props "{ params = [ $p ] }" >/dev/null 2>&1
+	echo "mbp-audio: running filter (node $id) set to $p"
+}
+
+# As the session user: regenerate the graph for DAC volume $1 and set its guard live.
+as_user() {
+	local u=${SUDO_USER:-} uid
+	[[ -n $u ]] || die "run with sudo from the user's session"
+	uid=$(id -u "$u")
+	sudo -u "$u" XDG_RUNTIME_DIR=/run/user/$uid MBP_DAC_DB="$1" "$0" _vfs
+}
+
+cmd_dac() {
+	local db code
+	if [[ -z ${1:-} ]]; then
+		echo "DAC:     running $(dac_live) dB, configured $(dac_conf) dB ($DAC_CONF)"
+		echo "thermal: Vfs $(graph_vfs) V in the graph (for $(dac_model) dB)"
+		return
+	fi
+	[[ $EUID -eq 0 ]] || die "setting the DAC volume needs sudo"
+	[[ -w $DAC_PARAM ]] || die "$DAC_PARAM missing: driver without ssm_dac_vol (install snd_hda_macbookpro and reboot)"
+	code=$(python3 -I -c '
+import sys
+db = float(sys.argv[1]); c = 0x40 - db / 0.375
+if not (-3 <= db <= 18) or abs(c - round(c)) > 1e-6: sys.exit("DAC volume: -3..+18 dB in steps of 0.375")
+print("0x%02x" % round(c))' "$1") || exit 1
+	db=$(code_db "$code")
+	# louder: thermal model first; quieter: amps first, the model after
+	as_user "$(dac_model "$db")"
+	echo "options snd_hda_codec_cs8409 ssm_dac_vol=$code" > "$DAC_CONF"
+	echo "$code" > "$DAC_PARAM"
+	as_user "$(dac_model)"
+	echo "mbp-audio: DAC volume $db dB ($code), from the next stream (pause and play again)"
+}
+
+# warn when the running guard is not what the graph file says (Vfs, limiter)
+live_guard_check() {
+	local want have id
+	want=$(guard_params 2>/dev/null) || return 0
+	id=$(node_id) || true
+	[[ -n $id ]] || { echo "guard:   filter not running yet (just restarted?): run status again"; return 0; }
+	have=$(pw-cli enum-params "$id" Props 2>/dev/null | grep -A1 -E '"guard:(Vfs|Ceiling)"' | grep -o -E 'Float [-0-9.]+' | awk '{printf "%g ", $2}')
+	python3 -I -c '
+import sys
+w = [float(x) for x in sys.argv[1].split()[1::2]]; h = [float(x) for x in sys.argv[2].split()]
+ok = len(h) == 2 and all(abs(a - b) < 0.01 for a, b in zip(w, h))
+print("guard:   running Vfs %s V, limiter %s dBFS%s" % (tuple(h + ["?", "?"])[:2] + ("" if ok else "  WARNING: graph file has Vfs %g, limiter %g (mbp-audio _vfs or restart wireplumber)" % tuple(w),)))' "$want" "$have"
+}
+
+# the raw speaker node must play at exactly 1.0: any other volume there is
+# after the graph, invisible to the thermal model and the limiter. The node
+# is hidden from clients (pw-dump does not list it), so check the rule that
+# locks it and show the route volume WirePlumber keeps (ignored while locked)
+raw_volume_check() {
+	local rule=/etc/wireplumber/wireplumber.conf.d/91-mbp13-2-speakers.conf
+	local route
+	route=$(pw-dump 2>/dev/null | python3 -I -c '
+import json, sys
+for o in json.load(sys.stdin):
+    i = o.get("info") or {}
+    if o.get("type", "").endswith("Device") and "alsa_card" in i.get("props", {}).get("device.name", ""):
+        for r in i.get("params", {}).get("Route", []):
+            if r.get("name") == "mbp13-2-speakers":
+                print(" ".join("%.3f" % v for v in r.get("props", {}).get("channelVolumes", [])))' 2>/dev/null)
+	if grep -qE '^[[:space:]]*channelmix\.lock-volumes = true' "$rule" 2>/dev/null &&
+	   grep -qE '^[[:space:]]*channelmix\.max-volume = 1\.0' "$rule" 2>/dev/null; then
+		echo "raw:     volume locked at 1.0 (route ${route:-?}, ignored)"
+	else
+		echo "raw:     WARNING: volume lock missing in $rule (install.sh audio, restart wireplumber); route ${route:-?}"
+	fi
+}
+
+cmd_status() {
+	echo "EQ:      $(eq_state)"
+	echo "bass:    +$(bass_state) dB (boost under 250 Hz)"
+	echo "map:     $(speaker_map) (left tweeter, right tweeter, left woofer, right woofer)"
+	echo "graph:   $([[ -s $GRAPH ]] && echo "$GRAPH ($(stat -c %y "$GRAPH" | cut -d. -f1))" || echo MISSING - speakers silent)"
+	echo "default: $(pactl get-default-sink 2>/dev/null || echo ?)"
+	echo "DAC:     $(dac_live) dB (configured $(dac_conf)), thermal model Vfs $(graph_vfs) V"
+	live_guard_check
+	raw_volume_check
+	# the guard must run at the amps' 44.1 kHz: no resampler after the limiter
+	pw-metadata -n settings 0 clock.allowed-rates 2>/dev/null | grep -q 44100 \
+		&& echo "rate:    44.1 kHz allowed (graph runs at the amps' rate)" \
+		|| echo "rate:    WARNING 44.1 kHz not allowed: resampling after the limiter (install.sh audio, restart pipewire)"
+	pw-dump 2>/dev/null | python3 -I -c '
+import json, sys
+names = {"mbp_speakers": "filter", "mbp_speakers.out": "filter out"}
+for o in json.load(sys.stdin):
+    if not o.get("type", "").endswith("Node"): continue
+    info = o.get("info", {}); p = info.get("props", {}); n = p.get("node.name", "")
+    if n in names or n.startswith("alsa_output.pci-0000_00_1f.3"):
+        print("node:    %-45s %s" % (n, info.get("state")))
+    if n == "mbp_speakers":
+        for pr in info.get("params", {}).get("Props", []):
+            ps = pr.get("params")
+            if not ps: continue
+            kv = dict(zip(ps[0::2], ps[1::2]))
+            t = [kv.get("guard:Temp %d" % i) for i in range(4)]
+            if t[0] is not None:
+                print("guard:   coil estimate degC  L tw %.1f  R tw %.1f  L wf %.1f  R wf %.1f" % tuple(t))
+                print("guard:   thermal gain dB  tw %.1f  wf %.1f, limiter dB  tw %.1f  wf %.1f" % tuple(
+                    kv.get(k, 0) for k in ("guard:Thermal gain A", "guard:Thermal gain B",
+                                           "guard:Limiter gain A", "guard:Limiter gain B")))
+'
+}
+
+case "${1:-status}" in
+gen) shift; cmd_gen "$@" ;;
+eq) shift; cmd_eq "$@" ;;
+bass) shift; cmd_bass "$@" ;;
+status) cmd_status ;;
+reload) systemctl --user restart wireplumber; echo "mbp-audio: WirePlumber restarted" ;;
+dac) shift; cmd_dac "$@" ;;
+_vfs) cmd_gen; guard_live ;;
+*) die "usage: mbp-audio gen|eq [on|off]|bass [0|2|3]|status|reload|dac [DB]" ;;
+esac

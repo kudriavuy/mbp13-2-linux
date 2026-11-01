@@ -1,0 +1,7 @@
+# Ours (MacBookPro13,2): our .link names the T1 NCM interface t1ncm0, and that
+# rename ends the "add" event T1Bridge's 90-t1bridge-xart.rules matches with a
+# "move" event that carries no SYSTEMD_WANTS: the xART service never started.
+# Want it on the move event too (same match, same unit).
+ACTION=="move", SUBSYSTEM=="net", ENV{ID_VENDOR_ID}=="05ac", \
+  ENV{ID_MODEL_ID}=="8600", ENV{ID_USB_INTERFACE_NUM}=="04", \
+  TAG+="systemd", ENV{SYSTEMD_WANTS}+="t1-xart-storage@$name.service"

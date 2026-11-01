@@ -1,0 +1,41 @@
+# Stage 7: minimal Touch Bar (Esc, F1-F12, media) when tiny-dfr has failed.
+# Back to tiny-dfr: Meta+Ctrl+T (mbp-t1-restart) or systemctl restart tiny-dfr.
+[Unit]
+Description=Touch Bar fallback renderer (Esc, F1-F12, media)
+BindsTo=dev-tiny_dfr_display.device dev-tiny_dfr_backlight.device
+After=dev-tiny_dfr_display.device dev-tiny_dfr_backlight.device
+Conflicts=tiny-dfr.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
+OnFailure=mbp-t1-giveup.service
+
+[Service]
+ExecStart=/usr/local/bin/mbp-t1-fallback
+Restart=on-failure
+RestartSec=3
+# OnFailure= (give up) only once the limit is hit, not on every restart
+RestartMode=direct
+# root only to open the devices; it drops to nobody (input, video) itself
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+# /sys writable: the brightness file
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+DevicePolicy=closed
+DeviceAllow=char-drm rw
+DeviceAllow=char-input r
+DeviceAllow=/dev/uinput w

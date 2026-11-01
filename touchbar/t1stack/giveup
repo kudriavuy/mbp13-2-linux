@@ -1,0 +1,9 @@
+#!/bin/bash
+# OnFailure of mbp-t1-fallback.service (its start limit used up): neither
+# tiny-dfr nor the fallback draws. The next boot stays in configuration 1,
+# where the T1 draws its own Touch Bar. Root.
+MARK=/var/lib/mbp-t1/stay-cfg1
+mkdir -p "$(dirname "$MARK")"
+echo "$(date -Is) $(uname -r): tiny-dfr and mbp-t1-fallback failed" > "$MARK"
+/usr/local/lib/mbp-t1/notify "Touch Bar: reboot the Mac" \
+	"tiny-dfr and the fallback renderer do not work. After a reboot the Touch Bar is in configuration 1 (keys visible). Marker $MARK; to use configuration 2 again: sudo rm $MARK."

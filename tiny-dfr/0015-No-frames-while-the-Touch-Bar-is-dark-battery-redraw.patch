@@ -1,0 +1,97 @@
+From f38ab9876493995a01f709f2cbb4c75c41a2a9b7 Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 23:38:14 +0100
+Subject: [PATCH] No frames while the Touch Bar is dark; battery redrawn on
+ events only
+
+The battery key was marked changed on every pass of the loop (upstream),
+so every wake-up - at least every 10 s, and every input event - sent a
+frame. While the bar is dark (backlight 0: the T1's panel is parked) the
+T1 does not answer frames, and each one timed out after 1 s in appletbdrm
+("Failed to read response (-110)" every 11 s; a touch could wait for it).
+
+Nothing is drawn while the backlight is off; everything is drawn again
+when it comes back. The battery key is redrawn on a power_supply udev
+event and once a minute.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ src/main.rs | 30 +++++++++++++++++++++++++-----
+ 1 file changed, 25 insertions(+), 5 deletions(-)
+
+diff --git a/src/main.rs b/src/main.rs
+index 90379cc..5febcb6 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1650,6 +1650,9 @@ fn real_main(drm: &mut DrmBackend) {
+     // the layout key held: (touch slot, x at touch, layout it started on,
+     // the one shown now if it is sliding)
+     let mut layout_hold: Option<(u32, f64, usize, Option<usize>)> = None;
++    // the battery key: redraw due, and the minute it was last due
++    let mut battery_due = true;
++    let mut battery_minute = u32::MAX;
+     // Touch ID: the icon, a result being shown (kind, since), what is drawn
+     let mut fingerprint = touchid_icon(&cfg);
+     let mut touchid_flash: Option<(state::TouchId, Instant)> = None;
+@@ -1884,7 +1887,15 @@ fn real_main(drm: &mut DrmBackend) {
+             needs_complete_redraw = true;
+             last_redraw_ts = current_ts;
+         }
+-        if layers[active_layer].displays_battery {
++        // the battery: on a power_supply event and once a minute, not on
++        // every pass (which sent a frame on every wake-up)
++        let minute = Local::now().minute();
++        if minute != battery_minute {
++            battery_minute = minute;
++            battery_due = true;
++        }
++        if layers[active_layer].displays_battery && battery_due {
++            battery_due = false;
+             for button in &mut layers[active_layer].buttons {
+                 if let ButtonImage::Battery(_, _, _) = button.1.image {
+                     button.1.changed = true;
+@@ -1897,7 +1908,13 @@ fn real_main(drm: &mut DrmBackend) {
+         for (_, b) in &mut layers[active_layer].buttons {
+             fading |= b.step_fade();
+         }
+-        if let Some(t) = &transition {
++        // a dark (parked) Touch Bar takes no frames: each one would wait for
++        // the T1's answer and time out after 1 s. All of it when it lights up.
++        let bar_dark = backlight.current_bl() == 0;
++        if bar_dark {
++            needs_complete_redraw = true;
++        }
++        if let (Some(t), false) = (&transition, bar_dark) {
+             if t.done() {
+                 transition = None;
+                 needs_complete_redraw = true;
+@@ -1923,8 +1940,9 @@ fn real_main(drm: &mut DrmBackend) {
+         }
+         let slider_moving = slider.as_ref().is_some_and(|s| s.animating());
+         let layer_changed = layers[active_layer].buttons.iter().any(|b| b.1.changed);
+-        if transition.is_some() {
+-            // the transition frame is on the bar; keys under it wait for its end
++        if transition.is_some() || bar_dark {
++            // a transition frame is on the bar (keys under it wait for its
++            // end), or the bar is dark
+         } else if needs_complete_redraw
+             || layer_changed
+             || (slider.is_some() && (slider_dirty || slider_moving))
+@@ -2089,7 +2107,9 @@ fn real_main(drm: &mut DrmBackend) {
+             e => e.unwrap(),
+         };
+ 
+-        _ = udev_monitor.iter().last();
++        if udev_monitor.iter().last().is_some() {
++            battery_due = true;
++        }
+ 
+         input_tb.dispatch().unwrap();
+         input_main.dispatch().unwrap();
+-- 
+2.53.0
+

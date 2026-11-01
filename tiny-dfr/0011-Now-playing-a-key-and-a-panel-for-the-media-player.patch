@@ -1,0 +1,908 @@
+From f60a669173cc5c897ef80eb449e961f821666e4b Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:10:06 +0100
+Subject: [PATCH 11/11] Now playing: a key and a panel for the media player
+
+Command = "NowPlaying" is a key that shows only while the helper reports
+a media player with a track (/run/tiny-dfr/bridge/nowplaying, "key value"
+lines: status, title, artist, length, position and when it was read, rate,
+whether it can seek); hidden it takes no room. A tap opens a panel right
+of Esc, as on macOS: a round close button, previous / play-pause / next
+(drawn, the middle one follows the status) and a capsule with title,
+artist, elapsed / total time and a scrubber. The time runs on from the
+last report while playing, redrawn once a second (only the capsule).
+Dragging the scrubber shows the new time and seeks on release ("seek
+<0..1>"); the keys send "media previous|playpause|next", or media keys
+without the helper. Only Esc stays usable under the panel; it closes with
+its button, when the player goes, or when the row changes.
+
+The PNG preview shows the key and the panel with a made-up track, and a
+key slider opening to the right of its key.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ share/tiny-dfr/config.toml |   4 +
+ src/config.rs              |   2 +
+ src/main.rs                | 239 +++++++++++++++++++++++++++++++++--
+ src/media.rs               | 246 +++++++++++++++++++++++++++++++++++++
+ src/slider.rs              |  20 +--
+ src/state.rs               |  62 +++++++++-
+ 6 files changed, 555 insertions(+), 18 deletions(-)
+ create mode 100644 src/media.rs
+
+diff --git a/share/tiny-dfr/config.toml b/share/tiny-dfr/config.toml
+index 8ae92ce..45e4ced 100644
+--- a/share/tiny-dfr/config.toml
++++ b/share/tiny-dfr/config.toml
+@@ -84,6 +84,10 @@ FontTemplate = ":bold"
+ # Slider = "Volume" / "Brightness" / "Keyboard" on a key with an Action: a tap
+ # sends the key (on release), holding it and sliding opens that slider.
+ # Command = "KeyboardSlider": like VolumeSlider, for the keyboard light.
++# Command = "NowPlaying": shown only while the helper follows a media player
++# with a track (/run/tiny-dfr/bridge/nowplaying); a tap opens a panel right of
++# Esc: close, previous, play/pause, next, title, artist, time and a scrubber
++# (dragging it seeks on release). Without the helper the three are media keys.
+ # PixelShiftSmooth = true   # false: one whole pixel every 10 s instead of a
+ #                           # 4 s animation (fewer frames); no shifting at all
+ #                           # while the bar is dark
+diff --git a/src/config.rs b/src/config.rs
+index 94deff7..b7ee0e1 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -116,6 +116,8 @@ pub enum Command {
+     BrightnessSlider,
+     /// the same for the keyboard light
+     KeyboardSlider,
++    /// shown while a media player has a track; opens the now-playing panel
++    NowPlaying,
+ }
+ 
+ #[derive(Deserialize)]
+diff --git a/src/main.rs b/src/main.rs
+index 91fb33a..159105e 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -39,7 +39,7 @@ use std::{
+     panic::{self, AssertUnwindSafe},
+     path::{Path, PathBuf},
+     process, thread,
+-    time::{Duration, Instant},
++    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+ };
+ use udev::MonitorBuilder;
+ 
+@@ -49,6 +49,7 @@ mod config;
+ mod display;
+ mod fonts;
+ mod layer_switch;
++mod media;
+ mod pixel_shift;
+ mod slider;
+ mod state;
+@@ -132,6 +133,8 @@ struct Button {
+     live: Option<(Live, Vec<ButtonImage>, usize)>,
+     // Slider: held and slid it opens this slider; its key goes out on release
+     slide: Option<SlideKind>,
++    // not shown and taking no room (NowPlaying without a player)
++    hidden: bool,
+ }
+ 
+ fn try_load_svg(path: &str) -> Result<ButtonImage> {
+@@ -363,6 +366,7 @@ impl Button {
+             fade: None,
+             live: None,
+             slide: None,
++            hidden: false,
+         }
+     }
+     fn new_text(text: String, action: Vec<Key>) -> Button {
+@@ -382,6 +386,7 @@ impl Button {
+             fade: None,
+             live: None,
+             slide: None,
++            hidden: false,
+         }
+     }
+     fn new_icon(
+@@ -409,6 +414,7 @@ impl Button {
+             fade: None,
+             live: None,
+             slide: None,
++            hidden: false,
+         }
+     }
+     fn load_battery_image(icon: &str, theme: Option<impl AsRef<str>>) -> Handle {
+@@ -471,6 +477,7 @@ impl Button {
+             fade: None,
+             live: None,
+             slide: None,
++            hidden: false,
+         }
+     }
+ 
+@@ -507,6 +514,7 @@ impl Button {
+             fade: None,
+             live: None,
+             slide: None,
++            hidden: false,
+         }
+     }
+     fn needs_faster_refresh(&self) -> bool {
+@@ -658,6 +666,13 @@ impl Button {
+     }
+     /// Show the image of a Live button for this state
+     fn follow(&mut self, st: &state::State) {
++        if self.command == Some(Command::NowPlaying) {
++            let hidden = st.playing.is_none();
++            if hidden != self.hidden {
++                self.hidden = hidden;
++                self.changed = true;
++            }
++        }
+         let Some((kind, images, shown)) = &mut self.live else { return };
+         let want = match kind {
+             Live::Volume => match st.volume {
+@@ -756,6 +771,7 @@ impl FunctionLayer {
+     /// a button instead of ButtonSpacing. Rounded so that the gaps stay even.
+     fn geometry(&self, config: &Config, width: f64) -> Vec<(f64, f64)> {
+         let gap = |i: usize, b: &Button| match (i, b.joined, b.group) {
++            _ if b.hidden => 0.0,
+             (0, _, _) => 0.0,
+             (_, true, _) => config.joined_spacing,
+             (_, false, true) => config.group_spacing,
+@@ -765,6 +781,9 @@ impl FunctionLayer {
+         let mut shares = 0usize;
+         for (i, (stretch, b)) in self.buttons.iter().enumerate() {
+             free -= gap(i, b);
++            if b.hidden {
++                continue;
++            }
+             match b.fixed_width {
+                 Some(w) => free -= w,
+                 None => {
+@@ -779,6 +798,10 @@ impl FunctionLayer {
+         let mut out = Vec::with_capacity(self.buttons.len());
+         for (i, (stretch, b)) in self.buttons.iter().enumerate() {
+             x += gap(i, b);
++            if b.hidden {
++                out.push((x.floor(), 0.0));
++                continue;
++            }
+             let w = b.fixed_width.unwrap_or(
+                 *stretch as f64 * share + (*stretch - 1) as f64 * config.button_spacing,
+             );
+@@ -832,7 +855,8 @@ impl FunctionLayer {
+ 
+         let joined: Vec<bool> = self.buttons.iter().map(|(_, b)| b.joined).collect();
+         for (i, (_, button)) in self.buttons.iter_mut().enumerate() {
+-            if !button.changed && !complete_redraw {
++            if (!button.changed && !complete_redraw) || button.hidden {
++                button.changed = false;
+                 continue;
+             };
+             // in a joined run only the outer corners are round
+@@ -935,9 +959,10 @@ impl FunctionLayer {
+             let hi = if i + 1 == n { f64::MAX } else { (left + w + geometry[i + 1].0) / 2.0 };
+             x >= lo && x < hi
+         };
++        let shown = |i: usize| !self.buttons[i].1.hidden;
+         match i {
+-            Some(i) => (i < n && contains(i)).then_some(i),
+-            None => (0..n).find(|&i| contains(i)),
++            Some(i) => (i < n && shown(i) && contains(i)).then_some(i),
++            None => (0..n).find(|&i| shown(i) && contains(i)),
+         }
+     }
+ }
+@@ -1007,6 +1032,12 @@ where
+ fn render_preview(path: &std::ffi::OsStr) {
+     let (width, height) = (2170u16, 60u16);
+     let (cfg, mut layers) = ConfigManager::new().load_config(width);
++    // no helper here: no player, the now-playing key stays hidden
++    for layer in layers.iter_mut() {
++        for (_, b) in &mut layer.buttons {
++            b.hidden = b.command == Some(Command::NowPlaying);
++        }
++    }
+     let gap = 12;
+     enum Frame {
+         Strip(f64),
+@@ -1029,6 +1060,13 @@ fn render_preview(path: &std::ffi::OsStr) {
+     for r in sets {
+         rows.push((r, None, None));
+     }
++    // a key with Slider = "Keyboard" on the expanded strip (opens on its right)
++    if let Some(btn) = layers[ROW_STRIP_EXPANDED].buttons.iter().position(|(_, b)| b.slide == Some(SlideKind::Keyboard)) {
++        let mut s = Slider::new(SliderKind::Keyboard, SliderMode::Tap { deadline: Instant::now() }, (ROW_STRIP_EXPANDED, btn));
++        s.value = 0.6;
++        s.backdate(anim::SLIDER_OPEN);
++        rows.push((ROW_STRIP_EXPANDED, None, Some(s)));
++    }
+     for (kind, value) in [(SliderKind::Volume, 0.4), (SliderKind::Brightness, 0.7)] {
+         let source = layers[ROW_STRIP_COLLAPSED]
+             .buttons
+@@ -1042,10 +1080,11 @@ fn render_preview(path: &std::ffi::OsStr) {
+         }
+     }
+     let mut bar = ImageSurface::create(Format::ARgb32, height as i32, width as i32).unwrap();
++    let has_np_row = layers[ROW_STRIP_COLLAPSED].buttons.iter().any(|(_, b)| b.command == Some(Command::NowPlaying));
+     let out = ImageSurface::create(
+         Format::ARgb32,
+         width as i32,
+-        (rows.len() + frames.len()) as i32 * (height as i32 + gap) - gap,
++        (rows.len() + frames.len() + if has_np_row { 2 } else { 0 }) as i32 * (height as i32 + gap) - gap,
+     )
+     .unwrap();
+     let c = Context::new(&out).unwrap();
+@@ -1077,9 +1116,57 @@ fn render_preview(path: &std::ffi::OsStr) {
+         c.paint().unwrap();
+         c.restore().unwrap();
+     }
++    // now playing (a made-up track): the strip with its key, the panel
++    let demo = state::NowPlaying {
++        playing: true,
++        title: "Song title from the media player".into(),
++        artist: "Artist".into(),
++        length_us: 225_000_000,
++        position_us: 83_000_000,
++        at_ms: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64),
++        rate: 0.0,
++        can_seek: true,
++    };
++    let has_np = layers[ROW_STRIP_COLLAPSED].buttons.iter().any(|(_, b)| b.command == Some(Command::NowPlaying));
++    let mut extra = 0;
++    if has_np {
++        for (_, b) in &mut layers[ROW_STRIP_COLLAPSED].buttons {
++            if b.command == Some(Command::NowPlaying) {
++                b.hidden = false;
++            }
++        }
++        for with_panel in [false, true] {
++            layers[ROW_STRIP_COLLAPSED].draw(&cfg, width as i32, height as i32, &bar, (0.0, 0.0), true);
++            if with_panel {
++                let layout = media_layout(&cfg, &layers[ROW_STRIP_COLLAPSED], width);
++                let bc = Context::new(&bar).unwrap();
++                bc.translate(height as f64, 0.0);
++                bc.rotate((90.0f64).to_radians());
++                let sx = pixel_shift_width(&cfg) / 2.0;
++                bc.set_source_rgb(0.0, 0.0, 0.0);
++                bc.rectangle(layout.left + sx - cfg.group_spacing / 2.0, 0.0, width as f64, height as f64);
++                bc.fill().unwrap();
++                bc.set_font_face(&cfg.font_face);
++                media::Panel::new().draw(&bc, &cfg, &layout, Some(&demo), height as f64, (sx, 0.0), true);
++            }
++            bar.flush();
++            c.save().unwrap();
++            let y0 = ((rows_len + extra) as i32 * (height as i32 + gap)) as f64;
++            c.transform(cairo::Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, y0 + height as f64));
++            c.set_source_surface(&bar, 0.0, 0.0).unwrap();
++            c.paint().unwrap();
++            c.restore().unwrap();
++            extra += 1;
++        }
++        for (_, b) in &mut layers[ROW_STRIP_COLLAPSED].buttons {
++            if b.command == Some(Command::NowPlaying) {
++                b.hidden = true;
++            }
++        }
++    }
+     // animation frames, time moved back by hand
+     let shift = (0.0, 0.0);
+-    let n_rows = rows_len;
++    let n_rows = rows_len + extra;
+     for (i, frame) in frames.into_iter().enumerate() {
+         match frame {
+             Frame::Strip(t) => {
+@@ -1263,6 +1350,31 @@ fn slider_layout(cfg: &Config, layer: &FunctionLayer, width: u16, btn: usize) ->
+     SliderLayout::new(cfg, layer.geometry(cfg, avail)[btn], avail)
+ }
+ 
++/// The now-playing panel over `layer`: right of Esc to the end
++fn media_layout(cfg: &Config, layer: &FunctionLayer, width: u16) -> media::Layout {
++    let avail = width as f64 - pixel_shift_width(cfg);
++    let left = if width >= 2170 {
++        let (l, w) = layer.geometry(cfg, avail)[0];
++        l + w + cfg.group_spacing
++    } else {
++        0.0
++    };
++    media::Layout::new(cfg, left, avail)
++}
++
++/// A key of the now-playing panel: to the helper (MPRIS), else as a media key
++fn media_key<F: AsRawFd>(key: media::Key, uinput: &mut UInputHandle<F>) {
++    let (cmd, fallback) = match key {
++        media::Key::Previous => ("media previous", Key::PreviousSong),
++        media::Key::PlayPause => ("media playpause", Key::PlayPause),
++        media::Key::Next => ("media next", Key::NextSong),
++    };
++    if slider::bridge_send(cmd).is_err() {
++        toggle_keys(uinput, &vec![fallback], 1);
++        toggle_keys(uinput, &vec![fallback], 0);
++    }
++}
++
+ /// Low and high icon of the slider opened by `button`
+ fn slider_icons(button: &Button) -> (Option<&Button>, &Button) {
+     match &button.slider_icons {
+@@ -1357,6 +1469,11 @@ fn real_main(drm: &mut DrmBackend) {
+     let mut active_layer = row(base_is_media, fn_held, expanded, collapsed_row);
+     let mut slider: Option<Slider> = None;
+     let mut slider_dirty = false;
++    // the now-playing panel, and whether its capsule needs drawing
++    let mut media: Option<media::Panel> = None;
++    let mut media_dirty = false;
++    // the panel's keys changed (pressed, play/pause): all of it
++    let mut media_full = false;
+     // animations: the row under a slider as it opened (fades out behind it),
+     // the strip changing rows, and whether the next row change is the strip's
+     let mut slider_backdrop: Option<ImageSurface> = None;
+@@ -1435,6 +1552,7 @@ fn real_main(drm: &mut DrmBackend) {
+             collapsed_row = ROW_STRIP_COLLAPSED;
+             current_app = None;
+             check_layer = true;
++            media = None;
+             session = state_watch.read();
+             for layer in layers.iter_mut() {
+                 for (_, b) in &mut layer.buttons {
+@@ -1476,9 +1594,19 @@ fn real_main(drm: &mut DrmBackend) {
+         if state_watch.changed() {
+             session = state_watch.read();
+             for layer in layers.iter_mut() {
++                let before: Vec<bool> = layer.buttons.iter().map(|(_, b)| b.hidden).collect();
+                 for (_, b) in &mut layer.buttons {
+                     b.follow(&session);
+                 }
++                // a key appeared or went: the others move
++                if layer.buttons.iter().map(|(_, b)| b.hidden).ne(before) {
++                    needs_complete_redraw = true;
++                }
++            }
++            media_dirty = true;
++            if media.is_some() && session.playing.is_none() {
++                media = None;
++                needs_complete_redraw = true;
+             }
+         }
+         let wanted_row = row(base_is_media, fn_held, expanded, collapsed_row);
+@@ -1512,6 +1640,7 @@ fn real_main(drm: &mut DrmBackend) {
+             }
+             slider_backdrop = None;
+             pending = None;
++            media = None;
+         }
+         strip_animate = false;
+         // a tapped slider closes after SliderTimeout without a touch
+@@ -1596,7 +1725,11 @@ fn real_main(drm: &mut DrmBackend) {
+         let layer_changed = layers[active_layer].buttons.iter().any(|b| b.1.changed);
+         if transition.is_some() {
+             // the transition frame is on the bar; keys under it wait for its end
+-        } else if needs_complete_redraw || layer_changed || (slider.is_some() && (slider_dirty || slider_moving)) {
++        } else if needs_complete_redraw
++            || layer_changed
++            || (slider.is_some() && (slider_dirty || slider_moving))
++            || (media.is_some() && (media_dirty || media_full))
++        {
+             let shift = if cfg.enable_pixel_shift {
+                 pixel_shift.get()
+             } else {
+@@ -1644,13 +1777,46 @@ fn real_main(drm: &mut DrmBackend) {
+                     clips = vec![ClipRect::new(0, 0, height, width)];
+                 }
+             }
++            if let Some(m) = &media {
++                let layout = media_layout(&cfg, &layers[active_layer], width);
++                let sx = shift.0 + pixel_shift_width(&cfg) / 2.0;
++                let full = needs_complete_redraw || layer_changed;
++                let c = Context::new(&surface).unwrap();
++                c.translate(height as f64, 0.0);
++                c.rotate((90.0f64).to_radians());
++                if full {
++                    // dark right of Esc
++                    c.set_source_rgb(0.0, 0.0, 0.0);
++                    c.rectangle(layout.left + sx - cfg.group_spacing / 2.0, 0.0, width as f64, height as f64);
++                    c.fill().unwrap();
++                }
++                c.set_font_face(&cfg.font_face);
++                m.draw(&c, &cfg, &layout, session.playing.as_ref(), height as f64, (sx, shift.1), full || media_full);
++                drop(c);
++                if full || media_full {
++                    clips = vec![ClipRect::new(0, 0, height, width)];
++                } else {
++                    let (cl, cw) = layout.capsule;
++                    let x1 = (cl + sx - 2.0).max(0.0) as u16;
++                    let x2 = ((cl + cw + sx + 2.0) as u16).min(width);
++                    clips.push(ClipRect::new(0, x1, height, x2));
++                }
++            }
+             slider_dirty = false;
++            media_dirty = false;
++            media_full = false;
+             let data = surface.data().unwrap();
+             drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
+             drm.dirty(&clips).unwrap();
+             needs_complete_redraw = false;
+         }
+ 
++        // the panel's time runs while it plays: once a second
++        if media.is_some() && session.playing.as_ref().is_some_and(|n| n.playing) {
++            let ms = (1000 - SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_millis())) as i32;
++            next_timeout_ms = min(next_timeout_ms, ms.max(1));
++            media_dirty = true;
++        }
+         // animating: come back for the next frame
+         if fading || transition.is_some() || slider.as_ref().is_some_and(|s| s.animating()) {
+             next_timeout_ms = min(next_timeout_ms, anim::FRAME.as_millis() as i32);
+@@ -1727,9 +1893,33 @@ fn real_main(drm: &mut DrmBackend) {
+                                     }
+                                 }
+                             }
++                            if let Some(m) = &mut media {
++                                let layout = media_layout(&cfg, &layers[active_layer], width);
++                                match layout.hit(x - half_shift) {
++                                    media::Hit::Close => {
++                                        media = None;
++                                        needs_complete_redraw = true;
++                                        continue;
++                                    }
++                                    media::Hit::Key(k) => {
++                                        m.pressed = Some((dn.seat_slot(), k));
++                                        media_full = true;
++                                        continue;
++                                    }
++                                    media::Hit::Scrub => {
++                                        if session.playing.as_ref().is_some_and(|n| n.can_seek && n.length_us > 0) {
++                                            m.scrub = Some((dn.seat_slot(), layout.fraction_at(x - half_shift)));
++                                            media_dirty = true;
++                                        }
++                                        continue;
++                                    }
++                                    media::Hit::Outside => {} // Esc
++                                }
++                            }
+                             let hit = layers[active_layer]
+                                 .hit(&cfg, width, height, x, y, None)
+-                                .filter(|_| slider.is_none());
++                                // under the slider nothing, under the panel only Esc
++                                .filter(|&b| slider.is_none() && (media.is_none() || b == 0));
+                             if let Some(btn) = hit {
+                                 touches.insert(dn.seat_slot(), (active_layer, btn));
+                                 let button = &mut layers[active_layer].buttons[btn].1;
+@@ -1761,6 +1951,16 @@ fn real_main(drm: &mut DrmBackend) {
+                                     continue;
+                                 }
+                             }
++                            if let Some(m) = &mut media {
++                                if let Some((slot, _)) = m.scrub {
++                                    if slot == mtn.seat_slot() {
++                                        let layout = media_layout(&cfg, &layers[active_layer], width);
++                                        m.scrub = Some((slot, layout.fraction_at(x - half_shift)));
++                                        media_dirty = true;
++                                        continue;
++                                    }
++                                }
++                            }
+                             // a held slider button slid sideways: slide its value
+                             if let Some((slot, x0, kind, deferred)) = pending {
+                                 if slot == mtn.seat_slot() && (x - x0).abs() > slider::DRAG_THRESHOLD_PX {
+@@ -1815,6 +2015,24 @@ fn real_main(drm: &mut DrmBackend) {
+                                     continue;
+                                 }
+                             }
++                            if let Some(m) = &mut media {
++                                if let Some((slot, k)) = m.pressed {
++                                    if slot == up.seat_slot() {
++                                        m.pressed = None;
++                                        media_key(k, &mut uinput);
++                                        media_full = true;
++                                        continue;
++                                    }
++                                }
++                                if let Some((slot, f)) = m.scrub {
++                                    if slot == up.seat_slot() {
++                                        m.scrub = None;
++                                        let _ = slider::bridge_send(&format!("seek {f:.4}"));
++                                        media_dirty = true;
++                                        continue;
++                                    }
++                                }
++                            }
+                             let deferred = pending.is_some_and(|p| p.0 == up.seat_slot() && p.3);
+                             if pending.is_some_and(|p| p.0 == up.seat_slot()) {
+                                 pending = None;
+@@ -1845,6 +2063,11 @@ fn real_main(drm: &mut DrmBackend) {
+                                     expanded = false;
+                                     strip_animate = true;
+                                 }
++                                Some(Command::NowPlaying) => {
++                                    media = Some(media::Panel::new());
++                                    slider = None;
++                                    needs_complete_redraw = true;
++                                }
+                                 Some(Command::VolumeSlider | Command::BrightnessSlider | Command::KeyboardSlider) => {
+                                     // a tap: open it for SliderTimeout
+                                     let kind = slider_kind(command).unwrap();
+diff --git a/src/media.rs b/src/media.rs
+new file mode 100644
+index 0000000..3a66a9e
+--- /dev/null
++++ b/src/media.rs
+@@ -0,0 +1,246 @@
++// "Now playing" (macOS style): a button (Command = "NowPlaying") shown while
++// the helper follows a media player with a track; tapped it opens a panel
++// over the row right of Esc: a round close button, previous / play-pause /
++// next, and a capsule with title, artist, time and a scrubber. Dragging the
++// scrubber seeks on release. Commands go to the helper (mbp-touchbar-bridge:
++// MPRIS of that player); without it the three keys are media keys.
++use crate::{config::Config, state::NowPlaying};
++use cairo::Context;
++use std::f64::consts::TAU;
++
++const CLOSE_DIAMETER: f64 = 44.0;
++const CLOSE_COLOR: f64 = 0.70;
++const CLOSE_BOX: f64 = 72.0;
++const KEY_WIDTH: f64 = 120.0;
++const TITLE_SIZE: f64 = 22.0;
++const TIME_SIZE: f64 = 18.0;
++const TRACK_HEIGHT: f64 = 5.0;
++const KNOB_RADIUS: f64 = 8.0;
++const PAD: f64 = 18.0;
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Key {
++    Previous,
++    PlayPause,
++    Next,
++}
++
++pub enum Hit {
++    Close,
++    Key(Key),
++    Scrub,
++    Outside,
++}
++
++/// Parts in bar coordinates without pixel shift
++pub struct Layout {
++    pub left: f64,
++    pub close: (f64, f64),
++    pub keys: [(f64, f64); 3],
++    pub capsule: (f64, f64),
++    pub track: (f64, f64),
++}
++
++impl Layout {
++    /// `left`: first px after Esc and its gap, `right`: end of the row
++    pub fn new(cfg: &Config, left: f64, right: f64) -> Layout {
++        let close = (left, CLOSE_BOX);
++        let mut x = close.0 + close.1 + cfg.group_spacing;
++        let mut keys = [(0.0, 0.0); 3];
++        for k in &mut keys {
++            *k = (x, KEY_WIDTH);
++            x += KEY_WIDTH + cfg.button_spacing;
++        }
++        let capsule = (x - cfg.button_spacing + cfg.group_spacing, 0.0);
++        let capsule = (capsule.0, (right - capsule.0).max(KEY_WIDTH));
++        let track = (capsule.0 + PAD + KNOB_RADIUS, capsule.0 + capsule.1 - PAD - KNOB_RADIUS);
++        Layout { left, close, keys, capsule, track }
++    }
++    pub fn hit(&self, x: f64) -> Hit {
++        let within = |(l, w): (f64, f64)| x >= l - 4.0 && x < l + w + 4.0;
++        if x < self.left - 4.0 {
++            Hit::Outside
++        } else if within(self.close) {
++            Hit::Close
++        } else if within(self.keys[0]) {
++            Hit::Key(Key::Previous)
++        } else if within(self.keys[1]) {
++            Hit::Key(Key::PlayPause)
++        } else if within(self.keys[2]) {
++            Hit::Key(Key::Next)
++        } else if within(self.capsule) {
++            Hit::Scrub
++        } else {
++            Hit::Outside
++        }
++    }
++    pub fn fraction_at(&self, x: f64) -> f64 {
++        ((x - self.track.0) / (self.track.1 - self.track.0)).clamp(0.0, 1.0)
++    }
++}
++
++pub struct Panel {
++    // a key held (shown pressed)
++    pub pressed: Option<(u32, Key)>,
++    // the scrubber held: touch slot and where (0..1)
++    pub scrub: Option<(u32, f64)>,
++}
++
++fn rounded_rect(c: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
++    let r = r.min(h / 2.0).min(w / 2.0);
++    c.new_sub_path();
++    c.arc(x + w - r, y + r, r, (-90.0f64).to_radians(), 0.0);
++    c.arc(x + w - r, y + h - r, r, 0.0, (90.0f64).to_radians());
++    c.arc(x + r, y + h - r, r, (90.0f64).to_radians(), (180.0f64).to_radians());
++    c.arc(x + r, y + r, r, (180.0f64).to_radians(), (270.0f64).to_radians());
++    c.close_path();
++}
++
++fn triangle(c: &Context, x: f64, cy: f64, w: f64, h: f64, right: bool) {
++    if right {
++        c.move_to(x, cy - h / 2.0);
++        c.line_to(x + w, cy);
++        c.line_to(x, cy + h / 2.0);
++    } else {
++        c.move_to(x + w, cy - h / 2.0);
++        c.line_to(x, cy);
++        c.line_to(x + w, cy + h / 2.0);
++    }
++    c.close_path();
++}
++
++fn time(us: i64) -> String {
++    let s = (us / 1_000_000).max(0);
++    format!("{}:{:02}", s / 60, s % 60)
++}
++
++/// `text` cut to fit `width` at the current font size, with an ellipsis
++fn fit(c: &Context, text: &str, width: f64) -> String {
++    if c.text_extents(text).map_or(0.0, |e| e.x_advance()) <= width {
++        return text.to_string();
++    }
++    let mut chars: Vec<char> = text.chars().collect();
++    while !chars.is_empty() {
++        chars.pop();
++        let t: String = chars.iter().collect::<String>().trim_end().to_string() + "…";
++        if c.text_extents(&t).map_or(0.0, |e| e.x_advance()) <= width {
++            return t;
++        }
++    }
++    String::new()
++}
++
++impl Panel {
++    pub fn new() -> Panel {
++        Panel { pressed: None, scrub: None }
++    }
++
++    /// `full`: also the close button and the keys (else only the capsule,
++    /// for the running time). The bar around it must be cleared by the caller.
++    pub fn draw(&self, c: &Context, cfg: &Config, layout: &Layout, np: Option<&NowPlaying>, height: f64, (sx, sy): (f64, f64), full: bool) {
++        let bh = if cfg.button_height > 0.0 { cfg.button_height.min(height) } else { height * 0.7 };
++        let top = (height - bh) / 2.0;
++        let cy = height / 2.0 + sy;
++        if full {
++            let cx = layout.close.0 + layout.close.1 / 2.0 + sx;
++            c.set_source_rgb(CLOSE_COLOR, CLOSE_COLOR, CLOSE_COLOR);
++            c.arc(cx, height / 2.0, CLOSE_DIAMETER / 2.0, 0.0, TAU);
++            c.fill().unwrap();
++            let arm = 7.5;
++            c.set_source_rgb(0.0, 0.0, 0.0);
++            c.set_line_width(3.5);
++            c.set_line_cap(cairo::LineCap::Round);
++            c.move_to(cx - arm, height / 2.0 - arm);
++            c.line_to(cx + arm, height / 2.0 + arm);
++            c.move_to(cx + arm, height / 2.0 - arm);
++            c.line_to(cx - arm, height / 2.0 + arm);
++            c.stroke().unwrap();
++            let playing = np.is_some_and(|n| n.playing);
++            for (i, key) in [Key::Previous, Key::PlayPause, Key::Next].into_iter().enumerate() {
++                let (l, w) = layout.keys[i];
++                let pressed = self.pressed.is_some_and(|(_, k)| k == key);
++                let (r, g, b) = if pressed { cfg.button_active_color } else { cfg.button_color };
++                c.set_source_rgb(r, g, b);
++                rounded_rect(c, l + sx, top, w, bh, cfg.button_radius);
++                c.fill().unwrap();
++                c.set_source_rgb(1.0, 1.0, 1.0);
++                let mx = l + w / 2.0 + sx;
++                match key {
++                    Key::Previous => {
++                        triangle(c, mx - 18.0, cy, 18.0, 20.0, false);
++                        triangle(c, mx, cy, 18.0, 20.0, false);
++                        c.fill().unwrap();
++                    }
++                    Key::Next => {
++                        triangle(c, mx - 18.0, cy, 18.0, 20.0, true);
++                        triangle(c, mx, cy, 18.0, 20.0, true);
++                        c.fill().unwrap();
++                    }
++                    Key::PlayPause if playing => {
++                        c.rectangle(mx - 10.0, cy - 11.0, 7.0, 22.0);
++                        c.rectangle(mx + 3.0, cy - 11.0, 7.0, 22.0);
++                        c.fill().unwrap();
++                    }
++                    Key::PlayPause => {
++                        triangle(c, mx - 8.0, cy, 20.0, 24.0, true);
++                        c.fill().unwrap();
++                    }
++                }
++            }
++        }
++        // capsule: title — artist, time, scrubber
++        let (cl, cw) = layout.capsule;
++        c.set_source_rgb(0.0, 0.0, 0.0);
++        c.rectangle(cl + sx - 1.0, 0.0, cw + 2.0, height);
++        c.fill().unwrap();
++        let (r, g, b) = cfg.button_color;
++        c.set_source_rgb(r, g, b);
++        rounded_rect(c, cl + sx, top, cw, bh, cfg.button_radius);
++        c.fill().unwrap();
++        let Some(np) = np else {
++            c.set_font_size(TITLE_SIZE);
++            c.set_source_rgb(0.6, 0.6, 0.6);
++            c.move_to(cl + PAD + sx, cy + 7.0);
++            let _ = c.show_text("—");
++            return;
++        };
++        let pos = self.scrub.map_or(np.position_now(), |(_, f)| (f * np.length_us as f64) as i64);
++        let times = if np.length_us > 0 {
++            format!("{} / {}", time(pos), time(np.length_us))
++        } else {
++            time(pos)
++        };
++        c.set_font_size(TIME_SIZE);
++        let tw = c.text_extents(&times).map_or(0.0, |e| e.x_advance());
++        c.set_source_rgb(0.7, 0.7, 0.7);
++        c.move_to(cl + cw - PAD - tw + sx, top + 23.0 + sy);
++        let _ = c.show_text(&times);
++        c.set_font_size(TITLE_SIZE);
++        let room = cw - 2.0 * PAD - tw - 16.0;
++        let title = fit(c, &np.title, room);
++        c.set_source_rgb(1.0, 1.0, 1.0);
++        c.move_to(cl + PAD + sx, top + 24.0 + sy);
++        let _ = c.show_text(&title);
++        let used = c.text_extents(&title).map_or(0.0, |e| e.x_advance());
++        if !np.artist.is_empty() && used < room - 40.0 {
++            let artist = fit(c, &format!("  —  {}", np.artist), room - used);
++            c.set_source_rgb(0.62, 0.62, 0.62);
++            let _ = c.show_text(&artist);
++        }
++        // scrubber
++        let ty = top + bh - 16.0;
++        let frac = if np.length_us > 0 { pos as f64 / np.length_us as f64 } else { 0.0 };
++        let (t0, t1) = layout.track;
++        c.set_source_rgb(0.40, 0.40, 0.42);
++        rounded_rect(c, t0 + sx, ty - TRACK_HEIGHT / 2.0, t1 - t0, TRACK_HEIGHT, TRACK_HEIGHT / 2.0);
++        c.fill().unwrap();
++        c.set_source_rgb(1.0, 1.0, 1.0);
++        let kx = t0 + frac * (t1 - t0);
++        rounded_rect(c, t0 + sx, ty - TRACK_HEIGHT / 2.0, (kx - t0).max(TRACK_HEIGHT), TRACK_HEIGHT, TRACK_HEIGHT / 2.0);
++        c.fill().unwrap();
++        if np.can_seek && np.length_us > 0 {
++            c.arc(kx + sx, ty, KNOB_RADIUS, 0.0, TAU);
++            c.fill().unwrap();
++        }
++    }
++}
+diff --git a/src/slider.rs b/src/slider.rs
+index 08f7305..9bf6bd8 100644
+--- a/src/slider.rs
++++ b/src/slider.rs
+@@ -145,6 +145,17 @@ fn rounded_rect(c: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
+     c.close_path();
+ }
+ 
++/// One command line to the helper; Err(()) if it is not running
++pub fn bridge_send(line: &str) -> Result<(), ()> {
++    // non-blocking: no reader (helper not running) is ENXIO
++    let mut fifo = OpenOptions::new()
++        .write(true)
++        .custom_flags(libc::O_NONBLOCK)
++        .open(BRIDGE_CMD)
++        .map_err(|_| ())?;
++    fifo.write_all(format!("{line}\n").as_bytes()).map_err(|_| ())
++}
++
+ /// Read the current value: volume from the helper's state file, brightness
+ /// from the display backlight. None if unknown.
+ pub fn current_value(kind: Kind) -> Option<f64> {
+@@ -341,14 +352,7 @@ impl Slider {
+         if !force && self.last_send.is_some_and(|t| t.elapsed() < SEND_INTERVAL) {
+             return Ok(false);
+         }
+-        // non-blocking: no reader (helper not running) is ENXIO
+-        let mut fifo = OpenOptions::new()
+-            .write(true)
+-            .custom_flags(libc::O_NONBLOCK)
+-            .open(BRIDGE_CMD)
+-            .map_err(|_| ())?;
+-        fifo.write_all(format!("{} {:.4}\n", self.kind.name(), self.value).as_bytes())
+-            .map_err(|_| ())?;
++        bridge_send(&format!("{} {:.4}", self.kind.name(), self.value))?;
+         self.sent_value = Some(self.value);
+         self.last_send = Some(Instant::now());
+         Ok(true)
+diff --git a/src/state.rs b/src/state.rs
+index 31fc5d3..f1a409b 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -2,7 +2,11 @@
+ // for icons that follow it (Live = "Volume" / "Mic"): files in
+ // /run/tiny-dfr/bridge, watched with inotify. Missing files: unknown.
+ use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+-use std::{fs::read_to_string, os::fd::AsFd};
++use std::{
++    fs::read_to_string,
++    os::fd::AsFd,
++    time::{SystemTime, UNIX_EPOCH},
++};
+ 
+ const DIR: &str = "/run/tiny-dfr/bridge";
+ 
+@@ -12,6 +16,57 @@ pub struct State {
+     pub volume: Option<(f64, bool)>,
+     /// default source muted
+     pub mic_muted: Option<bool>,
++    /// the media player the helper follows (MPRIS), if it has a track
++    pub playing: Option<NowPlaying>,
++}
++
++/// .../nowplaying: "key value" lines
++#[derive(Default, Clone, PartialEq, Debug)]
++pub struct NowPlaying {
++    pub playing: bool,
++    pub title: String,
++    pub artist: String,
++    pub length_us: i64,
++    pub position_us: i64,
++    // wall clock (ms since the epoch) when position_us was read
++    pub at_ms: i64,
++    pub rate: f64,
++    pub can_seek: bool,
++}
++
++impl NowPlaying {
++    fn parse(text: &str) -> Option<NowPlaying> {
++        let mut np = NowPlaying { rate: 1.0, ..Default::default() };
++        let mut status = "";
++        for line in text.lines() {
++            let (key, value) = line.split_once(' ').unwrap_or((line, ""));
++            match key {
++                "status" => status = if value == "Playing" { "Playing" } else if value == "Paused" { "Paused" } else { "" },
++                "title" => np.title = value.to_string(),
++                "artist" => np.artist = value.to_string(),
++                "length_us" => np.length_us = value.parse().unwrap_or(0),
++                "position_us" => np.position_us = value.parse().unwrap_or(0),
++                "at_ms" => np.at_ms = value.parse().unwrap_or(0),
++                "rate" => np.rate = value.parse().unwrap_or(1.0),
++                "can_seek" => np.can_seek = value == "1",
++                _ => {}
++            }
++        }
++        np.playing = status == "Playing";
++        (!status.is_empty()).then_some(np)
++    }
++    /// Where it is now, in µs: while playing it runs on from the last report
++    pub fn position_now(&self) -> i64 {
++        let mut pos = self.position_us;
++        if self.playing {
++            let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
++            pos += ((now_ms - self.at_ms).max(0) as f64 * 1000.0 * self.rate) as i64;
++        }
++        if self.length_us > 0 {
++            pos = pos.min(self.length_us);
++        }
++        pos.max(0)
++    }
+ }
+ 
+ pub struct StateWatch {
+@@ -39,7 +94,10 @@ impl StateWatch {
+         let mic_muted = read_to_string(format!("{DIR}/mic"))
+             .ok()
+             .map(|s| s.trim() == "1");
+-        State { volume, mic_muted }
++        let playing = read_to_string(format!("{DIR}/nowplaying"))
++            .ok()
++            .and_then(|s| NowPlaying::parse(&s));
++        State { volume, mic_muted, playing }
+     }
+     pub fn fd(&self) -> &impl AsFd {
+         &self.inotify_fd
+-- 
+2.53.0
+

@@ -1,0 +1,742 @@
+From aec08dcb724752a30436680f3b5654715e6e2da0 Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 20:31:28 +0100
+Subject: [PATCH] Volume and brightness sliders
+
+Buttons with Command = "VolumeSlider" / "BrightnessSlider" open a slider
+over the row, right of Esc: a close button, the button's icon and a track,
+as on macOS. A tap opens it for SliderTimeout ms (default 3000); on the
+track the knob jumps to the finger and follows it, and each touch starts
+the timeout again. Holding the button and sliding moves the value from
+where it was, and the buttons come back on release. Only Esc stays usable
+under the slider.
+
+tiny-dfr runs as nobody and cannot set the volume or the brightness the
+way the desktop does, so it hands the value to a helper in the session
+through the FIFO /run/tiny-dfr/bridge/cmd, at most every 30 ms while the
+finger moves and always on release; the volume to start from comes from
+/run/tiny-dfr/bridge/volume, the brightness from the display backlight.
+Without the helper the slider sends volume/brightness keys instead, one
+per 5 % of the track. The slider is drawn over the row after it and only
+its own area is sent to the panel while it moves.
+
+The PNG preview adds rows with the sliders open.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ share/tiny-dfr/config.toml |   7 +
+ src/config.rs              |   8 ++
+ src/main.rs                | 256 +++++++++++++++++++++++++++++++++----
+ src/slider.rs              | 254 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 503 insertions(+), 22 deletions(-)
+ create mode 100644 src/slider.rs
+
+diff --git a/share/tiny-dfr/config.toml b/share/tiny-dfr/config.toml
+index fb5a6e7..e0bb262 100644
+--- a/share/tiny-dfr/config.toml
++++ b/share/tiny-dfr/config.toml
+@@ -50,6 +50,13 @@ FontTemplate = ":bold"
+ #     { Icon = "volume_off", Action = "Mute", Width = 120 }
+ # ]
+ # AppLayerKeys = []
++# Command = "VolumeSlider" / "BrightnessSlider": a tap opens a slider over the
++# row (right of Esc) for SliderTimeout ms, holding the button and sliding moves
++# the value until release. The value goes to a helper through the FIFO
++# /run/tiny-dfr/bridge/cmd ("volume 0.42", "brightness 0.70"; the volume to
++# start from is read from /run/tiny-dfr/bridge/volume); without a helper the
++# slider sends VolumeUp/Down or BrightnessUp/Down, one per 5 % of the track.
++# SliderTimeout = 3000
+ 
+ # Set this to false if you want the brightness of the touchbar
+ # to be set to a static value instead of following the primary
+diff --git a/src/config.rs b/src/config.rs
+index 95055f5..cacbf33 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -32,6 +32,7 @@ pub struct Config {
+     pub group_spacing: f64,
+     pub font_size: f64,
+     pub control_strip_expanded: bool,
++    pub slider_timeout: std::time::Duration,
+ }
+ 
+ /// What a button does inside tiny-dfr instead of (or besides) sending keys
+@@ -41,6 +42,10 @@ pub enum Command {
+     Expand,
+     /// back to the app keys and the collapsed Control Strip
+     Collapse,
++    /// open the volume slider (tap) or slide it while held
++    VolumeSlider,
++    /// the same for the screen brightness
++    BrightnessSlider,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -67,6 +72,7 @@ struct ConfigProxy {
+     control_strip_keys: Option<Vec<ButtonConfig>>,
+     app_layer_keys: Option<Vec<ButtonConfig>>,
+     control_strip_default: Option<String>,
++    slider_timeout: Option<u64>,
+ }
+ 
+ fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<Key>, D::Error>
+@@ -180,6 +186,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 3]) {
+         base.control_strip_keys = user.control_strip_keys.or(base.control_strip_keys);
+         base.app_layer_keys = user.app_layer_keys.or(base.app_layer_keys);
+         base.control_strip_default = user.control_strip_default.or(base.control_strip_default);
++        base.slider_timeout = user.slider_timeout.or(base.slider_timeout);
+     };
+     let media_layer_keys = base.media_layer_keys.unwrap();
+     let primary_layer_keys = base.primary_layer_keys.unwrap();
+@@ -244,6 +251,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 3]) {
+         group_spacing: base.group_spacing.or(base.button_spacing).unwrap_or(16) as f64,
+         font_size: base.font_size.unwrap_or(32) as f64,
+         control_strip_expanded,
++        slider_timeout: std::time::Duration::from_millis(base.slider_timeout.unwrap_or(3000)),
+     };
+     (cfg, layers)
+ }
+diff --git a/src/main.rs b/src/main.rs
+index b446e06..78d85e6 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -49,6 +49,7 @@ mod display;
+ mod fonts;
+ mod layer_switch;
+ mod pixel_shift;
++mod slider;
+ 
+ use crate::config::ConfigManager;
+ use backlight::BacklightManager;
+@@ -56,6 +57,7 @@ use config::{ButtonConfig, Command, Config};
+ use display::DrmBackend;
+ use layer_switch::LayerSwitch;
+ use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
++use slider::{Hit as SliderHit, Kind as SliderKind, Layout as SliderLayout, Mode as SliderMode, Slider};
+ 
+ pub const DEFAULT_ICON_SIZE: i32 = 48;
+ // rows from config::load_config
+@@ -861,17 +863,30 @@ where
+ /// TINY_DFR_RENDER_PNG=<file>: draw the configured layers into a PNG instead
+ /// of the Touch Bar (no DRM, input or uinput), for checking a layout. Rows:
+ /// collapsed strip, expanded strip, the same with its second button pressed,
+-/// F-keys (without ControlStripKeys the first two are the same media row).
++/// F-keys (without ControlStripKeys the first two are the same media row),
++/// then the volume and brightness sliders (at 40 % and 70 %) if a button of
++/// the collapsed strip opens them.
+ fn render_preview(path: &std::ffi::OsStr) {
+     let (width, height) = (2170u16, 60u16);
+     let (cfg, mut layers) = ConfigManager::new().load_config(width);
+     let gap = 12;
+-    let rows = [
+-        (ROW_STRIP_COLLAPSED, None),
+-        (ROW_STRIP_EXPANDED, None),
+-        (ROW_STRIP_EXPANDED, Some(1)),
+-        (ROW_FKEYS, None),
++    let mut rows = vec![
++        (ROW_STRIP_COLLAPSED, None, None),
++        (ROW_STRIP_EXPANDED, None, None),
++        (ROW_STRIP_EXPANDED, Some(1), None),
++        (ROW_FKEYS, None, None),
+     ];
++    for (kind, value) in [(SliderKind::Volume, 0.4), (SliderKind::Brightness, 0.7)] {
++        let source = layers[ROW_STRIP_COLLAPSED]
++            .buttons
++            .iter()
++            .position(|(_, b)| slider_kind(b.command) == Some(kind));
++        if let Some(btn) = source {
++            let mut s = Slider::new(kind, SliderMode::Tap { deadline: Instant::now() }, (ROW_STRIP_COLLAPSED, btn));
++            s.value = value;
++            rows.push((ROW_STRIP_COLLAPSED, None, Some(s)));
++        }
++    }
+     let bar = ImageSurface::create(Format::ARgb32, height as i32, width as i32).unwrap();
+     let out = ImageSurface::create(
+         Format::ARgb32,
+@@ -882,11 +897,19 @@ fn render_preview(path: &std::ffi::OsStr) {
+     let c = Context::new(&out).unwrap();
+     c.set_source_rgb(0.5, 0.5, 0.5);
+     c.paint().unwrap();
+-    for (row, (layer, pressed)) in rows.into_iter().enumerate() {
++    for (row, (layer, pressed, slider)) in rows.into_iter().enumerate() {
+         for (i, (_, b)) in layers[layer].buttons.iter_mut().enumerate() {
+             b.active = Some(i) == pressed;
+         }
+         layers[layer].draw(&cfg, width as i32, height as i32, &bar, (0.0, 0.0), true);
++        if let Some(s) = slider {
++            let layout = slider_layout(&cfg, &layers[layer], width);
++            let bc = Context::new(&bar).unwrap();
++            bc.translate(height as f64, 0.0);
++            bc.rotate((90.0f64).to_radians());
++            let icon = &layers[s.source.0].buttons[s.source.1].1;
++            s.draw(&bc, &cfg, &layout, height as f64, (pixel_shift_width(&cfg) / 2.0, 0.0), icon);
++        }
+         bar.flush();
+         c.save().unwrap();
+         // the bar surface is portrait: (u, v) -> (v, height - u)
+@@ -936,6 +959,51 @@ fn main() {
+     sigset.wait().unwrap();
+ }
+ 
++fn pixel_shift_width(cfg: &Config) -> f64 {
++    if cfg.enable_pixel_shift {
++        PIXEL_SHIFT_WIDTH_PX as f64
++    } else {
++        0.0
++    }
++}
++
++/// The slider over `layer`: right of Esc (and its group gap) to the end
++fn slider_layout(cfg: &Config, layer: &FunctionLayer, width: u16) -> SliderLayout {
++    let avail = width as f64 - pixel_shift_width(cfg);
++    let left = if width >= 2170 {
++        let (l, w) = layer.geometry(cfg, avail)[0];
++        l + w + cfg.group_spacing
++    } else {
++        0.0
++    };
++    SliderLayout::new(cfg, left, avail)
++}
++
++fn slider_kind(command: Option<Command>) -> Option<SliderKind> {
++    match command {
++        Some(Command::VolumeSlider) => Some(SliderKind::Volume),
++        Some(Command::BrightnessSlider) => Some(SliderKind::Brightness),
++        _ => None,
++    }
++}
++
++/// Pass the slider's value on: to the helper, or as keys without it
++fn apply_slider<F: AsRawFd>(s: &mut Slider, uinput: &mut UInputHandle<F>, force: bool) {
++    if s.send(force).is_err() {
++        let steps = s.fallback_steps();
++        let key = match (s.kind, steps > 0) {
++            (SliderKind::Volume, true) => Key::VolumeUp,
++            (SliderKind::Volume, false) => Key::VolumeDown,
++            (SliderKind::Brightness, true) => Key::BrightnessUp,
++            (SliderKind::Brightness, false) => Key::BrightnessDown,
++        };
++        for _ in 0..steps.abs() {
++            toggle_keys(uinput, &vec![key], 1);
++            toggle_keys(uinput, &vec![key], 0);
++        }
++    }
++}
++
+ fn real_main(drm: &mut DrmBackend) {
+     let (height, width) = drm.mode().size();
+     let (db_width, db_height) = drm.fb_info().unwrap().size();
+@@ -973,6 +1041,10 @@ fn real_main(drm: &mut DrmBackend) {
+         }
+     };
+     let mut active_layer = row(base_is_media, fn_held, expanded);
++    let mut slider: Option<Slider> = None;
++    let mut slider_dirty = false;
++    // a slider button held but not slid yet: (touch slot, x at touch, kind)
++    let mut pending: Option<(u32, f64, SliderKind)> = None;
+     let mut needs_complete_redraw = true;
+ 
+     let mut input_tb = Libinput::new_with_udev(Interface);
+@@ -1038,6 +1110,8 @@ fn real_main(drm: &mut DrmBackend) {
+             base_is_media = cfg.media_layer_default;
+             expanded = cfg.control_strip_expanded;
+             check_layer = true;
++            slider = None;
++            pending = None;
+         }
+         if layer_switch.changed() || check_layer {
+             check_layer = false;
+@@ -1056,6 +1130,24 @@ fn real_main(drm: &mut DrmBackend) {
+         if wanted_row != active_layer {
+             active_layer = wanted_row;
+             needs_complete_redraw = true;
++            // a slider belongs to the row it was opened on
++            if let Some(mut s) = slider.take() {
++                apply_slider(&mut s, &mut uinput, true);
++            }
++            pending = None;
++        }
++        // a tapped slider closes after SliderTimeout without a touch
++        if let Some(s) = &mut slider {
++            if let SliderMode::Tap { deadline } = s.mode {
++                if s.slot.is_none() && Instant::now() >= deadline {
++                    apply_slider(s, &mut uinput, true);
++                    slider = None;
++                    needs_complete_redraw = true;
++                }
++            }
++        }
++        if let Some(s) = &mut slider {
++            apply_slider(s, &mut uinput, false);
+         }
+ 
+         let now = Local::now();
+@@ -1065,6 +1157,15 @@ fn real_main(drm: &mut DrmBackend) {
+             ((60 - now.second()) * 1000) as i32
+         };
+         let mut next_timeout_ms = min(ms_left, TIMEOUT_MS);
++        if let Some(s) = &slider {
++            if let (SliderMode::Tap { deadline }, None) = (s.mode, s.slot) {
++                let left = deadline.saturating_duration_since(Instant::now());
++                next_timeout_ms = min(next_timeout_ms, left.as_millis() as i32 + 1);
++            }
++            if let Some(due) = s.send_due_in() {
++                next_timeout_ms = min(next_timeout_ms, due.as_millis() as i32 + 1);
++            }
++        }
+ 
+         if cfg.enable_pixel_shift {
+             let (pixel_shift_needs_redraw, pixel_shift_next_timeout_ms) = pixel_shift.update();
+@@ -1091,20 +1192,44 @@ fn real_main(drm: &mut DrmBackend) {
+             }
+         }
+ 
+-        if needs_complete_redraw || layers[active_layer].buttons.iter().any(|b| b.1.changed) {
++        let layer_changed = layers[active_layer].buttons.iter().any(|b| b.1.changed);
++        if needs_complete_redraw || layer_changed || (slider.is_some() && slider_dirty) {
+             let shift = if cfg.enable_pixel_shift {
+                 pixel_shift.get()
+             } else {
+                 (0.0, 0.0)
+             };
+-            let clips = layers[active_layer].draw(
+-                &cfg,
+-                width as i32,
+-                height as i32,
+-                &surface,
+-                shift,
+-                needs_complete_redraw,
+-            );
++            let mut clips = if needs_complete_redraw || layer_changed {
++                layers[active_layer].draw(
++                    &cfg,
++                    width as i32,
++                    height as i32,
++                    &surface,
++                    shift,
++                    needs_complete_redraw,
++                )
++            } else {
++                Vec::new()
++            };
++            // the slider lies over the row: redraw it whenever the row was drawn
++            if let Some(s) = &slider {
++                let layout = slider_layout(&cfg, &layers[active_layer], width);
++                let sx = shift.0 + pixel_shift_width(&cfg) / 2.0;
++                let c = Context::new(&surface).unwrap();
++                c.translate(height as f64, 0.0);
++                c.rotate((90.0f64).to_radians());
++                c.set_font_face(&cfg.font_face);
++                c.set_font_size(cfg.font_size);
++                let icon = &layers[s.source.0].buttons[s.source.1].1;
++                s.draw(&c, &cfg, &layout, height as f64, (sx, shift.1), icon);
++                drop(c);
++                if !needs_complete_redraw {
++                    let x1 = (layout.left + sx - 2.0).max(0.0) as u16;
++                    let x2 = ((layout.right + sx + 2.0) as u16).min(width);
++                    clips.push(ClipRect::new(0, x1, height, x2));
++                }
++            }
++            slider_dirty = false;
+             let data = surface.data().unwrap();
+             drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
+             drm.dirty(&clips).unwrap();
+@@ -1148,24 +1273,82 @@ fn real_main(drm: &mut DrmBackend) {
+                     if Some(te.device()) != digitizer || backlight.current_bl() == 0 {
+                         continue;
+                     }
++                    let half_shift = pixel_shift_width(&cfg) / 2.0;
+                     match te {
+                         TouchEvent::Down(dn) => {
+                             let x = dn.x_transformed(width as u32);
+                             let y = dn.y_transformed(height as u32);
+-                            if let Some(btn) = layers[active_layer].hit(&cfg, width, height, x, y, None) {
++                            if let Some(s) = &mut slider {
++                                let layout = slider_layout(&cfg, &layers[active_layer], width);
++                                match layout.hit(x - half_shift) {
++                                    Some(SliderHit::Close) => {
++                                        apply_slider(s, &mut uinput, true);
++                                        slider = None;
++                                        needs_complete_redraw = true;
++                                        continue;
++                                    }
++                                    Some(SliderHit::Track) => {
++                                        // on the track the knob jumps to the finger
++                                        s.slot = Some(dn.seat_slot());
++                                        s.value = layout.value_at(x - half_shift);
++                                        if let SliderMode::Drag { .. } = s.mode {
++                                            s.mode = SliderMode::Tap { deadline: Instant::now() };
++                                        }
++                                        slider_dirty = true;
++                                        continue;
++                                    }
++                                    None => {} // Esc
++                                }
++                            }
++                            let hit = layers[active_layer]
++                                .hit(&cfg, width, height, x, y, None)
++                                // under an open slider only Esc is left
++                                .filter(|&btn| slider.is_none() || btn == 0);
++                            if let Some(btn) = hit {
+                                 touches.insert(dn.seat_slot(), (active_layer, btn));
+-                                layers[active_layer].buttons[btn]
+-                                    .1
+-                                    .set_active(&mut uinput, true);
++                                let button = &mut layers[active_layer].buttons[btn].1;
++                                if let Some(kind) = slider_kind(button.command) {
++                                    pending = Some((dn.seat_slot(), x, kind));
++                                }
++                                button.set_active(&mut uinput, true);
+                             }
+                         }
+                         TouchEvent::Motion(mtn) => {
++                            let x = mtn.x_transformed(width as u32);
++                            let y = mtn.y_transformed(height as u32);
++                            if let Some(s) = &mut slider {
++                                if s.slot == Some(mtn.seat_slot()) {
++                                    let layout = slider_layout(&cfg, &layers[active_layer], width);
++                                    s.value = match s.mode {
++                                        SliderMode::Drag { start_x, start_value } => (start_value
++                                            + (x - start_x) / layout.track_len())
++                                        .clamp(0.0, 1.0),
++                                        SliderMode::Tap { .. } => layout.value_at(x - half_shift),
++                                    };
++                                    slider_dirty = true;
++                                    continue;
++                                }
++                            }
++                            // a held slider button slid sideways: slide its value
++                            if let Some((slot, x0, kind)) = pending {
++                                if slot == mtn.seat_slot() && (x - x0).abs() > slider::DRAG_THRESHOLD_PX {
++                                    pending = None;
++                                    let (layer, btn) = touches.remove(&slot).unwrap();
++                                    layers[layer].buttons[btn].1.set_active(&mut uinput, false);
++                                    let mut s = Slider::new(kind, SliderMode::Tap { deadline: Instant::now() }, (layer, btn));
++                                    s.mode = SliderMode::Drag { start_x: x0, start_value: s.value };
++                                    s.slot = Some(slot);
++                                    let layout = slider_layout(&cfg, &layers[active_layer], width);
++                                    s.value = (s.value + (x - x0) / layout.track_len()).clamp(0.0, 1.0);
++                                    slider = Some(s);
++                                    needs_complete_redraw = true;
++                                    continue;
++                                }
++                            }
+                             if !touches.contains_key(&mtn.seat_slot()) {
+                                 continue;
+                             }
+ 
+-                            let x = mtn.x_transformed(width as u32);
+-                            let y = mtn.y_transformed(height as u32);
+                             let (layer, btn) = *touches.get(&mtn.seat_slot()).unwrap();
+                             let hit = layers[layer]
+                                 .hit(&cfg, width, height, x, y, Some(btn))
+@@ -1173,6 +1356,28 @@ fn real_main(drm: &mut DrmBackend) {
+                             layers[layer].buttons[btn].1.set_active(&mut uinput, hit);
+                         }
+                         TouchEvent::Up(up) => {
++                            if let Some(s) = &mut slider {
++                                if s.slot == Some(up.seat_slot()) {
++                                    s.slot = None;
++                                    apply_slider(s, &mut uinput, true);
++                                    match s.mode {
++                                        // held and slid: back to the buttons
++                                        SliderMode::Drag { .. } => {
++                                            slider = None;
++                                            needs_complete_redraw = true;
++                                        }
++                                        SliderMode::Tap { .. } => {
++                                            s.mode = SliderMode::Tap {
++                                                deadline: Instant::now() + cfg.slider_timeout,
++                                            };
++                                        }
++                                    }
++                                    continue;
++                                }
++                            }
++                            if pending.is_some_and(|(slot, _, _)| slot == up.seat_slot()) {
++                                pending = None;
++                            }
+                             if !touches.contains_key(&up.seat_slot()) {
+                                 continue;
+                             }
+@@ -1184,6 +1389,13 @@ fn real_main(drm: &mut DrmBackend) {
+                             match command {
+                                 Some(Command::Expand) => expanded = true,
+                                 Some(Command::Collapse) => expanded = false,
++                                Some(Command::VolumeSlider | Command::BrightnessSlider) => {
++                                    // a tap: open it for SliderTimeout
++                                    let kind = slider_kind(command).unwrap();
++                                    let deadline = Instant::now() + cfg.slider_timeout;
++                                    slider = Some(Slider::new(kind, SliderMode::Tap { deadline }, (layer, btn)));
++                                    needs_complete_redraw = true;
++                                }
+                                 None => {}
+                             }
+                         }
+diff --git a/src/slider.rs b/src/slider.rs
+new file mode 100644
+index 0000000..a95da29
+--- /dev/null
++++ b/src/slider.rs
+@@ -0,0 +1,254 @@
++// Volume and brightness sliders (macOS style). A tap on a slider button opens
++// the slider for SliderTimeout ms, where the value follows the finger on the
++// track; holding the button and sliding opens it until release, the value
++// moving with the finger from where it was. The slider covers the row right
++// of Esc: a close button, the button's icon, the track.
++//
++// The value goes to a helper in the desktop session (mbp-touchbar-bridge)
++// through the FIFO /run/tiny-dfr/bridge/cmd, which sets it the way the desktop
++// does (PulseAudio volume of the default sink, KDE screen brightness). Without
++// the helper tiny-dfr falls back to volume/brightness keys.
++use crate::{config::Config, Button};
++use cairo::Context;
++use std::{
++    fs::{self, OpenOptions},
++    io::Write,
++    os::unix::fs::OpenOptionsExt,
++    time::{Duration, Instant},
++};
++
++const BRIDGE_CMD: &str = "/run/tiny-dfr/bridge/cmd";
++const BRIDGE_VOLUME: &str = "/run/tiny-dfr/bridge/volume";
++// at most this often to the helper while the finger moves
++const SEND_INTERVAL: Duration = Duration::from_millis(30);
++// a hold turns into a slide after this many px sideways
++pub const DRAG_THRESHOLD_PX: f64 = 12.0;
++const CLOSE_WIDTH: f64 = 72.0;
++const ICON_WIDTH: f64 = 72.0;
++const TRACK_HEIGHT: f64 = 6.0;
++const KNOB_RADIUS: f64 = 13.0;
++// keys of the fallback: one per this much of the track
++const FALLBACK_STEP: f64 = 0.05;
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Kind {
++    Volume,
++    Brightness,
++}
++
++impl Kind {
++    fn name(self) -> &'static str {
++        match self {
++            Kind::Volume => "volume",
++            Kind::Brightness => "brightness",
++        }
++    }
++}
++
++#[derive(Clone, Copy, PartialEq, Debug)]
++pub enum Mode {
++    /// opened by a tap: closes at the deadline unless touched again
++    Tap { deadline: Instant },
++    /// opened by holding the button and sliding: closes on release
++    Drag { start_x: f64, start_value: f64 },
++}
++
++/// Where the parts are, in bar coordinates without pixel shift.
++pub struct Layout {
++    pub left: f64,
++    pub close: (f64, f64),
++    pub icon: (f64, f64),
++    pub track: (f64, f64),
++    pub right: f64,
++}
++
++pub enum Hit {
++    Close,
++    Track,
++}
++
++pub struct Slider {
++    pub kind: Kind,
++    pub value: f64,
++    pub mode: Mode,
++    // (row, button) that opened it: its icon is drawn on the slider
++    pub source: (usize, usize),
++    // the touch moving the knob
++    pub slot: Option<u32>,
++    sent_value: Option<f64>,
++    last_send: Option<Instant>,
++    // key fallback: the value the keys have reached so far
++    keys_value: f64,
++}
++
++impl Layout {
++    /// `left`: first px after Esc and its gap, `right`: end of the row
++    pub fn new(cfg: &Config, left: f64, right: f64) -> Layout {
++        let close = (left, CLOSE_WIDTH);
++        let icon = (close.0 + close.1 + cfg.button_spacing, ICON_WIDTH);
++        let track_left = icon.0 + icon.1 + cfg.button_spacing + KNOB_RADIUS;
++        let track_right = (right - KNOB_RADIUS - cfg.button_spacing).max(track_left + 1.0);
++        Layout {
++            left,
++            close,
++            icon,
++            track: (track_left, track_right),
++            right,
++        }
++    }
++    pub fn hit(&self, x: f64) -> Option<Hit> {
++        if x < self.left - 4.0 {
++            None
++        } else if x < self.close.0 + self.close.1 + 4.0 {
++            Some(Hit::Close)
++        } else {
++            Some(Hit::Track)
++        }
++    }
++    pub fn value_at(&self, x: f64) -> f64 {
++        ((x - self.track.0) / (self.track.1 - self.track.0)).clamp(0.0, 1.0)
++    }
++    pub fn track_len(&self) -> f64 {
++        self.track.1 - self.track.0
++    }
++}
++
++fn rounded_rect(c: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
++    let r = r.min(h / 2.0).min(w / 2.0);
++    c.new_sub_path();
++    c.arc(x + w - r, y + r, r, (-90.0f64).to_radians(), 0.0);
++    c.arc(x + w - r, y + h - r, r, 0.0, (90.0f64).to_radians());
++    c.arc(x + r, y + h - r, r, (90.0f64).to_radians(), (180.0f64).to_radians());
++    c.arc(x + r, y + r, r, (180.0f64).to_radians(), (270.0f64).to_radians());
++    c.close_path();
++}
++
++/// Read the current value: volume from the helper's state file, brightness
++/// from the display backlight. None if unknown.
++pub fn current_value(kind: Kind) -> Option<f64> {
++    match kind {
++        Kind::Volume => {
++            let s = fs::read_to_string(BRIDGE_VOLUME).ok()?;
++            s.split_whitespace().next()?.parse::<f64>().ok().map(|v| v.clamp(0.0, 1.0))
++        }
++        Kind::Brightness => {
++            for name in ["intel_backlight", "acpi_video0", "gmux_backlight", "apple-panel-bl"] {
++                let dir = format!("/sys/class/backlight/{name}");
++                let read = |attr: &str| {
++                    fs::read_to_string(format!("{dir}/{attr}"))
++                        .ok()
++                        .and_then(|s| s.trim().parse::<f64>().ok())
++                };
++                if let (Some(now), Some(max)) = (read("actual_brightness"), read("max_brightness")) {
++                    if max > 0.0 {
++                        return Some((now / max).clamp(0.0, 1.0));
++                    }
++                }
++            }
++            None
++        }
++    }
++}
++
++impl Slider {
++    pub fn new(kind: Kind, mode: Mode, source: (usize, usize)) -> Slider {
++        let value = current_value(kind).unwrap_or(0.5);
++        Slider {
++            kind,
++            value,
++            mode,
++            source,
++            slot: None,
++            sent_value: Some(value),
++            last_send: None,
++            keys_value: value,
++        }
++    }
++
++    pub fn draw(&self, c: &Context, cfg: &Config, layout: &Layout, height: f64, shift: (f64, f64), icon: &Button) {
++        let (sx, sy) = shift;
++        let button_height = if cfg.button_height > 0.0 {
++            cfg.button_height.min(height)
++        } else {
++            height * 0.7
++        };
++        let top = (height - button_height) / 2.0;
++        // clear the whole slider area
++        c.set_source_rgb(0.0, 0.0, 0.0);
++        c.rectangle(layout.left + sx - 1.0, 0.0, layout.right - layout.left + 2.0, height);
++        c.fill().unwrap();
++        // close button with an x
++        let (r, g, b) = cfg.button_color;
++        c.set_source_rgb(r, g, b);
++        rounded_rect(c, layout.close.0 + sx, top, layout.close.1, button_height, cfg.button_radius);
++        c.fill().unwrap();
++        let (cx, cy, arm) = (layout.close.0 + layout.close.1 / 2.0 + sx, height / 2.0 + sy, 9.0);
++        c.set_source_rgb(1.0, 1.0, 1.0);
++        c.set_line_width(2.5);
++        c.move_to(cx - arm, cy - arm);
++        c.line_to(cx + arm, cy + arm);
++        c.move_to(cx + arm, cy - arm);
++        c.line_to(cx - arm, cy + arm);
++        c.stroke().unwrap();
++        // the icon of the button that opened it
++        c.set_source_rgb(1.0, 1.0, 1.0);
++        icon.render(c, height as i32, layout.icon.0 + sx, layout.icon.1 as u64, sy);
++        // capsule behind the track
++        let cap_left = layout.track.0 - KNOB_RADIUS - cfg.button_spacing / 2.0 + sx;
++        let cap_right = layout.track.1 + KNOB_RADIUS + cfg.button_spacing / 2.0 + sx;
++        c.set_source_rgb(r, g, b);
++        rounded_rect(c, cap_left, top, cap_right - cap_left, button_height, cfg.button_radius);
++        c.fill().unwrap();
++        // track: filled part white, the rest grey
++        let y = height / 2.0 - TRACK_HEIGHT / 2.0;
++        let knob_x = layout.track.0 + self.value * layout.track_len() + sx;
++        c.set_source_rgb(0.45, 0.45, 0.47);
++        rounded_rect(c, layout.track.0 + sx, y, layout.track_len(), TRACK_HEIGHT, TRACK_HEIGHT / 2.0);
++        c.fill().unwrap();
++        c.set_source_rgb(1.0, 1.0, 1.0);
++        rounded_rect(c, layout.track.0 + sx, y, (knob_x - layout.track.0 - sx).max(TRACK_HEIGHT), TRACK_HEIGHT, TRACK_HEIGHT / 2.0);
++        c.fill().unwrap();
++        c.arc(knob_x, height / 2.0, KNOB_RADIUS, 0.0, std::f64::consts::TAU);
++        c.fill().unwrap();
++    }
++
++    /// Hand the value to the helper, at most every SEND_INTERVAL unless
++    /// `force`. Ok(true) sent or nothing to send, Ok(false) not yet (call
++    /// again), Err(()) no helper.
++    pub fn send(&mut self, force: bool) -> Result<bool, ()> {
++        if self.sent_value == Some(self.value) {
++            return Ok(true);
++        }
++        if !force && self.last_send.is_some_and(|t| t.elapsed() < SEND_INTERVAL) {
++            return Ok(false);
++        }
++        // non-blocking: no reader (helper not running) is ENXIO
++        let mut fifo = OpenOptions::new()
++            .write(true)
++            .custom_flags(libc::O_NONBLOCK)
++            .open(BRIDGE_CMD)
++            .map_err(|_| ())?;
++        fifo.write_all(format!("{} {:.4}\n", self.kind.name(), self.value).as_bytes())
++            .map_err(|_| ())?;
++        self.sent_value = Some(self.value);
++        self.last_send = Some(Instant::now());
++        Ok(true)
++    }
++
++    /// When the next send is due, if one is waiting
++    pub fn send_due_in(&self) -> Option<Duration> {
++        if self.sent_value == Some(self.value) {
++            return None;
++        }
++        Some(self.last_send.map_or(Duration::ZERO, |t| SEND_INTERVAL.saturating_sub(t.elapsed())))
++    }
++
++    /// Without the helper: how many key presses up (positive) or down make
++    /// the keys follow the value, in FALLBACK_STEP steps.
++    pub fn fallback_steps(&mut self) -> i32 {
++        let steps = ((self.value - self.keys_value) / FALLBACK_STEP).trunc() as i32;
++        self.keys_value += steps as f64 * FALLBACK_STEP;
++        self.sent_value = Some(self.value);
++        steps
++    }
++}
+-- 
+2.53.0
+

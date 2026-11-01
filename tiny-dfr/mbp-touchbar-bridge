@@ -1,0 +1,859 @@
+#!/usr/bin/python3
+"""Touch Bar helper in the desktop session for tiny-dfr, which runs as nobody
+(patches 0006, 0010, 0011): sets what the bar asks for the way the desktop
+does, and tells the bar what the session is doing. Event driven (GLib main
+loop, D-Bus signals, `pactl subscribe`); nothing is polled.
+
+Commands, one per line, on the FIFO /run/tiny-dfr/bridge/cmd (the last value
+of each kind wins when several are waiting):
+  volume <0..1>      PulseAudio volume of the default sink - the sink KDE's
+                     volume slider moves ("MacBook Speakers": the speaker
+                     protection and the macOS volume law stay in front of the
+                     speakers). Never above 100 %, never the raw speaker node;
+                     a muted sink is unmuted.
+  brightness <0..1>  KDE screen brightness (org.kde.ScreenBrightness), no OSD
+  keyboard <0..1>    KDE keyboard light (PowerDevil), no OSD
+  media playpause|next|previous   the followed media player (MPRIS)
+  seek <0..1>        that player, to this part of the track
+  layout next|<n>    KDE keyboard layout: the next one, or number n
+  dnd toggle         do not disturb on/off (an inhibition of the KDE
+                     notification server held by this helper)
+  player next        follow the next media player that has a track
+  emoji <text>       put it on the clipboard (Klipper) for tiny-dfr to paste:
+                     "paste" says when it is there; the clipboard's text
+                     before it comes back a moment later. Several in a row
+                     go one after the other.
+  tabs refresh       list the browser's tabs (plasma-browser-integration's
+                     KRunner tabs runner) into "tabs" and "tab-<id>.png"
+  tab <id>           switch to that tab (the runner's Run)
+State files (written only when they change):
+  volume       "<0..1> <muted 0|1>" of the default sink
+  mic          "1" muted / "0" of the default source
+  nowplaying   the followed player: "key value" lines (status, title,
+               artist, length_us, position_us, at_ms, rate, can_seek), or
+               "status none". Followed: the one that started playing last,
+               else the last paused one that has a track.
+  layout       the active keyboard layout's number, then the short names
+               of all of them on one line (KDE, org.kde.keyboard)
+  title        the active window's title, from the KWin script through the
+               bus name org.mbp.TouchBar (SetTitle) - for rules by web site
+  art-<n>.svg  the followed player's cover (mpris:artUrl copied or fetched
+               next to it as art-<n>.png/jpg/webp), named in nowplaying
+  locked       "1" while the screen is locked (org.freedesktop.ScreenSaver),
+               "0": tiny-dfr shows nothing of the session then
+  dnd          "1" while notifications are inhibited (do not disturb), "0"
+  notification the latest notification: when (ms since the epoch), the
+               program, the title - one per line; the body is not kept.
+               Seen as a session bus monitor of Notify calls.
+  emoji-recent emoji used lately, the latest first, on one line (kept in
+               ~/.local/state/mbp-touchbar/emoji-recent)
+  paste        ms since the epoch when an emoji was put on the clipboard
+  tabs         "<id>\t<title>" per tab, in the order of the ids (the order
+               they were opened in); tab-<id>.png their icons
+The directory is setgid video (tmpfiles), so tiny-dfr (group video) can write
+the FIFO and read the state.
+"""
+import os
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import zlib
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+DIR = "/run/tiny-dfr/bridge"
+CMD = f"{DIR}/cmd"
+# the hidden 4-channel node behind "MacBook Speakers": no volume of its own
+RAW_SPEAKERS = "alsa_output.pci-0000_00_1f.3.speakers"
+SCREEN = ("org.kde.ScreenBrightness", "/org/kde/ScreenBrightness/display0",
+          "org.kde.ScreenBrightness.Display")
+KEYBOARD = ("org.kde.Solid.PowerManagement",
+            "/org/kde/Solid/PowerManagement/Actions/KeyboardBrightnessControl",
+            "org.kde.Solid.PowerManagement.Actions.KeyboardBrightnessControl")
+SUPPRESS_INDICATOR = 1
+MIN_BRIGHTNESS = 0.01   # the slider's left end dims, it does not switch off
+LAYOUTS = ("org.kde.keyboard", "/Layouts", "org.kde.KeyboardLayouts")
+NOTIFY = ("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+          "org.freedesktop.Notifications")
+MPRIS = "org.mpris.MediaPlayer2."
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+PLAYER = "org.mpris.MediaPlayer2.Player"
+KLIPPER = ("org.kde.klipper", "/klipper", "org.kde.klipper.klipper")
+RECENT = os.path.expanduser("~/.local/state/mbp-touchbar/emoji-recent")
+RECENT_MAX = 24
+# the clipboard settles before the paste, the paste reads it before the next
+CLIP_SETTLE_MS = 60
+PASTE_TAKE_MS = 250
+RESTORE_MS = 700
+TABS = ("org.kde.plasma.browser_integration", "/TabsRunner", "org.kde.krunner1")
+# an empty query is refused; every tab's address has one of these
+TAB_QUERIES = ("/", ".")
+
+bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+written = {}
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def write(name, text):
+    """Replace a state file, only when its content changes (inotify in tiny-dfr)."""
+    if written.get(name) == text:
+        return
+    path, tmp = f"{DIR}/{name}", f"{DIR}/.{name}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o640)
+    os.replace(tmp, path)
+    written[name] = text
+
+
+def call(dest, path, iface, method, args=None, timeout=2000):
+    try:
+        r = bus.call_sync(dest, path, iface, method, args, None,
+                          Gio.DBusCallFlags.NONE, timeout, None)
+        return r.unpack() if r is not None else ()
+    except GLib.Error as e:
+        log(f"{dest} {method}: {e.message}")
+        return None
+
+
+def run(*cmd):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout.strip()
+
+
+# --- PulseAudio: volume and microphone --------------------------------------
+
+sink_muted = False
+
+
+def refresh_pulse():
+    global sink_muted
+    sink = run("pactl", "get-default-sink")
+    if sink:
+        pct = next((w for w in run("pactl", "get-sink-volume", sink).split() if w.endswith("%")), None)
+        sink_muted = run("pactl", "get-sink-mute", sink).endswith("yes")
+        if pct is not None:
+            write("volume", f"{int(pct[:-1]) / 100:.4f} {int(sink_muted)}\n")
+    source = run("pactl", "get-default-source")
+    if source:
+        write("mic", "1\n" if run("pactl", "get-source-mute", source).endswith("yes") else "0\n")
+
+
+refresh_pending = False
+
+
+def refresh_later():
+    """A burst of events (a slide): one refresh after it settles."""
+    global refresh_pending
+
+    def go():
+        global refresh_pending
+        refresh_pending = False
+        try:
+            refresh_pulse()
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"pulse: {e}")
+        return False
+
+    if not refresh_pending:
+        refresh_pending = True
+        GLib.timeout_add(60, go)
+
+
+def watch_pulse():
+    p = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE)
+    buf = b""
+
+    def on_events(fd, cond):
+        nonlocal buf
+        data = os.read(fd, 4096) if cond & GLib.IOCondition.IN else b""
+        if not data:
+            log("pactl subscribe ended")
+            loop.quit()
+            return False
+        buf += data
+        *lines, buf = buf.split(b"\n")
+        if any(k in line for line in lines for k in (b" sink ", b" source ", b" server")):
+            refresh_later()
+        return True
+
+    GLib.io_add_watch(p.stdout.fileno(), GLib.PRIORITY_DEFAULT,
+                      GLib.IOCondition.IN | GLib.IOCondition.HUP, on_events)
+
+
+def set_volume(value):
+    sink = run("pactl", "get-default-sink")
+    if not sink or sink == RAW_SPEAKERS:
+        log(f"volume: default sink {sink!r}, not touched")
+        return
+    pct = max(0, min(100, round(value * 100)))
+    run("pactl", "set-sink-volume", sink, f"{pct}%")
+    if sink_muted and pct > 0:
+        run("pactl", "set-sink-mute", sink, "0")
+
+
+# --- KDE: screen and keyboard light ------------------------------------------
+
+max_level = {}
+
+
+def set_level(target, prop_or_method, setter, value, low=0.0):
+    if target not in max_level:
+        if target is SCREEN:
+            r = call(target[0], target[1], "org.freedesktop.DBus.Properties", "Get",
+                     GLib.Variant("(ss)", (target[2], prop_or_method)))
+        else:
+            r = call(*target, prop_or_method)
+        if not r:
+            return
+        max_level[target] = int(r[0])
+    level = round(max(low, min(1.0, value)) * max_level[target])
+    if target is SCREEN:
+        args = GLib.Variant("(iu)", (level, SUPPRESS_INDICATOR))
+    else:
+        args = GLib.Variant("(i)", (level,))
+    if call(*target, setter, args) is None:
+        max_level.pop(target, None)
+
+
+# --- MPRIS: the media player to follow ----------------------------------------
+
+players = {}   # well-known name -> state
+owners = {}    # unique name -> well-known name
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def apply_props(p, props):
+    if "PlaybackStatus" in props:
+        status = props["PlaybackStatus"]
+        if status == "Playing" and p.get("status") != "Playing":
+            p["since"] = time.monotonic()
+        p["status"] = status
+    if "Metadata" in props:
+        md = props["Metadata"] or {}
+        p["title"] = str(md.get("xesam:title", "")).replace("\n", " ")
+        artist = md.get("xesam:artist", "")
+        p["artist"] = (", ".join(artist) if isinstance(artist, list) else str(artist)).replace("\n", " ")
+        p["length"] = int(md.get("mpris:length", 0) or 0)
+        p["trackid"] = md.get("mpris:trackid", "")
+        p["art_url"] = str(md.get("mpris:artUrl", "") or "")
+    if "Rate" in props:
+        p["rate"] = float(props["Rate"])
+    if "CanSeek" in props:
+        p["can_seek"] = bool(props["CanSeek"])
+    if "Position" in props:
+        p["position"], p["at"] = int(props["Position"]), now_ms()
+
+
+def read_position(name):
+    r = call(name, MPRIS_PATH, "org.freedesktop.DBus.Properties", "Get",
+             GLib.Variant("(ss)", (PLAYER, "Position")), timeout=500)
+    if r:
+        players[name]["position"], players[name]["at"] = int(r[0]), now_ms()
+
+
+chosen = None   # a player picked with "player next"
+
+
+def add_player(name):
+    owner = call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                 "GetNameOwner", GLib.Variant("(s)", (name,)))
+    props = call(name, MPRIS_PATH, "org.freedesktop.DBus.Properties", "GetAll",
+                 GLib.Variant("(s)", (PLAYER,)))
+    if not owner or props is None:
+        return
+    ident = call(name, MPRIS_PATH, "org.freedesktop.DBus.Properties", "Get",
+                 GLib.Variant("(ss)", ("org.mpris.MediaPlayer2", "Identity")), timeout=500)
+    p = {"owner": owner[0], "status": "Stopped", "title": "", "artist": "", "length": 0,
+         "trackid": "", "rate": 1.0, "can_seek": False, "position": 0, "at": now_ms(), "since": 0.0,
+         "identity": str(ident[0]) if ident else name[len(MPRIS):].split(".")[0]}
+    apply_props(p, props[0])
+    players[name] = p
+    owners[owner[0]] = name
+
+
+def remove_player(name):
+    p = players.pop(name, None)
+    if p:
+        owners.pop(p["owner"], None)
+
+
+def with_track():
+    """Players with a track. A browser's own player and plasma-browser-
+    integration's copy of it are the same track twice (the same length):
+    keep the one that tells more - the copy has the cover, the artist and a
+    clean title, Chrome's own player none of them."""
+    tracks = {n: p for n, p in players.items() if (p["title"] or p["length"]) and p["status"] != "Stopped"}
+    richness = lambda n: (bool(tracks[n].get("art_url")), bool(tracks[n]["artist"]), n)
+    best = {}
+    for n, p in tracks.items():
+        if p["length"] <= 0:
+            best[n] = n
+            continue
+        key = ("len", p["length"])
+        if key not in best or richness(n) > richness(best[key]):
+            best[key] = n
+    keep = set(best.values())
+    return {n: p for n, p in tracks.items() if n in keep}
+
+
+def followed():
+    global chosen
+    tracks = with_track()
+    if chosen in tracks:
+        return chosen
+    chosen = None
+    playing = [n for n, p in tracks.items() if p["status"] == "Playing"]
+    if playing:
+        return max(playing, key=lambda n: tracks[n]["since"])
+    paused = [n for n, p in tracks.items() if p["status"] == "Paused"]
+    return max(paused, key=lambda n: tracks[n]["since"]) if paused else None
+
+
+# --- covers ---------------------------------------------------------------------
+
+ART_MAX = 3 * 1024 * 1024
+art = {"url": None, "file": ""}   # the cover now: its URL and SVG file name
+art_serial = 0
+
+
+def art_kind(data):
+    if data.startswith(b"\x89PNG"):
+        return "png"
+    if data.startswith(b"\xff\xd8"):
+        return "jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def fetch_art(url):
+    """The picture behind an artUrl (a local file or http(s)), or None."""
+    try:
+        if url.startswith("file://"):
+            with open(urllib.request.url2pathname(url[7:]), "rb") as f:
+                return f.read(ART_MAX + 1)
+        if url.startswith(("https://", "http://")):
+            with urllib.request.urlopen(url, timeout=4) as r:
+                return r.read(ART_MAX + 1)
+    except (OSError, ValueError) as e:
+        log(f"cover {url[:60]}: {e}")
+    return None
+
+
+def set_art(url):
+    """Make the cover for this URL (in a thread: a download may take seconds)."""
+    if url == art["url"]:
+        return
+    art["url"] = url
+
+    def work():
+        global art_serial
+        data = fetch_art(url) if url else None
+        kind = art_kind(data) if data and len(data) <= ART_MAX else None
+        name = ""
+        if kind:
+            art_serial += 1
+            n = art_serial
+            pic, svg = f"art-{n}.{kind}", f"art-{n}.svg"
+            with open(f"{DIR}/{pic}", "wb") as f:
+                f.write(data)
+            os.chmod(f"{DIR}/{pic}", 0o640)
+            with open(f"{DIR}/{svg}", "w") as f:
+                f.write('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100">'
+                        f'<image href="{pic}" width="100" height="100" preserveAspectRatio="xMidYMid slice"/></svg>\n')
+            os.chmod(f"{DIR}/{svg}", 0o640)
+            name = svg
+
+        def done():
+            if art["url"] != url:   # another track meanwhile
+                return False
+            old = art["file"]
+            art["file"] = name
+            publish()
+            # the previous cover, once tiny-dfr has the new name
+            if old:
+                for f in os.listdir(DIR):
+                    if f.startswith(old[:-4] + "."):
+                        os.unlink(f"{DIR}/{f}")
+            return False
+        GLib.idle_add(done)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def publish():
+    name = followed()
+    if name is None:
+        set_art(None)
+        write("nowplaying", "status none\n")
+        return
+    p = players[name]
+    set_art(p.get("art_url") or None)
+    write("nowplaying", "".join(f"{k} {v}\n" for k, v in [
+        ("status", p["status"]), ("title", p["title"]), ("artist", p["artist"]),
+        ("length_us", p["length"]), ("position_us", p["position"]), ("at_ms", p["at"]),
+        ("rate", p["rate"]), ("can_seek", int(p["can_seek"])),
+        ("player", p["identity"].replace("\n", " ")), ("players", len(with_track())),
+        ("art", art["file"])]))
+
+
+def on_owner_changed(conn, sender, path, iface, signal, params, *_):
+    name, old, new = params.unpack()
+    if not name.startswith(MPRIS):
+        return
+    remove_player(name)
+    if new:
+        add_player(name)
+    publish()
+
+
+def on_properties(conn, sender, path, iface, signal, params, *_):
+    interface, changed, _invalidated = params.unpack()
+    name = owners.get(sender)
+    if interface != PLAYER or name is None:
+        return
+    # a player that starts playing takes over from one picked by hand
+    if changed.get("PlaybackStatus") == "Playing" and chosen not in (None, name):
+        set_chosen(None)
+    apply_props(players[name], changed)
+    # Position is not signalled: read it whenever the play state changes
+    if {"PlaybackStatus", "Metadata", "Rate"} & changed.keys():
+        read_position(name)
+    publish()
+
+
+def on_seeked(conn, sender, path, iface, signal, params, *_):
+    name = owners.get(sender)
+    if name is None:
+        return
+    players[name]["position"], players[name]["at"] = int(params.unpack()[0]), now_ms()
+    publish()
+
+
+def watch_mpris():
+    bus.signal_subscribe("org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+                         "/org/freedesktop/DBus", MPRIS.rstrip("."),
+                         Gio.DBusSignalFlags.MATCH_ARG0_NAMESPACE, on_owner_changed)
+    bus.signal_subscribe(None, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                         MPRIS_PATH, None, Gio.DBusSignalFlags.NONE, on_properties)
+    bus.signal_subscribe(None, PLAYER, "Seeked", MPRIS_PATH, None,
+                         Gio.DBusSignalFlags.NONE, on_seeked)
+    names = call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ListNames")
+    for name in (names[0] if names else []):
+        if name.startswith(MPRIS):
+            add_player(name)
+    publish()
+
+
+def set_chosen(name):
+    global chosen
+    chosen = name
+
+
+def next_player():
+    names = sorted(with_track())
+    if len(names) < 2:
+        return
+    cur = followed()
+    set_chosen(names[(names.index(cur) + 1) % len(names)] if cur in names else names[0])
+    publish()
+
+
+def media(action):
+    name = followed()
+    method = {"playpause": "PlayPause", "next": "Next", "previous": "Previous"}.get(action)
+    if name and method:
+        call(name, MPRIS_PATH, PLAYER, method)
+
+
+def seek(fraction):
+    name = followed()
+    if not name:
+        return
+    p = players[name]
+    if not (p["can_seek"] and p["length"] > 0 and p["trackid"]):
+        return
+    pos = int(max(0.0, min(1.0, fraction)) * p["length"])
+    call(name, MPRIS_PATH, PLAYER, "SetPosition", GLib.Variant("(ox)", (p["trackid"], pos)))
+
+
+# --- KDE: keyboard layouts ----------------------------------------------------
+
+def publish_layout(*_):
+    layouts = call(*LAYOUTS, "getLayoutsList")
+    active = call(*LAYOUTS, "getLayout")
+    if not layouts or not active:
+        return
+    names, seen = [], set()
+    for short, variant, _long in layouts[0]:
+        name = short if short not in seen else f"{short}-{variant or len(names)}"
+        seen.add(short)
+        names.append(name.replace(" ", "_"))
+    write("layout", f"{active[0]}\n{' '.join(names)}\n")
+
+
+def watch_layout():
+    for signal in ("layoutChanged", "layoutListChanged"):
+        bus.signal_subscribe(None, LAYOUTS[2], signal, LAYOUTS[1], None,
+                             Gio.DBusSignalFlags.NONE, publish_layout)
+    # KDE's keyboard module may come after us
+    bus.signal_subscribe("org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+                         "/org/freedesktop/DBus", LAYOUTS[0], Gio.DBusSignalFlags.NONE,
+                         lambda *a: publish_layout() if a[5].unpack()[2] else None)
+    publish_layout()
+
+
+def set_layout(arg):
+    if arg == "next":
+        call(*LAYOUTS, "switchToNextLayout")
+    elif arg.isdigit():
+        call(*LAYOUTS, "setLayout", GLib.Variant("(u)", (int(arg),)))
+
+
+# --- the active window's title (KWin script -> org.mbp.TouchBar.SetTitle) --------
+
+TITLE_XML = """<node><interface name="org.mbp.TouchBar">
+<method name="SetTitle"><arg type="s" direction="in"/></method></interface></node>"""
+
+
+def own_title_service():
+    def on_call(conn, sender, path, iface, method, params, inv):
+        if method == "SetTitle":
+            title = " ".join(params.unpack()[0].split())[:300]
+            write("title", title + "\n")
+        inv.return_value(None)
+
+    def on_bus(conn, name):
+        conn.register_object("/org/mbp/TouchBar", Gio.DBusNodeInfo.new_for_xml(TITLE_XML).interfaces[0],
+                             on_call, None, None)
+
+    Gio.bus_own_name_on_connection(bus, "org.mbp.TouchBar", Gio.BusNameOwnerFlags.NONE, None, None)
+    on_bus(bus, "org.mbp.TouchBar")
+
+
+# --- the lock screen ---------------------------------------------------------
+
+SCREENSAVER = ("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver")
+
+
+def publish_locked(*args):
+    # the signal carries the state; otherwise ask
+    if len(args) >= 6:
+        active = args[5].unpack()[0]
+    else:
+        r = call(*SCREENSAVER, "GetActive", timeout=1000)
+        if r is None:
+            return
+        active = r[0]
+    write("locked", "1\n" if active else "0\n")
+
+
+def watch_lock():
+    bus.signal_subscribe(None, SCREENSAVER[2], "ActiveChanged", SCREENSAVER[1], None,
+                         Gio.DBusSignalFlags.NONE, publish_locked)
+    publish_locked()
+
+
+# --- KDE notifications: do not disturb, the latest one ------------------------
+
+dnd_cookie = None
+
+
+def publish_dnd(*_):
+    r = call(NOTIFY[0], NOTIFY[1], "org.freedesktop.DBus.Properties", "Get",
+             GLib.Variant("(ss)", (NOTIFY[2], "Inhibited")), timeout=1000)
+    if r is not None:
+        write("dnd", "1\n" if r[0] else "0\n")
+
+
+def toggle_dnd():
+    global dnd_cookie
+    if dnd_cookie is not None:
+        call(*NOTIFY, "UnInhibit", GLib.Variant("(u)", (dnd_cookie,)))
+        dnd_cookie = None
+    else:
+        r = call(*NOTIFY, "Inhibit", GLib.Variant("(ssa{sv})", ("mbp-touchbar", "Touch Bar", {})))
+        if r:
+            dnd_cookie = r[0]
+    publish_dnd()
+
+
+def on_notification(app, summary):
+    write("notification", f"{now_ms()}\n{app}\n{summary}\n")
+    return False
+
+
+def watch_notifications():
+    bus.signal_subscribe(NOTIFY[0], "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                         NOTIFY[1], NOTIFY[2], Gio.DBusSignalFlags.NONE, publish_dnd)
+    publish_dnd()
+    # Notify calls go to the server only: watch them as a monitor on a
+    # connection of their own (a monitor cannot send anything else)
+    addr = Gio.dbus_address_get_for_bus_sync(Gio.BusType.SESSION, None)
+    mon = Gio.DBusConnection.new_for_address_sync(
+        addr, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+        None, None)
+
+    def on_message(conn, msg, incoming, *_):
+        # the filter sees our own messages too (BecomeMonitor and its reply):
+        # those pass; a watched Notify is taken out, or GDBus would answer it
+        # and a monitor must not send anything
+        if not (incoming and msg.get_member() == "Notify" and msg.get_interface() == NOTIFY[2]):
+            return msg
+        try:
+            app, _rid, _icon, summary = msg.get_body().unpack()[:4]
+            clean = lambda t: " ".join(str(t).split())
+            GLib.idle_add(on_notification, clean(app), clean(summary))
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    mon.add_filter(on_message)
+    mon.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus.Monitoring",
+                  "BecomeMonitor",
+                  GLib.Variant("(asu)", ([f"type='method_call',interface='{NOTIFY[2]}',member='Notify'"], 0)),
+                  None, Gio.DBusCallFlags.NONE, 5000, None)
+    return mon
+
+
+# --- emoji: the clipboard and the recent ones ---------------------------------
+
+emoji_queue = []
+emoji_busy = False
+# the clipboard's text before the first emoji of a burst, and its timer
+clip_saved = None
+restore_id = 0
+
+
+def load_recent():
+    try:
+        with open(RECENT, encoding="utf-8") as f:
+            return f.read().split()[:RECENT_MAX]
+    except OSError:
+        return []
+
+
+def publish_recent(recent):
+    write("emoji-recent", " ".join(recent) + "\n")
+
+
+def remember(text):
+    recent = [text] + [e for e in load_recent() if e != text]
+    recent = recent[:RECENT_MAX]
+    try:
+        os.makedirs(os.path.dirname(RECENT), exist_ok=True)
+        with open(RECENT, "w", encoding="utf-8") as f:
+            f.write(" ".join(recent) + "\n")
+    except OSError as e:
+        log(f"{RECENT}: {e}")
+    publish_recent(recent)
+
+
+def restore_clipboard():
+    global clip_saved, restore_id
+    restore_id = 0
+    if emoji_busy or emoji_queue:
+        restore_id = GLib.timeout_add(RESTORE_MS, restore_clipboard)
+        return False
+    # an image or nothing before: the emoji stays (Klipper gives text only)
+    if clip_saved:
+        call(*KLIPPER, "setClipboardContents", GLib.Variant("(s)", (clip_saved,)))
+    clip_saved = None
+    return False
+
+
+def next_emoji():
+    global emoji_busy, clip_saved
+    if not emoji_queue:
+        emoji_busy = False
+        return False
+    emoji_busy = True
+    text = emoji_queue.pop(0)
+    # the first of a burst: what was there before (restored after the last)
+    if clip_saved is None:
+        got = call(*KLIPPER, "getClipboardContents")
+        clip_saved = got[0] if got else ""
+    if call(*KLIPPER, "setClipboardContents", GLib.Variant("(s)", (text,))) is None:
+        emoji_busy = False
+        emoji_queue.clear()
+        return False
+    remember(text)
+
+    def pasted():
+        write("paste", f"{now_ms()}\n")
+        GLib.timeout_add(PASTE_TAKE_MS, next_emoji)
+        return False
+
+    GLib.timeout_add(CLIP_SETTLE_MS, pasted)
+    schedule_restore()
+    return False
+
+
+def schedule_restore():
+    global restore_id
+    if restore_id:
+        GLib.source_remove(restore_id)
+    restore_id = GLib.timeout_add(RESTORE_MS, restore_clipboard)
+
+
+def emoji(text):
+    emoji_queue.append(text)
+    if not emoji_busy:
+        next_emoji()
+
+
+# --- browser tabs ---------------------------------------------------------------
+
+tab_icons = {}   # id -> the icon's bytes as written
+
+
+def png(width, height, rowstride, channels, data):
+    """A PNG of an image-data icon (RGB or RGBA rows)."""
+    rows = b"".join(b"\0" + data[y * rowstride:y * rowstride + width * channels] for y in range(height))
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    head = struct.pack(">IIBBBBB", width, height, 8, 6 if channels == 4 else 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", head) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+
+
+def refresh_tabs():
+    found = {}
+    for q in TAB_QUERIES:
+        got = call(*TABS, "Match", GLib.Variant("(s)", (q,)), timeout=1500)
+        if got is None:
+            break
+        for match in got[0]:
+            found[match[0]] = match
+    order = sorted(found, key=lambda i: (len(i), i))
+    lines = []
+    for tid in order:
+        title = " ".join(found[tid][1].split())
+        lines.append(f"{tid}\t{title}")
+        icon = found[tid][5].get("icon-data")
+        if not icon or tid in tab_icons and tab_icons[tid] == icon[6]:
+            continue
+        w, h, stride, _, bits, channels, data = icon
+        if bits != 8 or channels not in (3, 4) or len(data) < stride * h:
+            continue
+        name = f"tab-{tid}.png"
+        tmp = f"{DIR}/.{name}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(png(w, h, stride, channels, bytes(data)))
+        os.chmod(tmp, 0o640)
+        os.replace(tmp, f"{DIR}/{name}")
+        tab_icons[tid] = icon[6]
+    # icons of closed tabs
+    for tid in list(tab_icons):
+        if tid not in found:
+            del tab_icons[tid]
+            try:
+                os.unlink(f"{DIR}/tab-{tid}.png")
+            except FileNotFoundError:
+                pass
+    write("tabs", "".join(f"{line}\n" for line in lines))
+
+
+def switch_tab(tid):
+    if tid.isdigit():
+        call(*TABS, "Run", GLib.Variant("(ss)", (tid, "")))
+
+
+# --- the FIFO -----------------------------------------------------------------
+
+def watch_commands():
+    try:
+        os.unlink(CMD)
+    except FileNotFoundError:
+        pass
+    os.mkfifo(CMD)
+    os.chmod(CMD, 0o620)
+    # read-write: the FIFO never reports end-of-file between writers
+    fd = os.open(CMD, os.O_RDWR | os.O_NONBLOCK)
+    buf = b""
+
+    def on_command(fd, cond):
+        nonlocal buf
+        try:
+            buf += os.read(fd, 4096)
+        except BlockingIOError:
+            return True
+        *lines, buf = buf.split(b"\n")
+        last = {}
+        for line in lines:
+            parts = line.decode(errors="replace").split()
+            if len(parts) != 2:
+                continue
+            kind, arg = parts
+            if kind == "media":
+                media(arg)
+                continue
+            if kind == "layout":
+                set_layout(arg)
+                continue
+            if kind == "dnd":
+                toggle_dnd()
+                continue
+            if kind == "player":
+                next_player()
+                continue
+            if kind == "emoji":
+                emoji(arg)
+                continue
+            if kind == "tabs":
+                refresh_tabs()
+                continue
+            if kind == "tab":
+                switch_tab(arg)
+                continue
+            try:
+                last[kind] = float(arg)
+            except ValueError:
+                pass
+        try:
+            if "volume" in last:
+                set_volume(last["volume"])
+            if "brightness" in last:
+                set_level(SCREEN, "MaxBrightness", "SetBrightness", last["brightness"], MIN_BRIGHTNESS)
+            if "keyboard" in last:
+                set_level(KEYBOARD, "keyboardBrightnessMax", "setKeyboardBrightnessSilent", last["keyboard"])
+            if "seek" in last:
+                seek(last["seek"])
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"apply: {e}")
+        return True
+
+    GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN, on_command)
+
+
+if __name__ == "__main__":
+    if not os.path.isdir(DIR):
+        log(f"{DIR} missing (tmpfiles mbp-tiny-dfr)")
+        sys.exit(1)
+    loop = GLib.MainLoop()
+    watch_commands()
+    publish_recent(load_recent())
+    refresh_pulse()
+    watch_pulse()
+    watch_mpris()
+    watch_layout()
+    watch_lock()
+    own_title_service()
+    try:
+        monitor = watch_notifications()   # keep the connection alive
+    except GLib.Error as e:
+        log(f"notifications: {e.message}")
+    loop.run()
+    sys.exit(1)   # pactl went away: systemd restarts us

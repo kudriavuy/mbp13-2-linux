@@ -1,0 +1,6 @@
+[Unit]
+Description=Touch Bar: %i keys for the active window
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mbp-touchbar mode %i

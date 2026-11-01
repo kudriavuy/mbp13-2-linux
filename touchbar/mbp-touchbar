@@ -1,0 +1,103 @@
+#!/bin/bash
+# Touch Bar mode for the active program (MacBookPro13,2).
+#   mbp-touchbar mode fn|media   F1-F12 or media keys: in configuration 1 the
+#                                hid-appletb-kbd 'mode' (left alone while the bar
+#                                is off or Esc-only); for tiny-dfr (configuration
+#                                2) /run/tiny-dfr/layer. Neither: nothing to do.
+#   mbp-touchbar app <class>     the active window's class (KWin script): written
+#                                to /run/tiny-dfr/app for tiny-dfr, which picks the
+#                                program's key set from [[Apps]] in
+#                                /etc/tiny-dfr/config.toml; the same rules decide
+#                                fn/media above (Set = "fn" -> fn)
+#   mbp-touchbar classes         window classes of the open windows (for Match)
+#   mbp-touchbar which <class>...  what tiny-dfr gives these classes with the
+#                                installed config (TINY_DFR_WHICH_SET)
+#   mbp-touchbar status
+set -euo pipefail
+M=$(ls /sys/bus/hid/drivers/hid-appletb-kbd/*/mode 2>/dev/null | head -1 || true)
+P=/sys/module/hid_appletb_kbd/parameters
+L=/run/tiny-dfr
+
+# fn or media for window class $1 from the [[Apps]] rules of tiny-dfr's config;
+# without rules (an older config) the terminal/editor list the KWin script had
+fn_or_media() {
+	python3 - "$1" <<'PY'
+import sys, tomllib
+OLD = ["org.kde.konsole", "konsole", "org.kde.yakuake", "yakuake", "code", "code-oss",
+       "codium", "vscodium", "jetbrains-*", "kitty", "alacritty", "org.wezfurlong.wezterm", "foot"]
+try:
+    with open("/etc/tiny-dfr/config.toml", "rb") as f:
+        rules = tomllib.load(f).get("Apps")
+except (OSError, tomllib.TOMLDecodeError):
+    rules = None
+if rules is None:
+    rules = [{"Match": OLD, "Set": "fn"}]
+cls = sys.argv[1].lower()
+def fits(p):
+    p = p.lower()
+    return cls.startswith(p[:-1]) if p.endswith("*") else cls == p
+for r in rules:
+    if any(fits(p) for p in r.get("Match", [])):
+        # Config1: what configuration 1 shows; else F1-F12 only for Set = "fn"
+        mode = r.get("Config1") or ("fn" if r.get("Set") == "fn" else "media")
+        print(mode if mode in ("fn", "media") else "media")
+        break
+else:
+    print("media")
+PY
+}
+
+case ${1:-status} in
+classes)
+	# a one-off KWin script prints them to the journal of the session
+	js=$(mktemp --suffix=.js)
+	trap 'rm -f "$js"' EXIT
+	echo 'for (const w of workspace.windowList()) if (w.normalWindow) print("MBPCLASS " + w.resourceClass + "  (" + w.caption + ")");' > "$js"
+	since=$(date '+%Y-%m-%d %H:%M:%S')
+	id=$(dbus-send --session --print-reply --dest=org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript \
+		string:"$js" string:mbp-classes | awk '/int32/{print $2}')
+	dbus-send --session --type=method_call --dest=org.kde.KWin "/Scripting/Script$id" org.kde.kwin.Script.run
+	sleep 0.5
+	dbus-send --session --type=method_call --dest=org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript string:mbp-classes
+	journalctl --user --since "$since" --no-pager -o cat | grep -o 'MBPCLASS .*' | sed 's/^MBPCLASS //' | sort -u
+	;;
+which)
+	shift
+	[[ $# -gt 0 ]] || { echo "which <class>..." >&2; exit 2; }
+	TINY_DFR_WHICH_SET=$(IFS=,; echo "$*") /usr/bin/tiny-dfr
+	;;
+app)
+	cls=${2:-none}
+	if [[ -w $L ]]; then
+		t=$(mktemp "$L/.app.XXXXXX")
+		echo "$cls" > "$t" && chmod 0644 "$t" && mv -f "$t" "$L/app"
+	fi
+	exec "$0" mode "$(fn_or_media "$cls")"
+	;;
+mode)
+	case ${2:-} in fn) want=1 ;; media) want=2 ;; *) echo "mode fn|media" >&2; exit 2 ;; esac
+	# tiny-dfr may start later: keep the file current whenever it can be written
+	if [[ -w $L ]]; then
+		t=$(mktemp "$L/.layer.XXXXXX")
+		echo "$2" > "$t" && chmod 0644 "$t" && mv -f "$t" "$L/layer"
+	fi
+	[[ -n $M ]] || exit 0
+	cur=$(<"$M")
+	# 0 = Esc only (set by hand), 3 = off (lid closed, sleep): not ours to change
+	[[ $cur == 1 || $cur == 2 ]] || exit 0
+	[[ $cur == "$want" ]] || echo "$want" > "$M"
+	;;
+status)
+	[[ -r $L/layer ]] && echo "tiny-dfr:   $(<"$L/layer")   $L/layer"
+	[[ -r $L/app ]] && echo "program:    $(<"$L/app")   $L/app"
+	[[ -n $M ]] || { echo "no Touch Bar mode (hid-appletb-kbd not bound)"; exit 0; }
+	names=(esc-only fn media off)
+	cur=$(<"$M")
+	echo "mode:       $cur (${names[$cur]:-?})   $M"
+	echo "brightness: $(cat /sys/class/backlight/appletb_backlight/brightness 2>/dev/null)/2 (0 off, 1 dim, 2 on)"
+	for k in fntoggle autodim dim_timeout idle_timeout; do printf '%-12s%s\n' "$k:" "$(<"$P/$k")"; done
+	ls -l "$M" | awk '{print "access:     " $1, $3, $4}'
+	echo "lid:        $(awk '{print $2}' /proc/acpi/button/lid/*/state 2>/dev/null)"
+	;;
+*) echo "usage: mbp-touchbar app <class> | mode fn|media | classes | which <class>... | status" >&2; exit 2 ;;
+esac

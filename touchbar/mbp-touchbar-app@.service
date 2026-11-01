@@ -1,0 +1,6 @@
+[Unit]
+Description=Touch Bar: keys for the active program (%i)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mbp-touchbar app %i

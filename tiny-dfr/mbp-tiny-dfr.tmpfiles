@@ -1,0 +1,7 @@
+# /run/tiny-dfr/layer: base Touch Bar layer for tiny-dfr, written by
+# mbp-touchbar (user session, group wheel), read by tiny-dfr (nobody)
+d /run/tiny-dfr 0775 root wheel -
+# sliders: mbp-touchbar-bridge (the desktop user) makes the FIFO and the state
+# file here; setgid video so that tiny-dfr (nobody, group video) can use them.
+# install.sh puts the user in place of @OWNER@.
+d /run/tiny-dfr/bridge 2750 @OWNER@ video -

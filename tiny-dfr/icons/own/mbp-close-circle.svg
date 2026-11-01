@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="44" height="44" viewBox="0 0 44 44">
+  <!-- round close button (MacBookPro13,2 tiny-dfr config, own drawing) -->
+  <circle cx="22" cy="22" r="22" fill="#b3b3b3"/>
+  <path d="M14.5 14.5 29.5 29.5M29.5 14.5 14.5 29.5" stroke="#000" stroke-width="3.5" stroke-linecap="round"/>
+</svg>

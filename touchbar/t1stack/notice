@@ -1,0 +1,15 @@
+#!/bin/bash
+# User side of the Touch Bar notices (mbp-t1-notice.service, at login): what
+# happened during this boot before the session (/run/mbp-t1/notice), and a
+# reminder while the stay-cfg1 marker is there.
+N=/run/mbp-t1/notice
+MARK=/var/lib/mbp-t1/stay-cfg1
+if [[ -r $N ]]; then
+	while IFS=$'\t' read -r title body; do
+		notify-send -u critical -a "Touch Bar" -i input-keyboard "$title" "$body"
+	done < "$N"
+elif [[ -e $MARK ]]; then
+	notify-send -a "Touch Bar" -i input-keyboard "Touch Bar: configuration 1 (marker)" \
+		"The Mac stays in configuration 1 because of the marker $MARK ($(cut -c1-120 "$MARK" 2>/dev/null)). To use configuration 2 again: sudo rm $MARK and reboot."
+fi
+exit 0

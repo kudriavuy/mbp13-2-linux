@@ -1,0 +1,210 @@
+From 286b1e921e5eecc9849a46f769d829761561b5da Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 16:41:33 +0100
+Subject: [PATCH] Panels: an AppSets entry opened over the program's keys
+
+Command = "Open" with Open = "<AppSets entry>" shows that set as a panel
+in place of the collapsed row: a close key first (PanelCloseIcon, else a
+boxed cross; Command = "Close"), the set, the Control Strip as it was. A
+second tap on the key, the close key, expanding the strip or another
+program closes it, and so does a used key of the panel (one with keys to
+send). Fn still shows the F-keys over it.
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ src/config.rs | 54 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/main.rs   | 24 ++++++++++++++++++++++-
+ 2 files changed, 77 insertions(+), 1 deletion(-)
+
+diff --git a/src/config.rs b/src/config.rs
+index d051928..19daeb1 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -60,6 +60,10 @@ pub struct Config {
+     // the emoji panel: its font, and programs that paste with Ctrl+Shift+V
+     pub emoji_font: String,
+     pub emoji_paste_shift: Vec<String>,
++    // keys with Command = "Open": (row, key) -> the row of that panel
++    pub opens: HashMap<(usize, usize), usize>,
++    // the rows that are panels (opened by such a key)
++    pub panel_rows: Vec<usize>,
+ }
+ 
+ /// Icons that follow the session (Live = ...)
+@@ -174,6 +178,12 @@ pub enum Command {
+     Dnd,
+     /// open the emoji panel
+     Emoji,
++    /// show the [AppSets] entry named by Open as a panel over the program's
++    /// keys (a close key first, the Control Strip stays); using one of its
++    /// keys closes it
++    Open,
++    /// close the panel (its first key)
++    Close,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -225,6 +235,7 @@ struct ConfigProxy {
+     lock_screen_wake_key: Option<Key>,
+     emoji_font: Option<String>,
+     emoji_paste_shift: Option<Vec<String>>,
++    panel_close_icon: Option<String>,
+ }
+ 
+ fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<Key>, D::Error>
+@@ -280,6 +291,8 @@ pub struct ButtonConfig {
+     pub slider: Option<SlideKind>,
+     /// a Battery key only below this charge (%) or while charging
+     pub show_below: Option<u32>,
++    /// Command = "Open": the [AppSets] entry it shows
++    pub open: Option<String>,
+     // filled in from VolumeIcons / MicIcons for a Live button
+     #[serde(skip)]
+     pub live_icons: Vec<String>,
+@@ -374,6 +387,7 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+         base.lock_screen_wake_key = user.lock_screen_wake_key.or(base.lock_screen_wake_key);
+         base.emoji_font = user.emoji_font.or(base.emoji_font);
+         base.emoji_paste_shift = user.emoji_paste_shift.or(base.emoji_paste_shift);
++        base.panel_close_icon = user.panel_close_icon.or(base.panel_close_icon);
+     };
+     let media_layer_keys = base.media_layer_keys.unwrap();
+     let primary_layer_keys = base.primary_layer_keys.unwrap();
+@@ -422,6 +436,35 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+             }
+         }
+     }
++    // panels: an [AppSets] entry opened by a key with Command = "Open", as
++    // a collapsed row with a close key first
++    let mut panel_of = HashMap::new();
++    let wanted: Vec<String> = rows.iter().flatten().filter(|b| b.command == Some(Command::Open)).filter_map(|b| b.open.clone()).collect();
++    for name in wanted {
++        if panel_of.contains_key(&name) {
++            continue;
++        }
++        let Some(keys) = all_sets.get(&name) else {
++            eprintln!("Open = \"{name}\" is not an AppSets entry; the key does nothing");
++            continue;
++        };
++        let close = ButtonConfig {
++            icon: base.panel_close_icon.clone(),
++            text: base.panel_close_icon.is_none().then(|| "\u{2715}".into()),
++            command: Some(Command::Close),
++            background: Some(base.panel_close_icon.is_none()),
++            width: Some(72),
++            ..Default::default()
++        };
++        let mut panel = vec![close];
++        panel.extend(keys.iter().cloned());
++        if let Some(second) = panel.get_mut(1) {
++            second.group.get_or_insert(true);
++        }
++        panel_of.insert(name, rows.len());
++        rows.push(collapsed(panel));
++    }
++    let panel_rows: Vec<usize> = panel_of.values().copied().collect();
+     // while the screen is locked: Esc and LockScreenKeys (none by default)
+     let lock_row = rows.len();
+     rows.push(base.lock_screen_keys.clone().unwrap_or_default());
+@@ -448,6 +491,15 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+             );
+         }
+     }
++    // which panel each Open key shows (Esc is in place now)
++    let mut opens = HashMap::new();
++    for (r, row) in rows.iter().enumerate() {
++        for (i, b) in row.iter().enumerate() {
++            if let (Some(Command::Open), Some(&p)) = (b.command, b.open.as_ref().and_then(|n| panel_of.get(n))) {
++                opens.insert((r, i), p);
++            }
++        }
++    }
+     // Live buttons: their icon set (a wrong number of icons: not live)
+     for row in &mut rows {
+         for b in row.iter_mut() {
+@@ -518,6 +570,8 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+         lock_wake_key: base.lock_screen_wake_key,
+         emoji_font: base.emoji_font.clone().unwrap_or_else(|| "Noto Color Emoji".into()),
+         emoji_paste_shift: base.emoji_paste_shift.clone().unwrap_or_default(),
++        opens,
++        panel_rows,
+     };
+     crate::anim::set_enabled(cfg.animations);
+     (cfg, layers)
+diff --git a/src/main.rs b/src/main.rs
+index 67f90c9..d006615 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1226,7 +1226,7 @@ fn render_preview(path: &std::ffi::OsStr) {
+         (ROW_FKEYS, None, None),
+     ];
+     // one row per program key set, the F-key label rows, the lock row
+-    let mut sets: Vec<_> = cfg.app_sets.values().chain(cfg.fn_rows.values()).copied().collect();
++    let mut sets: Vec<_> = cfg.app_sets.values().chain(cfg.fn_rows.values()).chain(cfg.panel_rows.iter()).copied().collect();
+     sets.push(cfg.lock_row);
+     sets.sort();
+     for r in sets {
+@@ -1736,6 +1736,8 @@ fn real_main(drm: &mut DrmBackend) {
+         }
+     };
+     let mut active_layer = row(base_is_media, fn_held, expanded, collapsed_row, fn_row);
++    // a panel shown instead of the row (Command = "Open"); Fn still shows F-keys
++    let mut panel_row: Option<usize> = None;
+     let mut slider: Option<Slider> = None;
+     let mut slider_dirty = false;
+     // the now-playing panel, and whether its capsule needs drawing
+@@ -1853,6 +1855,7 @@ fn real_main(drm: &mut DrmBackend) {
+             check_layer = true;
+             media = None;
+             emoji = None;
++            panel_row = None;
+             fingerprint = touchid_icon(&cfg);
+             bell = named_icon(cfg.notification_icon.as_ref());
+             session = state_watch.read();
+@@ -1888,6 +1891,7 @@ fn real_main(drm: &mut DrmBackend) {
+                     layers[layer].buttons[btn].1.set_active(&mut uinput, false);
+                 }
+                 base_is_media = want_media;
++                panel_row = None;
+                 collapsed_row = want_row;
+                 fn_row = want_fn_row;
+                 // each program starts with its own strip state
+@@ -1976,6 +1980,8 @@ fn real_main(drm: &mut DrmBackend) {
+                 needs_complete_redraw = true;
+             }
+             cfg.lock_row
++        } else if let (Some(p), false) = (panel_row, fn_held) {
++            p
+         } else {
+             row(base_is_media, fn_held, expanded, collapsed_row, fn_row)
+         };
+@@ -2690,11 +2696,27 @@ fn real_main(drm: &mut DrmBackend) {
+                             }
+                             // a command runs on release, while the finger is still on it
+                             let command = button.command.filter(|_| button.active);
++                            // a panel's key did its work: the panel closes
++                            if button.active && command.is_none() && !button.action.is_empty() && cfg.panel_rows.contains(&layer) {
++                                panel_row = None;
++                            }
+                             button.set_active(&mut uinput, false);
+                             match command {
+                                 Some(Command::Expand) => {
+                                     expanded = true;
+                                     strip_animate = true;
++                                    panel_row = None;
++                                }
++                                Some(Command::Open) => {
++                                    // a second tap closes it
++                                    let p = cfg.opens.get(&(layer, btn)).copied();
++                                    panel_row = if panel_row == p { None } else { p };
++                                    media = None;
++                                    emoji = None;
++                                    slider = None;
++                                }
++                                Some(Command::Close) => {
++                                    panel_row = None;
+                                 }
+                                 Some(Command::Collapse) => {
+                                     expanded = false;
+-- 
+2.53.0
+

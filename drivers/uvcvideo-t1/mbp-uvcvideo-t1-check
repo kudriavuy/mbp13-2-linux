@@ -1,0 +1,14 @@
+#!/bin/bash
+# Called by 92-mbp-uvcvideo-t1-check.hook after a kernel update (after the
+# DKMS hook): warn for every kernel without uvcvideo-t1. Always exits 0.
+for b in /usr/lib/modules/*/build; do
+	k=$(basename "$(dirname "$b")")
+	if dkms status uvcvideo-t1 -k "$k" 2>/dev/null | grep -q installed; then
+		echo "uvcvideo-t1: $k OK"
+	else
+		echo "WARNING: uvcvideo-t1 is not installed for $k: the camera stays on the stock uvcvideo"
+		echo "    (no H.264 camera in T1 configuration 2). Rebuild later, with network:"
+		echo "    sudo dkms install uvcvideo-t1/0.1 -k $k"
+	fi
+done
+exit 0

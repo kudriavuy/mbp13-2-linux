@@ -1,0 +1,685 @@
+From 78666e0b1d4c28bf3649642b5fb8640c68a1a254 Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:04:01 +0100
+Subject: [PATCH 10/11] Live icons, sliders on keys, keyboard light slider,
+ quieter pixel shift
+
+Live = "Volume" / "Mic" makes a button's icon follow the session: the
+helper's files /run/tiny-dfr/bridge/volume and .../mic (inotify) choose
+one of VolumeIcons (muted, 0, up to half, more) or MicIcons (muted, on).
+
+Slider = "Volume" / "Brightness" / "Keyboard" on a key with an Action:
+held and slid it opens that slider (from where the value is, back to the
+keys on release); tapped it sends its key on release instead of on touch,
+so that a slide never sends it. Command = "KeyboardSlider" and the
+keyboard-light slider: value from the kbd_backlight LED, "keyboard <v>" to
+the helper, IllumUp/IllumDown without it. A slider whose button has no
+room for the capsule on its left opens on its right.
+
+Pixel shift no longer moves while the Touch Bar backlight is off (nothing
+to protect, no frames), and PixelShiftSmooth = false moves one whole pixel
+every 10 s instead of a 4 s sub-pixel animation of 20 full frames.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ share/tiny-dfr/config.toml |  12 +++
+ src/config.rs              |  49 +++++++++++
+ src/main.rs                | 161 +++++++++++++++++++++++++++++++++----
+ src/pixel_shift.rs         |  11 ++-
+ src/slider.rs              |  40 +++++++--
+ src/state.rs               |  47 +++++++++++
+ 6 files changed, 300 insertions(+), 20 deletions(-)
+ create mode 100644 src/state.rs
+
+diff --git a/share/tiny-dfr/config.toml b/share/tiny-dfr/config.toml
+index bed9a91..8ae92ce 100644
+--- a/share/tiny-dfr/config.toml
++++ b/share/tiny-dfr/config.toml
+@@ -76,6 +76,18 @@ FontTemplate = ":bold"
+ #                      # ends any animation.
+ # SeparatorColor = "#2c2c2c"
+ 
++# Icons that follow the session (from the helper's files in /run/tiny-dfr/bridge):
++# Live = "Volume" on a button shows one of VolumeIcons (muted, 0, up to half,
++# more), Live = "Mic" one of MicIcons (muted, on).
++# VolumeIcons = ["volume_off", "volume_down", "volume_down", "volume_up"]
++# MicIcons = ["mic_off", "mic_off"]
++# Slider = "Volume" / "Brightness" / "Keyboard" on a key with an Action: a tap
++# sends the key (on release), holding it and sliding opens that slider.
++# Command = "KeyboardSlider": like VolumeSlider, for the keyboard light.
++# PixelShiftSmooth = true   # false: one whole pixel every 10 s instead of a
++#                           # 4 s animation (fewer frames); no shifting at all
++#                           # while the bar is dark
++
+ # Key sets per program: a helper writes the active window's class to
+ # /run/tiny-dfr/app; the first [[Apps]] rule whose Match fits (case does not
+ # matter, a trailing * matches the start) chooses Set = "fn" (F1-F12), "strip"
+diff --git a/src/config.rs b/src/config.rs
+index fba354f..94deff7 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -42,6 +42,24 @@ pub struct Config {
+     // key sets per program: rules in order, set name -> row
+     pub apps: Vec<AppRule>,
+     pub app_sets: HashMap<String, usize>,
++    pub pixel_shift_smooth: bool,
++}
++
++/// Icons that follow the session (Live = ...)
++#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash)]
++pub enum Live {
++    /// VolumeIcons: muted, 0, up to half, more
++    Volume,
++    /// MicIcons: muted, on
++    Mic,
++}
++
++/// Which slider a key opens when held and slid (Slider = ...)
++#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
++pub enum SlideKind {
++    Volume,
++    Brightness,
++    Keyboard,
+ }
+ 
+ /// [[Apps]]: windows whose class matches one of Match (case does not matter,
+@@ -96,6 +114,8 @@ pub enum Command {
+     VolumeSlider,
+     /// the same for the screen brightness
+     BrightnessSlider,
++    /// the same for the keyboard light
++    KeyboardSlider,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -131,6 +151,9 @@ struct ConfigProxy {
+     animations: Option<bool>,
+     app_sets: Option<HashMap<String, Vec<ButtonConfig>>>,
+     apps: Option<Vec<AppRule>>,
++    pixel_shift_smooth: Option<bool>,
++    volume_icons: Option<Vec<String>>,
++    mic_icons: Option<Vec<String>>,
+ }
+ 
+ fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<Key>, D::Error>
+@@ -182,6 +205,11 @@ pub struct ButtonConfig {
+     pub background: Option<bool>,
+     pub slider_icon_low: Option<String>,
+     pub slider_icon_high: Option<String>,
++    pub live: Option<Live>,
++    pub slider: Option<SlideKind>,
++    // filled in from VolumeIcons / MicIcons for a Live button
++    #[serde(skip)]
++    pub live_icons: Vec<String>,
+ }
+ 
+ // "#rrggbb" -> (r, g, b) in 0..1; a bad value keeps the default
+@@ -257,6 +285,9 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+         base.animations = user.animations.or(base.animations);
+         base.app_sets = user.app_sets.or(base.app_sets);
+         base.apps = user.apps.or(base.apps);
++        base.pixel_shift_smooth = user.pixel_shift_smooth.or(base.pixel_shift_smooth);
++        base.volume_icons = user.volume_icons.or(base.volume_icons);
++        base.mic_icons = user.mic_icons.or(base.mic_icons);
+     };
+     let media_layer_keys = base.media_layer_keys.unwrap();
+     let primary_layer_keys = base.primary_layer_keys.unwrap();
+@@ -313,6 +344,23 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+             );
+         }
+     }
++    // Live buttons: their icon set (a wrong number of icons: not live)
++    for row in &mut rows {
++        for b in row.iter_mut() {
++            let (list, n, key) = match b.live {
++                Some(Live::Volume) => (&base.volume_icons, 4, "VolumeIcons"),
++                Some(Live::Mic) => (&base.mic_icons, 2, "MicIcons"),
++                None => continue,
++            };
++            match list {
++                Some(l) if l.len() == n => b.live_icons = l.clone(),
++                _ => {
++                    eprintln!("Live = {:?} needs {key} with {n} icons; the key stays as it is", b.live.unwrap());
++                    b.live = None;
++                }
++            }
++        }
++    }
+     // the defaults are the upstream look
+     let icon_size = base.icon_size.unwrap_or(DEFAULT_ICON_SIZE);
+     // rows 0..2 have fixed places (ROW_* in main), the sets follow
+@@ -351,6 +399,7 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+         animations: base.animations.unwrap_or(false),
+         apps,
+         app_sets,
++        pixel_shift_smooth: base.pixel_shift_smooth.unwrap_or(true),
+     };
+     crate::anim::set_enabled(cfg.animations);
+     (cfg, layers)
+diff --git a/src/main.rs b/src/main.rs
+index 14dc1d9..91fb33a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -51,10 +51,11 @@ mod fonts;
+ mod layer_switch;
+ mod pixel_shift;
+ mod slider;
++mod state;
+ 
+ use crate::config::ConfigManager;
+ use backlight::BacklightManager;
+-use config::{AppSet, ButtonConfig, Command, Config};
++use config::{AppSet, ButtonConfig, Command, Config, Live, SlideKind};
+ use display::DrmBackend;
+ use layer_switch::LayerSwitch;
+ use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
+@@ -74,6 +75,7 @@ enum BatteryState {
+     Low,
+ }
+ 
++#[derive(Clone)]
+ struct BatteryImages {
+     plain: Vec<Handle>,
+     charging: Vec<Handle>,
+@@ -96,6 +98,7 @@ impl BatteryIconMode {
+     }
+ }
+ 
++#[derive(Clone)]
+ enum ButtonImage {
+     Text(String),
+     Svg(Handle),
+@@ -125,6 +128,10 @@ struct Button {
+     slider_icons: Option<Box<(Button, Button)>>,
+     // animations: the highlight was this high when it started to change
+     fade: Option<(Instant, f64)>,
++    // Live: its images (VolumeIcons / MicIcons) and the one shown
++    live: Option<(Live, Vec<ButtonImage>, usize)>,
++    // Slider: held and slid it opens this slider; its key goes out on release
++    slide: Option<SlideKind>,
+ }
+ 
+ fn try_load_svg(path: &str) -> Result<ButtonImage> {
+@@ -286,7 +293,28 @@ impl Button {
+             ))),
+             _ => None,
+         };
++        let live = cfg.live.map(|kind| {
++            let (w, h) = (cfg.icon_width.unwrap_or(icon_size), cfg.icon_height.unwrap_or(icon_size));
++            let images: Vec<ButtonImage> = cfg
++                .live_icons
++                .iter()
++                .map(|name| try_load_image(name, cfg.theme.as_ref(), w, h).expect("failed to load icon"))
++                .collect();
++            // until the helper says otherwise: on / loudest
++            let shown = images.len() - 1;
++            (kind, images, shown)
++        });
++        let slide = cfg.slider;
+         let mut button = Button::from_image_config(cfg, icon_size);
++        if let Some((_, images, shown)) = &live {
++            button.image = images[*shown].clone();
++            if let (ButtonImage::Svg(_), true) = (&button.image, button.icon_width == 0.0) {
++                button.icon_width = icon_size as f64;
++                button.icon_height = icon_size as f64;
++            }
++        }
++        button.live = live;
++        button.slide = slide;
+         button.fixed_width = fixed_width;
+         button.group = group;
+         button.command = command;
+@@ -333,6 +361,8 @@ impl Button {
+             background: true,
+             slider_icons: None,
+             fade: None,
++            live: None,
++            slide: None,
+         }
+     }
+     fn new_text(text: String, action: Vec<Key>) -> Button {
+@@ -350,6 +380,8 @@ impl Button {
+             background: true,
+             slider_icons: None,
+             fade: None,
++            live: None,
++            slide: None,
+         }
+     }
+     fn new_icon(
+@@ -375,6 +407,8 @@ impl Button {
+             background: true,
+             slider_icons: None,
+             fade: None,
++            live: None,
++            slide: None,
+         }
+     }
+     fn load_battery_image(icon: &str, theme: Option<impl AsRef<str>>) -> Handle {
+@@ -435,6 +469,8 @@ impl Button {
+             background: true,
+             slider_icons: None,
+             fade: None,
++            live: None,
++            slide: None,
+         }
+     }
+ 
+@@ -469,6 +505,8 @@ impl Button {
+             background: true,
+             slider_icons: None,
+             fade: None,
++            live: None,
++            slide: None,
+         }
+     }
+     fn needs_faster_refresh(&self) -> bool {
+@@ -608,6 +646,39 @@ impl Button {
+             toggle_keys(uinput, &self.action, active as i32);
+         }
+     }
++    /// Pressed look without the key (a key with Slider sends it on release)
++    fn set_highlight(&mut self, active: bool) {
++        if self.active != active {
++            if anim::enabled() {
++                self.fade = Some((Instant::now(), self.highlight()));
++            }
++            self.active = active;
++            self.changed = true;
++        }
++    }
++    /// Show the image of a Live button for this state
++    fn follow(&mut self, st: &state::State) {
++        let Some((kind, images, shown)) = &mut self.live else { return };
++        let want = match kind {
++            Live::Volume => match st.volume {
++                Some((_, true)) => 0,
++                Some((v, false)) if v <= 0.0 => 1,
++                Some((v, false)) if v <= 0.5 => 2,
++                Some(_) => 3,
++                None => return,
++            },
++            Live::Mic => match st.mic_muted {
++                Some(true) => 0,
++                Some(false) => 1,
++                None => return,
++            },
++        };
++        if want != *shown && want < images.len() {
++            *shown = want;
++            self.image = images[want].clone();
++            self.changed = true;
++        }
++    }
+     /// 0 released .. 1 pressed, on the way while it fades
+     fn highlight(&self) -> f64 {
+         let target = if self.active { 1.0 } else { 0.0 };
+@@ -1189,7 +1260,7 @@ fn pixel_shift_width(cfg: &Config) -> f64 {
+ /// The slider opened by button `btn` of `layer`
+ fn slider_layout(cfg: &Config, layer: &FunctionLayer, width: u16, btn: usize) -> SliderLayout {
+     let avail = width as f64 - pixel_shift_width(cfg);
+-    SliderLayout::new(cfg, layer.geometry(cfg, avail)[btn])
++    SliderLayout::new(cfg, layer.geometry(cfg, avail)[btn], avail)
+ }
+ 
+ /// Low and high icon of the slider opened by `button`
+@@ -1204,10 +1275,19 @@ fn slider_kind(command: Option<Command>) -> Option<SliderKind> {
+     match command {
+         Some(Command::VolumeSlider) => Some(SliderKind::Volume),
+         Some(Command::BrightnessSlider) => Some(SliderKind::Brightness),
++        Some(Command::KeyboardSlider) => Some(SliderKind::Keyboard),
+         _ => None,
+     }
+ }
+ 
++fn slide_kind(slide: SlideKind) -> SliderKind {
++    match slide {
++        SlideKind::Volume => SliderKind::Volume,
++        SlideKind::Brightness => SliderKind::Brightness,
++        SlideKind::Keyboard => SliderKind::Keyboard,
++    }
++}
++
+ /// Pass the slider's value on: to the helper, or as keys without it
+ fn apply_slider<F: AsRawFd>(s: &mut Slider, uinput: &mut UInputHandle<F>, force: bool) {
+     if s.send(force).is_err() {
+@@ -1217,6 +1297,8 @@ fn apply_slider<F: AsRawFd>(s: &mut Slider, uinput: &mut UInputHandle<F>, force:
+             (SliderKind::Volume, false) => Key::VolumeDown,
+             (SliderKind::Brightness, true) => Key::BrightnessUp,
+             (SliderKind::Brightness, false) => Key::BrightnessDown,
++            (SliderKind::Keyboard, true) => Key::IllumUp,
++            (SliderKind::Keyboard, false) => Key::IllumDown,
+         };
+         for _ in 0..steps.abs() {
+             toggle_keys(uinput, &vec![key], 1);
+@@ -1233,6 +1315,13 @@ fn real_main(drm: &mut DrmBackend) {
+     let mut cfg_mgr = ConfigManager::new();
+     let (mut cfg, mut layers) = cfg_mgr.load_config(width);
+     let layer_switch = LayerSwitch::new();
++    let state_watch = state::StateWatch::new();
++    let mut session = state_watch.read();
++    for layer in layers.iter_mut() {
++        for (_, b) in &mut layer.buttons {
++            b.follow(&session);
++        }
++    }
+     let mut base_is_media = cfg.media_layer_default;
+     let mut check_layer = true;
+     let mut pixel_shift = PixelShiftManager::new();
+@@ -1273,8 +1362,9 @@ fn real_main(drm: &mut DrmBackend) {
+     let mut slider_backdrop: Option<ImageSurface> = None;
+     let mut transition: Option<anim::RowTransition> = None;
+     let mut strip_animate = false;
+-    // a slider button held but not slid yet: (touch slot, x at touch, kind)
+-    let mut pending: Option<(u32, f64, SliderKind)> = None;
++    // a slider button held but not slid yet: (touch slot, x at touch, kind,
++    // key deferred to the release: a key with Slider)
++    let mut pending: Option<(u32, f64, SliderKind, bool)> = None;
+     let mut needs_complete_redraw = true;
+ 
+     let mut input_tb = Libinput::new_with_udev(Interface);
+@@ -1303,6 +1393,9 @@ fn real_main(drm: &mut DrmBackend) {
+     epoll
+         .add(layer_switch.fd(), EpollEvent::new(EpollFlags::EPOLLIN, 4))
+         .unwrap();
++    epoll
++        .add(state_watch.fd(), EpollEvent::new(EpollFlags::EPOLLIN, 5))
++        .unwrap();
+     uinput.set_evbit(EventKind::Key).unwrap();
+     for k in Key::iter() {
+         uinput.set_keybit(k).unwrap();
+@@ -1342,6 +1435,12 @@ fn real_main(drm: &mut DrmBackend) {
+             collapsed_row = ROW_STRIP_COLLAPSED;
+             current_app = None;
+             check_layer = true;
++            session = state_watch.read();
++            for layer in layers.iter_mut() {
++                for (_, b) in &mut layer.buttons {
++                    b.follow(&session);
++                }
++            }
+             slider = None;
+             pending = None;
+             transition = None;
+@@ -1373,6 +1472,15 @@ fn real_main(drm: &mut DrmBackend) {
+                 current_app = app;
+             }
+         }
++        // the session changed (volume, mute): icons that follow it
++        if state_watch.changed() {
++            session = state_watch.read();
++            for layer in layers.iter_mut() {
++                for (_, b) in &mut layer.buttons {
++                    b.follow(&session);
++                }
++            }
++        }
+         let wanted_row = row(base_is_media, fn_held, expanded, collapsed_row);
+         if wanted_row != active_layer {
+             active_layer = wanted_row;
+@@ -1442,8 +1550,9 @@ fn real_main(drm: &mut DrmBackend) {
+             }
+         }
+ 
+-        if cfg.enable_pixel_shift {
+-            let (pixel_shift_needs_redraw, pixel_shift_next_timeout_ms) = pixel_shift.update();
++        // nothing to protect while the bar is dark: no frames then
++        if cfg.enable_pixel_shift && backlight.current_bl() > 0 {
++            let (pixel_shift_needs_redraw, pixel_shift_next_timeout_ms) = pixel_shift.update(cfg.pixel_shift_smooth);
+             if pixel_shift_needs_redraw {
+                 needs_complete_redraw = true;
+             }
+@@ -1624,10 +1733,16 @@ fn real_main(drm: &mut DrmBackend) {
+                             if let Some(btn) = hit {
+                                 touches.insert(dn.seat_slot(), (active_layer, btn));
+                                 let button = &mut layers[active_layer].buttons[btn].1;
+-                                if let Some(kind) = slider_kind(button.command) {
+-                                    pending = Some((dn.seat_slot(), x, kind));
++                                if let Some(kind) = button.slide.map(slide_kind) {
++                                    // slid it opens the slider, tapped it sends its key on release
++                                    pending = Some((dn.seat_slot(), x, kind, true));
++                                    button.set_highlight(true);
++                                } else {
++                                    if let Some(kind) = slider_kind(button.command) {
++                                        pending = Some((dn.seat_slot(), x, kind, false));
++                                    }
++                                    button.set_active(&mut uinput, true);
+                                 }
+-                                button.set_active(&mut uinput, true);
+                             }
+                         }
+                         TouchEvent::Motion(mtn) => {
+@@ -1647,11 +1762,15 @@ fn real_main(drm: &mut DrmBackend) {
+                                 }
+                             }
+                             // a held slider button slid sideways: slide its value
+-                            if let Some((slot, x0, kind)) = pending {
++                            if let Some((slot, x0, kind, deferred)) = pending {
+                                 if slot == mtn.seat_slot() && (x - x0).abs() > slider::DRAG_THRESHOLD_PX {
+                                     pending = None;
+                                     let (layer, btn) = touches.remove(&slot).unwrap();
+-                                    layers[layer].buttons[btn].1.set_active(&mut uinput, false);
++                                    if deferred {
++                                        layers[layer].buttons[btn].1.set_highlight(false);
++                                    } else {
++                                        layers[layer].buttons[btn].1.set_active(&mut uinput, false);
++                                    }
+                                     let mut s = Slider::new(kind, SliderMode::Tap { deadline: Instant::now() }, (layer, btn));
+                                     s.mode = SliderMode::Drag { start_x: x0, start_value: s.value };
+                                     s.slot = Some(slot);
+@@ -1671,7 +1790,11 @@ fn real_main(drm: &mut DrmBackend) {
+                             let hit = layers[layer]
+                                 .hit(&cfg, width, height, x, y, Some(btn))
+                                 .is_some();
+-                            layers[layer].buttons[btn].1.set_active(&mut uinput, hit);
++                            if pending.is_some_and(|p| p.0 == mtn.seat_slot() && p.3) {
++                                layers[layer].buttons[btn].1.set_highlight(hit);
++                            } else {
++                                layers[layer].buttons[btn].1.set_active(&mut uinput, hit);
++                            }
+                         }
+                         TouchEvent::Up(up) => {
+                             if let Some(s) = &mut slider {
+@@ -1692,7 +1815,8 @@ fn real_main(drm: &mut DrmBackend) {
+                                     continue;
+                                 }
+                             }
+-                            if pending.is_some_and(|(slot, _, _)| slot == up.seat_slot()) {
++                            let deferred = pending.is_some_and(|p| p.0 == up.seat_slot() && p.3);
++                            if pending.is_some_and(|p| p.0 == up.seat_slot()) {
+                                 pending = None;
+                             }
+                             if !touches.contains_key(&up.seat_slot()) {
+@@ -1700,6 +1824,15 @@ fn real_main(drm: &mut DrmBackend) {
+                             }
+                             let (layer, btn) = touches.remove(&up.seat_slot()).unwrap();
+                             let button = &mut layers[layer].buttons[btn].1;
++                            if deferred {
++                                // a tap on a key with Slider: its key now
++                                if button.active {
++                                    toggle_keys(&mut uinput, &button.action, 1);
++                                    toggle_keys(&mut uinput, &button.action, 0);
++                                }
++                                button.set_highlight(false);
++                                continue;
++                            }
+                             // a command runs on release, while the finger is still on it
+                             let command = button.command.filter(|_| button.active);
+                             button.set_active(&mut uinput, false);
+@@ -1712,7 +1845,7 @@ fn real_main(drm: &mut DrmBackend) {
+                                     expanded = false;
+                                     strip_animate = true;
+                                 }
+-                                Some(Command::VolumeSlider | Command::BrightnessSlider) => {
++                                Some(Command::VolumeSlider | Command::BrightnessSlider | Command::KeyboardSlider) => {
+                                     // a tap: open it for SliderTimeout
+                                     let kind = slider_kind(command).unwrap();
+                                     let deadline = Instant::now() + cfg.slider_timeout;
+diff --git a/src/pixel_shift.rs b/src/pixel_shift.rs
+index 45050bd..95c4acd 100644
+--- a/src/pixel_shift.rs
++++ b/src/pixel_shift.rs
+@@ -59,7 +59,9 @@ impl PixelShiftManager {
+         }
+     }
+ 
+-    pub fn update(&mut self) -> (bool, i32) {
++    /// `smooth` false (PixelShiftSmooth = false): one whole pixel every
++    /// INTERVAL_MS instead of a 4 s sub-pixel animation (20 frames)
++    pub fn update(&mut self, smooth: bool) -> (bool, i32) {
+         let time_now = Instant::now();
+         let since_last_pixel_shift = (time_now - self.last_active).as_millis() as i32;
+ 
+@@ -69,6 +71,13 @@ impl PixelShiftManager {
+         self.last_active = time_now;
+ 
+         match self.state {
++            ShiftState::Normal if !smooth => {
++                self.pixel_progress = (self.direction + self.pixel_progress as i64) as u64;
++                if self.pixel_progress == 0 || self.pixel_progress >= PIXEL_SHIFT_WIDTH_PX {
++                    self.state = ShiftState::WaitingAtEnd;
++                    self.direction = -self.direction;
++                }
++            }
+             ShiftState::Normal => {
+                 self.state = ShiftState::ShiftingSubpixel;
+             }
+diff --git a/src/slider.rs b/src/slider.rs
+index 9499882..08f7305 100644
+--- a/src/slider.rs
++++ b/src/slider.rs
+@@ -43,6 +43,7 @@ const FALLBACK_STEP: f64 = 0.05;
+ pub enum Kind {
+     Volume,
+     Brightness,
++    Keyboard,
+ }
+ 
+ impl Kind {
+@@ -50,6 +51,7 @@ impl Kind {
+         match self {
+             Kind::Volume => "volume",
+             Kind::Brightness => "brightness",
++            Kind::Keyboard => "keyboard",
+         }
+     }
+ }
+@@ -97,10 +99,15 @@ pub struct Slider {
+ }
+ 
+ impl Layout {
+-    /// `button`: left edge and width of the button that opened it
+-    pub fn new(cfg: &Config, button: (f64, f64)) -> Layout {
+-        let right = button.0;
+-        let left = (right - cfg.slider_width).max(0.0);
++    /// `button`: left edge and width of the button that opened it; the
++    /// capsule ends where it starts, or (no room there, enough after it in a
++    /// row `bar` px wide) starts where it ends
++    pub fn new(cfg: &Config, button: (f64, f64), bar: f64) -> Layout {
++        let (left, right) = if button.0 < cfg.slider_width && button.0 + button.1 + cfg.slider_width <= bar {
++            (button.0 + button.1, button.0 + button.1 + cfg.slider_width)
++        } else {
++            ((button.0 - cfg.slider_width).max(0.0), button.0)
++        };
+         let w = right - left;
+         Layout {
+             left,
+@@ -162,6 +169,24 @@ pub fn current_value(kind: Kind) -> Option<f64> {
+             }
+             None
+         }
++        Kind::Keyboard => {
++            for entry in fs::read_dir("/sys/class/leds").ok()?.flatten() {
++                if !entry.file_name().to_string_lossy().contains("kbd_backlight") {
++                    continue;
++                }
++                let read = |attr: &str| {
++                    fs::read_to_string(entry.path().join(attr))
++                        .ok()
++                        .and_then(|s| s.trim().parse::<f64>().ok())
++                };
++                if let (Some(now), Some(max)) = (read("brightness"), read("max_brightness")) {
++                    if max > 0.0 {
++                        return Some((now / max).clamp(0.0, 1.0));
++                    }
++                }
++            }
++            None
++        }
+     }
+ }
+ 
+@@ -261,7 +286,12 @@ impl Slider {
+         // capsule, grown from the button's width while opening
+         let full_width = layout.right - layout.left;
+         let width_now = anim::lerp(layout.close.1.min(full_width), full_width, level);
+-        let left_now = layout.right - width_now;
++        // it grows away from its button
++        let left_now = if layout.left >= layout.close.0 + layout.close.1 {
++            layout.left
++        } else {
++            layout.right - width_now
++        };
+         let (r, g, b) = cfg.button_color;
+         c.set_source_rgb(r, g, b);
+         rounded_rect(c, left_now + sx, top, width_now, button_height, cfg.button_radius);
+diff --git a/src/state.rs b/src/state.rs
+new file mode 100644
+index 0000000..31fc5d3
+--- /dev/null
++++ b/src/state.rs
+@@ -0,0 +1,47 @@
++// What the desktop helper (mbp-touchbar-bridge) reports about the session,
++// for icons that follow it (Live = "Volume" / "Mic"): files in
++// /run/tiny-dfr/bridge, watched with inotify. Missing files: unknown.
++use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
++use std::{fs::read_to_string, os::fd::AsFd};
++
++const DIR: &str = "/run/tiny-dfr/bridge";
++
++#[derive(Default, Clone, PartialEq)]
++pub struct State {
++    /// default sink: volume 0..1 and muted
++    pub volume: Option<(f64, bool)>,
++    /// default source muted
++    pub mic_muted: Option<bool>,
++}
++
++pub struct StateWatch {
++    inotify_fd: Inotify,
++}
++
++impl StateWatch {
++    pub fn new() -> StateWatch {
++        let inotify_fd = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
++        // no directory (no tmpfiles entry): the icons keep their first image
++        let _ = inotify_fd.add_watch(DIR, AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_MOVED_TO);
++        StateWatch { inotify_fd }
++    }
++    /// whether a file changed since the last call
++    pub fn changed(&self) -> bool {
++        self.inotify_fd.read_events().is_ok_and(|evts| !evts.is_empty())
++    }
++    pub fn read(&self) -> State {
++        let volume = read_to_string(format!("{DIR}/volume")).ok().and_then(|s| {
++            let mut w = s.split_whitespace();
++            let v = w.next()?.parse::<f64>().ok()?;
++            let muted = w.next().is_some_and(|m| m == "1");
++            Some((v.clamp(0.0, 1.0), muted))
++        });
++        let mic_muted = read_to_string(format!("{DIR}/mic"))
++            .ok()
++            .map(|s| s.trim() == "1");
++        State { volume, mic_muted }
++    }
++    pub fn fd(&self) -> &impl AsFd {
++        &self.inotify_fd
++    }
++}
+-- 
+2.53.0
+

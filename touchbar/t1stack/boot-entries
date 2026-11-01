@@ -1,0 +1,51 @@
+#!/bin/bash
+# boot-entries [check]: for every systemd-boot entry arch*.conf without
+# mbp.t1=1, write <name>-t1cfg1.conf: the same kernel, initrds and options
+# plus mbp.t1=1, so the menu can start the Mac with the T1 in configuration 1
+# (editor stays off in loader.conf). Regenerated from the base entries after
+# kernel and systemd-boot updates (pacman hook 93-mbp-t1-boot-entries), then
+# checked: every file an entry names exists on the ESP and bootctl lists it.
+#   boot-entries          write and check (root)
+#   boot-entries check    only check
+#   boot-entries remove   delete the -t1cfg1 entries
+set -uo pipefail
+E=/boot/loader/entries
+fail=0
+case ${1:-write} in
+remove)
+	rm -fv "$E"/*-t1cfg1.conf
+	exit 0 ;;
+write)
+	for b in "$E"/arch*.conf; do
+		[[ $b == *-t1cfg1.conf ]] && continue
+		grep -q "mbp.t1=1" "$b" && continue
+		n=$(basename "$b" .conf)
+		awk '
+			/^title/ { sub(/[ \t]*$/, ""); print $0 ", Touch Bar config 1"; next }
+			/^sort-key/ { print $0 "-t1cfg1"; next }
+			/^options/ { print $0 " mbp.t1=1"; opt = 1; next }
+			{ print }
+			END { if (!opt) print "options mbp.t1=1" }
+		' "$b" > "$E/.$n-t1cfg1.tmp" && mv -f "$E/.$n-t1cfg1.tmp" "$E/$n-t1cfg1.conf"
+	done ;;
+check) ;;
+*) echo "usage: $0 [check|remove]"; exit 2 ;;
+esac
+n=0
+for f in "$E"/*-t1cfg1.conf; do
+	[[ -e $f ]] || continue
+	n=$((n + 1))
+	b="$E/$(basename "$f" -t1cfg1.conf).conf"
+	[[ -e $b ]] || { echo "boot-entries: $(basename "$f"): base entry $(basename "$b") is gone"; fail=1; }
+	for p in $(awk '$1 == "linux" || $1 == "initrd" {print $2}' "$f"); do
+		[[ -e /boot/$p ]] || { echo "boot-entries: $(basename "$f"): /boot$p missing"; fail=1; }
+	done
+	grep -q "^options.*mbp.t1=1" "$f" || { echo "boot-entries: $(basename "$f"): no mbp.t1=1"; fail=1; }
+	# the same kernel options as the base entry, apart from mbp.t1=1
+	[[ $(grep "^options" "$f" | sed 's/ mbp.t1=1//') == "$(grep "^options" "$b" 2>/dev/null)" ]] ||
+		{ echo "boot-entries: $(basename "$f"): options differ from $(basename "$b"): rerun boot-entries"; fail=1; }
+	[[ $(bootctl --no-pager list 2>/dev/null) == *"$(basename "$f")"* ]] || { echo "boot-entries: bootctl does not list $(basename "$f")"; fail=1; }
+done
+((n)) || { echo "boot-entries: no -t1cfg1 entries"; fail=1; }
+((fail)) && echo "boot-entries: WARNING: the 'Touch Bar config 1' menu entries need a look (see above)" || echo "boot-entries: $n 'Touch Bar config 1' entries ok"
+exit 0

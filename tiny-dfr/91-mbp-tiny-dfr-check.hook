@@ -1,0 +1,21 @@
+# After tiny-dfr or one of its libraries changed: check that every library
+# and symbol still resolves (ldd -r: does not start it). Never stops pacman.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = tiny-dfr
+Target = glibc
+Target = gcc-libs
+Target = glib2
+Target = cairo
+Target = librsvg
+Target = libinput
+Target = freetype2
+Target = fontconfig
+Target = systemd-libs
+
+[Action]
+Description = Checking that tiny-dfr still links...
+When = PostTransaction
+Exec = /usr/local/bin/mbp-tiny-dfr-check

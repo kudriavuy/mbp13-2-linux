@@ -1,0 +1,600 @@
+#!/usr/bin/python3
+"""Touch Bar settings (MacBookPro13,2, tiny-dfr with the mbp patches), like
+"Customize Touch Bar" on macOS: pick a row (the quick keys, the Control
+Strip, a program's set, a panel), drag its keys around, drag keys in from
+the list of all keys in the config, drag them out onto the bin; the width
+of a key and a gap before it. "Apply" writes /etc/tiny-dfr/config.toml
+through pkexec (mbp-touchbar-apply; the password is kept a few minutes) and
+tiny-dfr shows it at once. Only the lists that changed are written again
+(their comments inside go); the rest of the file stays as it is.
+    mbp-touchbar-settings            the window
+    mbp-touchbar-settings --selftest [file]  the file handling, no window
+    mbp-touchbar-settings --shot <png> [row]  the window drawn into a PNG
+"""
+import copy
+import json
+import os
+import re
+import subprocess
+import sys
+import tomllib
+
+# other places only for trying it out elsewhere
+CFG = os.environ.get("MBP_TB_CONFIG", "/etc/tiny-dfr/config.toml")
+APPLY = "/usr/local/libexec/mbp-touchbar-apply"
+ICON_DIRS = tuple(os.environ.get("MBP_TB_ICONS", "/etc/tiny-dfr:/usr/share/tiny-dfr").split(":"))
+SCALE = 0.5          # bar pixels -> window pixels
+DEFAULT_WIDTH = 120  # a key without Width (tiny-dfr shares out the room)
+
+# the rows that can be edited, in this order, with what they are
+TOP = [
+    ("AppLayerKeys", "Звичайний рядок", "Кнопки ліворуч від згорнутого Control Strip, коли програма не має свого набору"),
+    ("ControlStripKeys", "Control Strip, згорнутий", "Праворуч на панелі"),
+    ("MediaLayerKeys", "Control Strip, розгорнутий", "Після «<» у згорнутому"),
+    ("LockScreenKeys", "Екран блокування", "Після Esc, поки екран заблоковано"),
+]
+SET_NAMES = {
+    "browser": "Браузер", "files": "Dolphin", "code": "VS Code", "meet": "Google Meet",
+    "youtube": "YouTube", "terminal": "Konsole", "telegram": "Telegram", "calls": "Дзвінки",
+    "screenshot": "Панель скріншотів", "code-fn": "VS Code: підписи F-клавіш",
+    "files-fn": "Dolphin: підписи F-клавіш",
+}
+COMMANDS = {
+    "Expand": "розгорнути Strip", "Collapse": "згорнути Strip", "VolumeSlider": "повзунок гучності",
+    "BrightnessSlider": "повзунок яскравості", "KeyboardSlider": "повзунок підсвітки",
+    "NowPlaying": "зараз грає", "Layout": "розкладка", "Dnd": "не турбувати", "Emoji": "емодзі",
+    "Open": "панель", "Close": "закрити панель", "Tabs": "вкладки браузера",
+}
+KEYS = {"LeftCtrl": "Ctrl", "LeftAlt": "Alt", "LeftShift": "Shift", "LeftMeta": "Meta",
+        "Sysrq": "Print", "Screensaver": "Блокування"}
+# kept when a key is copied into another row; the rest describe its place
+PLACE = ("Group", "Joined")
+
+
+# --- the file ---------------------------------------------------------------
+
+def find_arrays(text):
+    """name -> (start, end) of the [...] of each list of keys: top-level ones
+    and [AppSets] entries (end: one past the closing bracket)."""
+    spans = {}
+    table = ""
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            if re.match(r"^\[\[?[A-Za-z]", stripped) and "=" not in stripped.split("#")[0]:
+                table = stripped.split("#")[0].strip()
+        m = re.match(r"^([A-Za-z][A-Za-z0-9_-]*)\s*=\s*\[", line)
+        if m and table in ("", "[AppSets]"):
+            start = pos + m.end() - 1
+            end = match_bracket(text, start)
+            if end is not None:
+                spans[m.group(1)] = (start, end)
+        pos += len(line)
+    return spans
+
+
+def match_bracket(text, start):
+    """The index after the bracket closing text[start] ('['), past strings and comments."""
+    depth = 0
+    i = start
+    in_str = None
+    while i < len(text):
+        c = text[i]
+        if in_str:
+            if c == "\\" and in_str == '"':
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+        elif c in "\"'":
+            in_str = c
+        elif c == "#":
+            nl = text.find("\n", i)
+            i = len(text) if nl < 0 else nl
+            continue
+        elif c in "[{":
+            depth += 1
+        elif c in "]}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def toml_value(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, list):
+        return "[" + ", ".join(toml_value(x) for x in v) + "]"
+    raise ValueError(f"cannot write {v!r}")
+
+
+def dump_key(key):
+    return "{ " + ", ".join(f"{k} = {toml_value(v)}" for k, v in key.items()) + " }"
+
+
+def dump_array(keys):
+    if not keys:
+        return "[]"
+    return "[\n" + ",\n".join("    " + dump_key(k) for k in keys) + "\n]"
+
+
+def rewrite(text, changed):
+    """text with the lists in `changed` (name -> keys) written anew"""
+    spans = find_arrays(text)
+    for name, (start, end) in sorted(spans.items(), key=lambda kv: -kv[1][0]):
+        if name in changed:
+            text = text[:start] + dump_array(changed[name]) + text[end:]
+    return text
+
+
+def load(text):
+    """The editable rows: [(name, title, note, keys)] and the file's data"""
+    data = tomllib.loads(text)
+    spans = find_arrays(text)
+    rows = []
+    for name, title, note in TOP:
+        if name in data and name in spans:
+            rows.append((name, title, note, data[name]))
+    for name, keys in data.get("AppSets", {}).items():
+        if name in spans:
+            note = "Набір програми (зліва від згорнутого Control Strip)"
+            if name.endswith("-fn"):
+                note = "Увесь рядок, поки затиснуто Fn"
+            elif any(k.get("Open") == name for r in rows for k in r[3]) or name == "screenshot":
+                note = "Панель (відкривається кнопкою, × закриває)"
+            rows.append((name, SET_NAMES.get(name, name), note, keys))
+    return rows, data
+
+
+def describe(key):
+    """What a key does, in words"""
+    if "Command" in key:
+        what = COMMANDS.get(key["Command"], key["Command"])
+        if key["Command"] == "Open":
+            what += f" «{SET_NAMES.get(key.get('Open', ''), key.get('Open', ''))}»"
+        return what
+    if "Time" in key:
+        return "годинник"
+    if "Battery" in key:
+        return "батарея"
+    act = key.get("Action", [])
+    if isinstance(act, str):
+        act = [act]
+    return "+".join(KEYS.get(a, a.removeprefix("Num")) for a in act) or "—"
+
+
+# what makes two keys the same one in the list of all keys
+SAME = ("Icon", "Text", "Time", "Battery", "Command", "Open", "Action", "Live", "Slider")
+
+
+def palette(rows):
+    """Every different key of the config (its place, sizes aside); the
+    F-key labels only in their own rows"""
+    seen = {}
+    for name, _, _, keys in rows:
+        if name.endswith("-fn"):
+            continue
+        for k in keys:
+            bare = {a: b for a, b in k.items() if a not in PLACE}
+            sig = json.dumps({a: bare.get(a) for a in SAME}, sort_keys=True, ensure_ascii=False)
+            seen.setdefault(sig, bare)
+    return list(seen.values())
+
+
+def icon_path(name):
+    for d in ICON_DIRS:
+        for ext in (".svg", ".png"):
+            p = os.path.join(d, name + ext)
+            if os.path.exists(p):
+                return p
+    return None
+
+
+def selftest(path=CFG):
+    text = open(path, encoding="utf-8").read()
+    rows, data = load(text)
+    print("rows:", ", ".join(r[0] for r in rows))
+    # unchanged lists written anew must parse to the same data
+    again = rewrite(text, {r[0]: r[3] for r in rows})
+    assert tomllib.loads(again) == data, "rewrite changed the data"
+    # a moved key
+    name, _, _, keys = rows[0]
+    moved = keys[1:] + keys[:1]
+    after = tomllib.loads(rewrite(text, {name: moved}))
+    assert after[name] == moved
+    assert {k: v for k, v in after.items() if k != name} == {k: v for k, v in data.items() if k != name}
+    print("palette:", len(palette(rows)), "keys; rewrite ok")
+
+
+# --- the window -----------------------------------------------------------------
+
+def run_app(shot=None, row=None):
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk
+
+    css = """
+    .tb-bar { background: #000; border-radius: 6px; padding: 6px; }
+    .tb-key { background: #363636; border-radius: 4px; color: #fff; }
+    .tb-key.tb-nobox { background: transparent; }
+    .tb-key.tb-selected { background: #3880d1; }
+    .tb-key.tb-context { opacity: 0.35; }
+    .tb-key label { font-size: 11px; }
+    .tb-bin { border: 2px dashed alpha(currentColor, 0.3); border-radius: 8px; padding: 10px; }
+    .tb-bin.tb-hover { border-color: #e01b24; }
+    """
+
+    def str_value(s):
+        v = GObject.Value()
+        v.init(GObject.TYPE_STRING)
+        v.set_string(s)
+        return v
+
+    def key_widget(key, context=False):
+        width = key.get("Width", DEFAULT_WIDTH)
+        box = Gtk.Box(halign=Gtk.Align.START, valign=Gtk.Align.CENTER)
+        box.add_css_class("tb-key")
+        if key.get("Background") is False:
+            box.add_css_class("tb-nobox")
+        if context:
+            box.add_css_class("tb-context")
+        box.set_size_request(int(width * SCALE), 30)
+        inner = None
+        if "Icon" in key and (p := icon_path(key["Icon"])):
+            inner = Gtk.Image.new_from_gicon(Gio.FileIcon.new(Gio.File.new_for_path(p)))
+            inner.set_pixel_size(18)
+        if inner is None:
+            if "Text" in key:
+                text = key["Text"].replace("\n", " ")
+            elif "Time" in key:
+                text = "12:34"
+            elif "Battery" in key:
+                text = "🔋"
+            elif "Icon" in key:
+                text = key["Icon"].removeprefix("lucide-")
+            else:
+                text = "…"
+            inner = Gtk.Label(label=text, ellipsize=3, max_width_chars=10)
+        inner.set_hexpand(True)
+        inner.set_halign(Gtk.Align.CENTER)
+        box.append(inner)
+        box.set_tooltip_text(describe(key))
+        return box
+
+    class Window(Adw.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="Налаштування Touch Bar", default_width=1240, default_height=640)
+            self.text = ""
+            self.rows = []        # [(name, title, note, keys)] as in the file
+            self.edit = {}        # name -> keys being edited
+            self.current = None
+            self.selected = None  # index in the current row
+
+            self.toasts = Adw.ToastOverlay()
+            view = Adw.ToolbarView()
+            header = Adw.HeaderBar()
+            self.apply_btn = Gtk.Button(label="Застосувати")
+            self.apply_btn.add_css_class("suggested-action")
+            self.apply_btn.connect("clicked", self.on_apply)
+            self.revert_btn = Gtk.Button(label="Скасувати зміни")
+            self.revert_btn.connect("clicked", lambda *_: self.reload())
+            header.pack_end(self.apply_btn)
+            header.pack_start(self.revert_btn)
+            view.add_top_bar(header)
+
+            paned = Gtk.Paned(position=260)
+            self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+            self.list.add_css_class("navigation-sidebar")
+            self.list.connect("row-selected", self.on_row)
+            side = Gtk.ScrolledWindow(child=self.list, hscrollbar_policy=Gtk.PolicyType.NEVER)
+            paned.set_start_child(side)
+
+            main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                           margin_top=16, margin_bottom=16, margin_start=16, margin_end=16)
+            self.title = Gtk.Label(xalign=0)
+            self.title.add_css_class("title-2")
+            self.note = Gtk.Label(xalign=0, wrap=True)
+            self.note.add_css_class("dim-label")
+            main.append(self.title)
+            main.append(self.note)
+
+            self.bar = Gtk.Box(spacing=2)
+            self.bar.add_css_class("tb-bar")
+            drop = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE | Gdk.DragAction.COPY)
+            drop.connect("drop", self.on_drop_bar)
+            self.bar.add_controller(drop)
+            bar_scroll = Gtk.ScrolledWindow(child=self.bar, vscrollbar_policy=Gtk.PolicyType.NEVER, min_content_height=56)
+            main.append(bar_scroll)
+            hint = Gtk.Label(xalign=0, wrap=True, label="Перетягуйте кнопки в рядку, щоб змінити порядок; знизу — щоб додати (або клацніть); на кошик — щоб прибрати. Esc і сірі кнопки показано для орієнтиру.")
+            hint.add_css_class("dim-label")
+            main.append(hint)
+
+            # the selected key
+            props = Gtk.Box(spacing=12)
+            self.what = Gtk.Label(xalign=0, hexpand=True)
+            self.width = Gtk.SpinButton.new_with_range(30, 600, 10)
+            self.width.connect("value-changed", self.on_width)
+            self.group = Gtk.Switch(valign=Gtk.Align.CENTER)
+            self.group.connect("notify::active", self.on_group)
+            remove = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text="Прибрати")
+            remove.connect("clicked", lambda *_: self.remove_selected())
+            props.append(self.what)
+            props.append(Gtk.Label(label="Ширина, px"))
+            props.append(self.width)
+            props.append(Gtk.Label(label="Відступ перед"))
+            props.append(self.group)
+            props.append(remove)
+            self.props = props
+            main.append(props)
+
+            self.bin = Gtk.Label(label="🗑  Перетягніть сюди, щоб прибрати")
+            self.bin.add_css_class("tb-bin")
+            bin_drop = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+            bin_drop.connect("drop", self.on_drop_bin)
+            bin_drop.connect("enter", lambda *_: (self.bin.add_css_class("tb-hover"), Gdk.DragAction.MOVE)[1])
+            bin_drop.connect("leave", lambda *_: self.bin.remove_css_class("tb-hover"))
+            self.bin.add_controller(bin_drop)
+            main.append(self.bin)
+
+            pal_title = Gtk.Label(xalign=0, label="Усі кнопки")
+            pal_title.add_css_class("heading")
+            main.append(pal_title)
+            self.palette = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=30,
+                                       row_spacing=6, column_spacing=6, homogeneous=False)
+            main.append(Gtk.ScrolledWindow(child=self.palette, vexpand=True))
+
+            paned.set_end_child(Gtk.ScrolledWindow(child=main))
+            view.set_content(paned)
+            self.toasts.set_child(view)
+            self.set_content(self.toasts)
+            self.reload()
+
+        # -- data
+        def reload(self):
+            try:
+                self.text = open(CFG, encoding="utf-8").read()
+                self.rows, _ = load(self.text)
+            except (OSError, tomllib.TOMLDecodeError) as e:
+                self.toasts.add_toast(Adw.Toast(title=f"{CFG}: {e}"))
+                self.rows = []
+            self.edit = {r[0]: copy.deepcopy(r[3]) for r in self.rows}
+            keep = self.current
+            while (child := self.list.get_first_child()) is not None:
+                self.list.remove(child)
+            for name, title, _, _ in self.rows:
+                row = Gtk.ListBoxRow()
+                row.name = name
+                row.set_child(Gtk.Label(label=title, xalign=0, margin_top=6, margin_bottom=6, margin_start=6))
+                self.list.append(row)
+            self.fill_palette()
+            target = next((i for i, r in enumerate(self.rows) if r[0] == keep), 0)
+            if self.rows:
+                self.list.select_row(self.list.get_row_at_index(target))
+            self.update_buttons()
+
+        def changed(self):
+            return {r[0]: self.edit[r[0]] for r in self.rows if self.edit[r[0]] != r[3]}
+
+        def update_buttons(self):
+            dirty = bool(self.changed())
+            self.apply_btn.set_sensitive(dirty)
+            self.revert_btn.set_sensitive(dirty)
+
+        # -- drawing
+        def fill_palette(self):
+            while (child := self.palette.get_first_child()) is not None:
+                self.palette.remove(child)
+            self.pal_keys = palette(self.rows)
+            for i, key in enumerate(self.pal_keys):
+                w = key_widget(key)
+                self.make_draggable(w, f"pal:{i}")
+                click = Gtk.GestureClick()
+                click.connect("released", lambda g, n, x, y, i=i: self.add_key(i, None))
+                w.add_controller(click)
+                self.palette.append(w)
+
+        def make_draggable(self, widget, payload):
+            src = Gtk.DragSource(actions=Gdk.DragAction.MOVE | Gdk.DragAction.COPY)
+            src.connect("prepare", lambda *_: Gdk.ContentProvider.new_for_value(str_value(payload)))
+            src.connect("drag-begin", lambda s, d: s.set_icon(Gtk.WidgetPaintable.new(widget), 10, 10))
+            widget.add_controller(src)
+
+        def draw_bar(self):
+            while (child := self.bar.get_first_child()) is not None:
+                self.bar.remove(child)
+            self.chips = []
+            name = self.current
+            if name is None:
+                return
+            context_strip = name == "AppLayerKeys" or (name in self.edit and name not in dict.fromkeys(k for k, _, _ in TOP)
+                                                         and not name.endswith("-fn"))
+            if name != "ControlStripKeys" and name != "MediaLayerKeys":
+                self.bar.append(key_widget({"Text": "esc", "Width": 128}, context=True))
+            if name in self.panel_names():
+                self.bar.append(key_widget({"Icon": "mbp-close-circle", "Background": False, "Width": 72}, context=True))
+            for i, key in enumerate(self.edit[name]):
+                if key.get("Group") and i > 0:
+                    self.bar.append(Gtk.Box(width_request=int(30 * SCALE)))
+                w = key_widget(key)
+                if i == self.selected:
+                    w.add_css_class("tb-selected")
+                self.make_draggable(w, f"row:{i}")
+                click = Gtk.GestureClick()
+                click.connect("released", lambda g, n, x, y, i=i: self.select(i))
+                w.add_controller(click)
+                self.bar.append(w)
+                self.chips.append(w)
+            if context_strip and "ControlStripKeys" in self.edit:
+                self.bar.append(Gtk.Box(hexpand=True, width_request=40))
+                for key in self.edit["ControlStripKeys"]:
+                    self.bar.append(key_widget(key, context=True))
+            self.show_props()
+
+        def panel_names(self):
+            names = {k.get("Open") for keys in self.edit.values() for k in keys if k.get("Command") == "Open"}
+            return names | {"screenshot"}
+
+        def show_props(self):
+            keys = self.edit.get(self.current, [])
+            ok = self.selected is not None and self.selected < len(keys)
+            self.props.set_sensitive(ok)
+            if not ok:
+                self.what.set_label("Клацніть кнопку в рядку, щоб змінити її ширину або відступ")
+                return
+            key = keys[self.selected]
+            self.what.set_label(f"Вибрано: {describe(key)}")
+            self.updating = True
+            self.width.set_value(key.get("Width", DEFAULT_WIDTH))
+            self.group.set_active(bool(key.get("Group")))
+            self.updating = False
+
+        # -- events
+        def on_row(self, box, row):
+            if row is None:
+                return
+            self.current = row.name
+            self.selected = None
+            r = next(r for r in self.rows if r[0] == row.name)
+            self.title.set_label(r[1])
+            self.note.set_label(r[2])
+            self.draw_bar()
+
+        def select(self, i):
+            self.selected = i
+            self.draw_bar()
+
+        def on_width(self, spin):
+            if getattr(self, "updating", False) or self.selected is None:
+                return
+            self.edit[self.current][self.selected]["Width"] = int(spin.get_value())
+            self.after_change()
+
+        def on_group(self, sw, _):
+            if getattr(self, "updating", False) or self.selected is None:
+                return
+            key = self.edit[self.current][self.selected]
+            if sw.get_active():
+                key["Group"] = True
+            else:
+                key.pop("Group", None)
+            self.after_change()
+
+        def after_change(self):
+            self.draw_bar()
+            self.update_buttons()
+
+        def index_at(self, x):
+            for i, w in enumerate(self.chips):
+                ok, rect = w.compute_bounds(self.bar)
+                if ok and x < rect.get_x() + rect.get_width() / 2:
+                    return i
+            return len(self.chips)
+
+        def add_key(self, pal_index, at):
+            keys = self.edit[self.current]
+            key = copy.deepcopy(self.pal_keys[pal_index])
+            at = len(keys) if at is None else at
+            keys.insert(at, key)
+            self.selected = at
+            self.after_change()
+
+        def on_drop_bar(self, target, value, x, y):
+            if self.current is None:
+                return False
+            kind, _, n = value.partition(":")
+            at = self.index_at(x)
+            if kind == "pal":
+                self.add_key(int(n), at)
+            elif kind == "row":
+                keys = self.edit[self.current]
+                i = int(n)
+                key = keys.pop(i)
+                if at > i:
+                    at -= 1
+                keys.insert(at, key)
+                self.selected = at
+                self.after_change()
+            return True
+
+        def on_drop_bin(self, target, value, x, y):
+            self.bin.remove_css_class("tb-hover")
+            kind, _, n = value.partition(":")
+            if kind != "row":
+                return False
+            self.selected = int(n)
+            self.remove_selected()
+            return True
+
+        def remove_selected(self):
+            keys = self.edit.get(self.current, [])
+            if self.selected is None or self.selected >= len(keys):
+                return
+            keys.pop(self.selected)
+            self.selected = None
+            self.after_change()
+
+        def on_apply(self, *_):
+            text = rewrite(self.text, self.changed())
+            try:
+                tomllib.loads(text)
+            except tomllib.TOMLDecodeError as e:
+                self.toasts.add_toast(Adw.Toast(title=f"Помилка у файлі: {e}"))
+                return
+            r = subprocess.run(["pkexec", APPLY], input=text.encode(), capture_output=True)
+            if r.returncode != 0:
+                msg = r.stderr.decode(errors="replace").strip() or "скасовано"
+                self.toasts.add_toast(Adw.Toast(title=f"Не збережено: {msg}"))
+                return
+            self.toasts.add_toast(Adw.Toast(title="Застосовано — Touch Bar уже показує зміни"))
+            self.reload()
+
+    app = Adw.Application(application_id="org.mbp.TouchBarSettings")
+
+    def on_activate(app):
+        prov = Gtk.CssProvider()
+        prov.load_from_string(css)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        (app.get_active_window() or Window(app)).present()
+
+    app.connect("activate", on_activate)
+    if shot:
+        def take():
+            win = app.get_active_window()
+            if row:
+                for i in range(len(win.rows)):
+                    if win.rows[i][0] == row:
+                        win.list.select_row(win.list.get_row_at_index(i))
+                        win.select(0)
+            GLib.timeout_add(400, save)
+            return False
+
+        def save():
+            win = app.get_active_window()
+            paintable = Gtk.WidgetPaintable.new(win)
+            w, h = win.get_width(), win.get_height()
+            snap = Gtk.Snapshot()
+            paintable.snapshot(snap, w, h)
+            node = snap.to_node()
+            texture = win.get_native().get_renderer().render_texture(node, None)
+            texture.save_to_png(shot)
+            app.quit()
+            return False
+        GLib.timeout_add(900, take)
+    return app.run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--selftest"]:
+        selftest(*sys.argv[2:3])
+    elif sys.argv[1:2] == ["--shot"]:
+        sys.exit(run_app(*sys.argv[2:4]))
+    else:
+        sys.exit(run_app())

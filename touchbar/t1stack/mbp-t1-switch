@@ -1,0 +1,109 @@
+#!/bin/bash
+# Stage 7 (decision a+b): the Mac always boots with the T1 in USB
+# configuration 1 (the T1's own Touch Bar: Esc visible). This switches it to
+# configuration 2 (appletbdrm + hid-t1-touchbar + tiny-dfr, H.264 camera)
+# only when everything for it is there, and starts mbp-t1-cfg2.target.
+# Otherwise the Mac stays in configuration 1 and the reason goes to the
+# journal and to a desktop notification. Run by mbp-t1-switch.service.
+#   mbp-t1-switch            check and switch (root)
+#   mbp-t1-switch check      only the checks, no switch (root or not);
+#                            MBP_T1_KERNEL=<version> checks another kernel
+# Stays in configuration 1: kernel parameter mbp.t1=1 (the systemd-boot
+# entries "... Touch Bar config 1"), the marker /var/lib/mbp-t1/stay-cfg1,
+# a missing or broken module/program for the running kernel.
+set -uo pipefail
+L=/usr/local/lib/mbp-t1
+MARK=/var/lib/mbp-t1/stay-cfg1
+K=$(uname -r)
+# test only: the checks for another kernel version (as after an update)
+[[ ${1:-} == check && -n ${MBP_T1_KERNEL:-} ]] && K=$MBP_T1_KERNEL
+log() { echo "mbp-t1-switch: $*"; }
+stay() {	# reason [notify]
+	log "staying in configuration 1: $1"
+	[[ ${2:-} == notify ]] && "$L/notify" "Touch Bar: configuration 1" "$1"
+	exit 0
+}
+
+checks() {
+	local m p bad=()
+	# the T1-patched modules come from DKMS (updates/dkms); the stock
+	# appletbdrm cannot drive the T1, stock uvcvideo has no H.264
+	for m in appletbdrm hid_t1_touchbar uvcvideo v4l2loopback; do
+		p=$(modinfo -k "$K" -n "$m" 2>/dev/null)
+		[[ $p == */updates/dkms/* || ($m == v4l2loopback && -n $p) ]] || bad+=("$m")
+	done
+	((${#bad[@]})) && { echo "modules missing for $K: ${bad[*]} (DKMS did not build them? sudo dkms autoinstall -k $K, then reboot)"; return 1; }
+	for p in /usr/bin/tiny-dfr /usr/local/bin/mbp-t1-fallback; do
+		[[ -x $p ]] || { echo "$p missing"; return 1; }
+		# not ldd | grep -q: under pipefail an early grep exit (SIGPIPE) would hide the match
+		[[ $(ldd -r "$p" 2>&1) =~ (not found|undefined symbol) ]] && { echo "$p: libraries do not match (ldd -r)"; return 1; }
+	done
+	return 0
+}
+
+if [[ ${1:-} == check ]]; then
+	r=$(checks) && { echo "ok: configuration 2 can be used"; exit 0; } || { echo "$r"; exit 1; }
+fi
+[[ $EUID -eq 0 ]] || { echo "run as root"; exit 1; }
+
+grep -qw "mbp.t1=1" /proc/cmdline && stay "kernel parameter mbp.t1=1"
+[[ -e $MARK ]] && stay "marker $MARK (remove it to use configuration 2: sudo rm $MARK)" notify
+r=$(checks) || stay "$r" notify
+
+# the T1 and its configuration-1 drivers (up to 30 s after boot)
+D=
+for _ in $(seq 60); do
+	f=$(grep -lx 8600 /sys/bus/usb/devices/*/idProduct 2>/dev/null | head -1 || true)
+	[[ -n $f ]] && D=$(dirname "$f") && break
+	sleep 0.5
+done
+[[ -n $D ]] || stay "no T1 (05ac:8600) on USB"
+N=$(basename "$D")
+cfg=$(cat "$D/bConfigurationValue")
+[[ $cfg == 1 || $cfg == 2 ]] || stay "T1 in configuration '$cfg'"
+
+ready() {
+	local c e ok=0
+	for c in /sys/class/drm/card*; do
+		[[ $(basename "$(readlink -f "$c/device/driver" 2>/dev/null)") == appletbdrm ]] && ok=$((ok | 1))
+	done
+	for e in /sys/class/input/event*; do
+		[[ $(cat "$e/device/name" 2>/dev/null) == "Apple Inc. iBridge Touch Bar" ]] && ok=$((ok | 2))
+	done
+	[[ $(basename "$(readlink -f /sys/class/backlight/appletb_backlight/device/driver 2>/dev/null)") == hid-t1-touchbar ]] && ok=$((ok | 4))
+	echo $ok
+}
+
+if [[ $cfg == 1 ]]; then
+	log "switching $N to configuration 2"
+	modprobe -r hid_appletb_kbd hid_appletb_bl 2>/dev/null
+	echo 2 > "$D/bConfigurationValue" || { modprobe hid_appletb_kbd; stay "SET_CONFIGURATION 2 failed" notify; }
+fi
+for _ in $(seq 20); do
+	[[ $(ready) == 7 ]] && break
+	sleep 0.5
+done
+r=$(ready)
+if [[ $r != 7 ]]; then
+	# configuration 2 without its drivers: nothing can draw. The T1's own
+	# rendering does not come back before a reboot, so the next boot stays
+	# in configuration 1 (marker), and now configuration 1 at least gives
+	# working keys.
+	what=$( ((r & 1)) || echo -n "DRM appletbdrm, "; ((r & 2)) || echo -n "touch input, "; ((r & 4)) || echo -n "backlight, ")
+	mkdir -p "$(dirname "$MARK")"
+	echo "$(date -Is) $K: missing ${what%, } after the switch" > "$MARK"
+	echo 1 > "$D/bConfigurationValue"
+	sleep 2
+	modprobe hid_appletb_kbd
+	"$L/notify" "Touch Bar: reboot the Mac" \
+		"After switching the T1 to configuration 2 this is missing: ${what%, }. The keys work, but none are visible until a reboot. The next boot stays in configuration 1 (marker $MARK; to remove: sudo rm $MARK)."
+	log "missing ${what%, }: back to configuration 1, marker $MARK"
+	exit 0
+fi
+
+# no Touch Bar or camera wake in configuration 2: a streaming camera woke
+# the Mac right after every sleep (gpe6D); lid, power button, keyboard and
+# the other USB devices still wake it
+echo disabled > "$D/power/wakeup"
+log "configuration 2 ready (DRM, touch, backlight); T1 wakeup off; starting mbp-t1-cfg2.target"
+systemctl start --no-block mbp-t1-cfg2.target

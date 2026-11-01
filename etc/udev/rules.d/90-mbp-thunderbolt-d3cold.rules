@@ -1,0 +1,13 @@
+# MacBookPro13,2: forbid D3cold on the Thunderbolt (Alpine Ridge) hierarchy.
+#
+# Without this, S3 resume took 40-80 s in pci_pm_resume_noirq on the TB
+# bridges (0000:03:00.0, 04:02.0, 7a:02.0 ...): the controller had been put in
+# D3cold through ACPI and Linux waited out the 60 s PCIe readiness timeout for
+# devices that the Apple firmware had powered off. The screen stayed black for
+# that long, so suspend looked broken. With D3cold forbidden, noirq resume took
+# 0.12 s (pm_test core) and real S3 resumes in seconds (tested 2026-10-15).
+#
+# Root ports of the two TB controllers:
+ACTION=="add", SUBSYSTEM=="pci", KERNEL=="0000:00:1c.4|0000:00:1d.0", ATTR{d3cold_allowed}="0"
+# Alpine Ridge upstream bridge 1578, downstream bridges 15d3, NHI 15d2, xHCI 15d4:
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x8086", ATTR{device}=="0x1578|0x15d3|0x15d2|0x15d4", ATTR{d3cold_allowed}="0"

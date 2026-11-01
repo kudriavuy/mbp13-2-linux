@@ -1,0 +1,98 @@
+#!/bin/bash
+# mbp-dkms-precheck [headers-package ...]: build every DKMS module that is
+# installed now against the headers in the given packages (as pacman's
+# PreTransaction hook passes them on stdin, or as arguments), before they
+# are installed: from the downloaded package in pacman's cache, unpacked
+# into a scratch directory, with a scratch DKMS tree, in a private mount
+# namespace that shows the new headers under /usr/lib/modules. The system's
+# DKMS tree, /usr/src and /lib/modules are not touched (a driver that
+# downloads kernel sources, as snd_hda_macbookpro does for a new version,
+# may fill its own download cache, which its real build would do anyway).
+# Only warns: the exit status is 0 unless asked with --strict.
+#
+#   sudo mbp-dkms-precheck linux-headers        check the version pacman would install
+#   mbp-dkms-precheck --file PKG.pkg.tar.zst    check a given headers package
+set -uo pipefail
+
+CACHE=/var/cache/pacman/pkg
+WORK=$(mktemp -d /var/tmp/mbp-dkms-precheck.XXXXXX) || exit 0
+trap 'rm -rf "$WORK"' EXIT
+strict=0 files=() names=()
+# root (the pacman hook): a mount namespace; a user (tests): a user one too
+if ((EUID == 0)); then UNSHARE="unshare -m --propagation private"; else UNSHARE="unshare -rm --propagation private"; fi
+
+while (($#)); do
+	case $1 in
+	--strict) strict=1 ;;
+	--file) shift; files+=("$1") ;;
+	*) names+=("$1") ;;
+	esac
+	shift
+done
+if ((${#names[@]} == 0 && ${#files[@]} == 0)) && [[ ! -t 0 ]]; then
+	mapfile -t names
+fi
+
+# the package file pacman downloaded for this transaction
+for n in "${names[@]}"; do
+	[[ -n $n ]] || continue
+	v=$(pacman -Sp --print-format %v "$n" 2>/dev/null | head -1)
+	f=$(ls "$CACHE/$n-$v-"*.pkg.tar.zst 2>/dev/null | head -1)
+	if [[ -z $v || -z $f ]]; then
+		echo "mbp-dkms-precheck: $n: package file not found in $CACHE, not checked"
+		continue
+	fi
+	files+=("$f")
+done
+
+# the DKMS modules installed for any kernel now: name/version
+mapfile -t mods < <(dkms status 2>/dev/null | sed -n 's/^\([^/, ]*\)\/\([^, ]*\)[, ].*installed.*/\1\/\2/p' | sort -u)
+if ((${#mods[@]} == 0)); then
+	echo "mbp-dkms-precheck: no DKMS modules installed, nothing to check"
+	exit 0
+fi
+
+fail=0
+for f in "${files[@]}"; do
+	h="$WORK/h.$(basename "$f")"
+	mkdir -p "$h"
+	if ! bsdtar -xf "$f" -C "$h" usr/lib/modules 2>/dev/null; then
+		echo "mbp-dkms-precheck: $(basename "$f"): could not unpack, not checked"
+		continue
+	fi
+	for kdir in "$h"/usr/lib/modules/*/build; do
+		kver=$(basename "$(dirname "$kdir")")
+		for m in "${mods[@]}"; do
+			tree="$WORK/tree.$kver.${m%%/*}"
+			mkdir -p "$tree"
+			log="$WORK/${m%%/*}.$kver.log"
+			# The build sees the new kernel where a real one would be: in a
+			# private mount namespace /usr/lib/modules is an empty tmpfs with
+			# the unpacked headers bound in (drivers look there themselves, not
+			# only at --kernelsourcedir); nothing of it is visible outside.
+			# As a user (tests), a user namespace gives the rights for that.
+			if $UNSHARE env KVER="$kver" HDIR="$h/usr/lib/modules/$kver" TREE="$tree" MOD="$m" bash -c '
+				set -e
+				mount -t tmpfs mbp-dkms-precheck /usr/lib/modules
+				mkdir /usr/lib/modules/"$KVER"
+				mount --bind "$HDIR" /usr/lib/modules/"$KVER"
+				dkms add "$MOD" --dkmstree "$TREE" --sourcetree /usr/src
+				dkms build "$MOD" -k "$KVER" --dkmstree "$TREE" --sourcetree /usr/src --force
+			' >"$log" 2>&1; then
+				echo "mbp-dkms-precheck: $m for $kver: builds"
+			else
+				fail=1
+				echo "mbp-dkms-precheck: WARNING: $m does NOT build for $kver"
+				keep=/var/log/mbp-dkms-precheck.${m%%/*}.$kver.log
+				cp "$log" "$keep" 2>/dev/null && echo "    log: $keep"
+				grep -iE "error|failed" "$log" | tail -4 | sed 's/^/    /'
+			fi
+		done
+	done
+done
+if ((fail)); then
+	echo "mbp-dkms-precheck: WARNING: after this update the modules above would be missing for the new kernel"
+	echo "    (sound / Touch Bar from the stock driver). Boot the other kernel from the systemd-boot menu if needed."
+fi
+((strict && fail)) && exit 1
+exit 0

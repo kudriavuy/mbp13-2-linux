@@ -1,0 +1,14 @@
+# Touch Bar sliders: volume and brightness for tiny-dfr (patch 0006), in the
+# desktop session (PulseAudio of the session, KDE brightness over D-Bus).
+[Unit]
+Description=Touch Bar sliders (tiny-dfr): volume and screen brightness
+PartOf=graphical-session.target
+After=graphical-session.target pipewire-pulse.service
+
+[Service]
+ExecStart=/usr/local/bin/mbp-touchbar-bridge
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

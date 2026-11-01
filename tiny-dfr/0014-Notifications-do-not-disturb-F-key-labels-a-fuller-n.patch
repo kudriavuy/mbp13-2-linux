@@ -1,0 +1,922 @@
+From dfb2e7b1101a8305f41767ffc8ca83b39ff440a1 Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 23:16:10 +0100
+Subject: [PATCH] Notifications, do not disturb, F-key labels, a fuller
+ now-playing panel
+
+- Notifications = true: the latest notification the helper reports
+  (/run/tiny-dfr/bridge/notification: when, program, title) shows for
+  NotificationSeconds over the program's part of the row, with
+  NotificationIcon; never while do not disturb is on; a tap takes it away.
+- Live = "Dnd" (DndIcons: on, do not disturb) and Command = "Dnd" ("dnd
+  toggle" to the helper); the state comes from .../dnd.
+- A Text with a line break is drawn as two smaller lines (a label over a
+  key name), and FnSet in an [[Apps]] rule names an [AppSets] entry shown
+  over the whole row while Fn is held in that program, instead of F1-F12.
+- The now-playing panel covers only the program's part of the row, so the
+  Control Strip stays usable (its volume slider above all); a second tap
+  on the note closes it; with several players a key switches to the next
+  ("player next"), and the panel shows the player's name. Under a slider
+  the panel is hidden, not drawn over it.
+
+The PNG preview shows a made-up notification and the F-key label rows.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ share/tiny-dfr/config.toml |   9 ++
+ src/config.rs              |  56 +++++++++-
+ src/main.rs                | 212 +++++++++++++++++++++++++++++++------
+ src/media.rs               |  53 ++++++++--
+ src/notice.rs              |  67 ++++++++++++
+ src/state.rs               |  27 ++++-
+ 6 files changed, 379 insertions(+), 45 deletions(-)
+ create mode 100644 src/notice.rs
+
+diff --git a/share/tiny-dfr/config.toml b/share/tiny-dfr/config.toml
+index 4e675c6..aee03b7 100644
+--- a/share/tiny-dfr/config.toml
++++ b/share/tiny-dfr/config.toml
+@@ -102,6 +102,15 @@ FontTemplate = ":bold"
+ # TouchIdRetryText = "Try again"
+ # TouchIdFailText = "Not recognized"
+ # TouchIdIcon = "fingerprint"
++# Notifications = false  # true: the latest notification (helper: when, program,
++#                        # title) over the program's keys for NotificationSeconds
++#                        # (default 4), with NotificationIcon; not while do not
++#                        # disturb is on; a tap takes it away
++# Live = "Dnd" with DndIcons (on, do not disturb) and Command = "Dnd": a do not
++# disturb key ("dnd toggle" to the helper).
++# Text with a line break ("Run\nF5") is drawn as two smaller lines.
++# FnSet = "<AppSets entry>" in an [[Apps]] rule: that entry over the whole row
++# while Fn is held in the program (labels for its F-keys), instead of F1-F12.
+ # PixelShiftSmooth = true   # false: one whole pixel every 10 s instead of a
+ #                           # 4 s animation (fewer frames); no shifting at all
+ #                           # while the bar is dark
+diff --git a/src/config.rs b/src/config.rs
+index 8c59ed4..9401733 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -48,6 +48,11 @@ pub struct Config {
+     pub touchid_retry_text: String,
+     pub touchid_fail_text: String,
+     pub touchid_icon: Option<String>,
++    pub notifications: bool,
++    pub notification_time: std::time::Duration,
++    pub notification_icon: Option<String>,
++    // FnSet of a rule -> its full-width row (Fn held in that program)
++    pub fn_rows: HashMap<String, usize>,
+ }
+ 
+ /// Icons that follow the session (Live = ...)
+@@ -59,6 +64,8 @@ pub enum Live {
+     Mic,
+     /// the keyboard layout's short name as text (no icons)
+     Layout,
++    /// DndIcons: notifications on, do not disturb
++    Dnd,
+ }
+ 
+ /// Which slider a key opens when held and slid (Slider = ...)
+@@ -78,6 +85,9 @@ pub enum SlideKind {
+ pub struct AppRule {
+     pub r#match: Vec<String>,
+     pub set: String,
++    /// an [AppSets] entry shown over the whole row while Fn is held (labels
++    /// for the F-keys), instead of the plain F1-F12
++    pub fn_set: Option<String>,
+ }
+ 
+ /// What a program gets on the bar
+@@ -90,10 +100,10 @@ pub enum AppSet {
+ }
+ 
+ impl Config {
+-    /// The set of the first rule matching window class `class`
+-    pub fn set_for(&self, class: &str) -> Option<AppSet> {
++    /// The first rule matching window class `class`
++    fn rule_for(&self, class: &str) -> Option<&AppRule> {
+         let class = class.to_lowercase();
+-        let rule = self.apps.iter().find(|r| {
++        self.apps.iter().find(|r| {
+             r.r#match.iter().any(|p| {
+                 let p = p.to_lowercase();
+                 match p.strip_suffix('*') {
+@@ -101,7 +111,15 @@ impl Config {
+                     None => class == p,
+                 }
+             })
+-        })?;
++        })
++    }
++    /// The F-key row of that program (FnSet), if it has one
++    pub fn fn_row_for(&self, class: &str) -> Option<usize> {
++        self.fn_rows.get(self.rule_for(class)?.fn_set.as_ref()?).copied()
++    }
++    /// The set of the first rule matching window class `class`
++    pub fn set_for(&self, class: &str) -> Option<AppSet> {
++        let rule = self.rule_for(class)?;
+         match rule.set.as_str() {
+             "fn" => Some(AppSet::Fn),
+             "strip" => Some(AppSet::Strip),
+@@ -127,6 +145,8 @@ pub enum Command {
+     NowPlaying,
+     /// the keyboard layout: a tap the next one, held and slid a choice
+     Layout,
++    /// do not disturb on/off ("dnd toggle" to the helper)
++    Dnd,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -170,6 +190,10 @@ struct ConfigProxy {
+     touch_id_retry_text: Option<String>,
+     touch_id_fail_text: Option<String>,
+     touch_id_icon: Option<String>,
++    dnd_icons: Option<Vec<String>>,
++    notifications: Option<bool>,
++    notification_seconds: Option<u64>,
++    notification_icon: Option<String>,
+ }
+ 
+ fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<Key>, D::Error>
+@@ -309,6 +333,10 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+         base.touch_id_retry_text = user.touch_id_retry_text.or(base.touch_id_retry_text);
+         base.touch_id_fail_text = user.touch_id_fail_text.or(base.touch_id_fail_text);
+         base.touch_id_icon = user.touch_id_icon.or(base.touch_id_icon);
++        base.dnd_icons = user.dnd_icons.or(base.dnd_icons);
++        base.notifications = user.notifications.or(base.notifications);
++        base.notification_seconds = user.notification_seconds.or(base.notification_seconds);
++        base.notification_icon = user.notification_icon.or(base.notification_icon);
+     };
+     let media_layer_keys = base.media_layer_keys.unwrap();
+     let primary_layer_keys = base.primary_layer_keys.unwrap();
+@@ -342,6 +370,21 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+         app_sets.insert(name, rows.len());
+         rows.push(collapsed(keys));
+     }
++    // FnSet: an [AppSets] entry as a full row (Esc is added below)
++    let mut fn_rows = HashMap::new();
++    let all_sets = base.app_sets.clone().unwrap_or_default();
++    for rule in base.apps.iter().flatten() {
++        if let Some(name) = &rule.fn_set {
++            match all_sets.get(name) {
++                Some(keys) if !fn_rows.contains_key(name) => {
++                    fn_rows.insert(name.clone(), rows.len());
++                    rows.push(keys.clone());
++                }
++                Some(_) => {}
++                None => eprintln!("Apps: FnSet = \"{name}\" is not an AppSets entry; ignored"),
++            }
++        }
++    }
+     let apps = base.apps.clone().unwrap_or_default();
+     for rule in &apps {
+         if !["fn", "strip"].contains(&rule.set.as_str()) && !app_sets.contains_key(&rule.set) {
+@@ -371,6 +414,7 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+             let (list, n, key) = match b.live {
+                 Some(Live::Volume) => (&base.volume_icons, 4, "VolumeIcons"),
+                 Some(Live::Mic) => (&base.mic_icons, 2, "MicIcons"),
++                Some(Live::Dnd) => (&base.dnd_icons, 2, "DndIcons"),
+                 Some(Live::Layout) | None => continue,
+             };
+             match list {
+@@ -426,6 +470,10 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+         touchid_retry_text: base.touch_id_retry_text.clone().unwrap_or_else(|| "Try again".into()),
+         touchid_fail_text: base.touch_id_fail_text.clone().unwrap_or_else(|| "Not recognized".into()),
+         touchid_icon: base.touch_id_icon.clone(),
++        notifications: base.notifications.unwrap_or(false),
++        notification_time: std::time::Duration::from_secs(base.notification_seconds.unwrap_or(4)),
++        notification_icon: base.notification_icon.clone(),
++        fn_rows,
+     };
+     crate::anim::set_enabled(cfg.animations);
+     (cfg, layers)
+diff --git a/src/main.rs b/src/main.rs
+index 2536fe3..90379cc 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -50,6 +50,7 @@ mod display;
+ mod fonts;
+ mod layer_switch;
+ mod media;
++mod notice;
+ mod pixel_shift;
+ mod slider;
+ mod state;
+@@ -81,6 +82,30 @@ fn touchid_icon(cfg: &Config) -> Option<Button> {
+     })
+ }
+ 
++/// The notification to show now, if any (fresh, not tapped away, not while
++/// do not disturb is on)
++fn notice_now<'a>(cfg: &Config, session: &'a state::State, dismissed: i64) -> Option<&'a state::Notice> {
++    let n = session.notice.as_ref()?;
++    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
++    (cfg.notifications
++        && n.at_ms != dismissed
++        && now_ms - n.at_ms < cfg.notification_time.as_millis() as i64
++        && now_ms >= n.at_ms - 1000
++        && session.dnd != Some(true))
++    .then_some(n)
++}
++
++/// An icon of the config by name (48 px), as a key's image
++fn named_icon(name: Option<&String>) -> Option<Button> {
++    try_load_image(name?, None::<&str>, 48, 48).ok().map(|image| {
++        let mut b = Button::new_spacer();
++        b.image = image;
++        b.icon_width = 48.0;
++        b.icon_height = 48.0;
++        b
++    })
++}
++
+ /// What the Touch ID hint shows now: a recent result, else a fresh wait
+ fn touchid_now(cfg: &Config, session: &state::State, flash: Option<(state::TouchId, Instant)>) -> Option<state::TouchId> {
+     if !cfg.touchid_hint {
+@@ -340,8 +365,9 @@ impl Button {
+                 .iter()
+                 .map(|name| try_load_image(name, cfg.theme.as_ref(), w, h).expect("failed to load icon"))
+                 .collect();
+-            // until the helper says otherwise: on / loudest (Layout: no images)
+-            let shown = images.len().saturating_sub(1);
++            // until the helper says otherwise: on / loudest / notifications
++            // on (Layout: no images)
++            let shown = if kind == Live::Dnd { 0 } else { images.len().saturating_sub(1) };
+             (kind, images, shown)
+         });
+         let slide = cfg.slider;
+@@ -577,6 +603,22 @@ impl Button {
+         y_shift: f64,
+     ) {
+         match &self.image {
++            ButtonImage::Text(text) if text.contains('\n') => {
++                // two lines (a label over a key name): smaller, one above the other
++                let size = c.font_matrix().xx();
++                c.set_font_size(size * 0.62);
++                let lines: Vec<&str> = text.splitn(2, '\n').collect();
++                for (i, line) in lines.iter().enumerate() {
++                    let e = c.text_extents(line).unwrap();
++                    let y = height as f64 / 2.0 + if i == 0 { -4.0 } else { size * 0.62 + 2.0 };
++                    c.move_to(
++                        button_left_edge + (button_width as f64 / 2.0 - e.x_advance() / 2.0).round(),
++                        y_shift + y.round(),
++                    );
++                    c.show_text(line).unwrap();
++                }
++                c.set_font_size(size);
++            }
+             ButtonImage::Text(text) => {
+                 let extents = c.text_extents(text).unwrap();
+                 c.move_to(
+@@ -730,6 +772,11 @@ impl Button {
+                 Some(false) => 1,
+                 None => return,
+             },
++            Live::Dnd => match st.dnd {
++                Some(true) => 1,
++                Some(false) => 0,
++                None => return,
++            },
+             Live::Layout => return,
+         };
+         if want != *shown && want < images.len() {
+@@ -983,6 +1030,13 @@ impl FunctionLayer {
+         modified_regions
+     }
+ 
++    /// The first key of the collapsed Control Strip (after the spacer that
++    /// pushes it to the right end), if the row has one
++    fn strip_start(&self) -> Option<usize> {
++        let spacer = self.buttons.iter().rposition(|(_, b)| matches!(b.image, ButtonImage::Spacer))?;
++        (spacer + 1 < self.buttons.len()).then_some(spacer + 1)
++    }
++
+     /// The button under x (bar coordinates, pixel shift included). A touch in
+     /// a gap counts for the nearer neighbour; `Some(i)` checks that button only.
+     fn hit(
+@@ -1110,8 +1164,8 @@ fn render_preview(path: &std::ffi::OsStr) {
+         (ROW_STRIP_EXPANDED, Some(1), None),
+         (ROW_FKEYS, None, None),
+     ];
+-    // one row per program key set
+-    let mut sets: Vec<_> = cfg.app_sets.values().copied().collect();
++    // one row per program key set, and the F-key label rows
++    let mut sets: Vec<_> = cfg.app_sets.values().chain(cfg.fn_rows.values()).copied().collect();
+     sets.sort();
+     for r in sets {
+         rows.push((r, None, None));
+@@ -1140,7 +1194,7 @@ fn render_preview(path: &std::ffi::OsStr) {
+     let out = ImageSurface::create(
+         Format::ARgb32,
+         width as i32,
+-        (rows.len() + frames.len() + if has_np_row { 2 } else { 0 } + if cfg.touchid_hint { 4 } else { 0 }) as i32
++        (rows.len() + frames.len() + if has_np_row { 2 } else { 0 } + if cfg.touchid_hint { 4 } else { 0 } + cfg.notifications as usize) as i32
+             * (height as i32 + gap)
+             - gap,
+     )
+@@ -1184,6 +1238,8 @@ fn render_preview(path: &std::ffi::OsStr) {
+         at_ms: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64),
+         rate: 0.0,
+         can_seek: true,
++        player: "Chrome".into(),
++        players: 2,
+     };
+     let has_np = layers[ROW_STRIP_COLLAPSED].buttons.iter().any(|(_, b)| b.command == Some(Command::NowPlaying));
+     let mut extra = 0;
+@@ -1196,13 +1252,13 @@ fn render_preview(path: &std::ffi::OsStr) {
+         for with_panel in [false, true] {
+             layers[ROW_STRIP_COLLAPSED].draw(&cfg, width as i32, height as i32, &bar, (0.0, 0.0), true);
+             if with_panel {
+-                let layout = media_layout(&cfg, &layers[ROW_STRIP_COLLAPSED], width);
++                let layout = media_layout(&cfg, &layers[ROW_STRIP_COLLAPSED], width, demo.players);
+                 let bc = Context::new(&bar).unwrap();
+                 bc.translate(height as f64, 0.0);
+                 bc.rotate((90.0f64).to_radians());
+                 let sx = pixel_shift_width(&cfg) / 2.0;
+                 bc.set_source_rgb(0.0, 0.0, 0.0);
+-                bc.rectangle(layout.left + sx - cfg.group_spacing / 2.0, 0.0, width as f64, height as f64);
++                bc.rectangle(layout.left + sx - cfg.group_spacing / 2.0, 0.0, layout.right - layout.left + cfg.group_spacing, height as f64);
+                 bc.fill().unwrap();
+                 bc.set_font_face(&cfg.font_face);
+                 media::Panel::new().draw(&bc, &cfg, &layout, Some(&demo), height as f64, (sx, 0.0), true);
+@@ -1222,6 +1278,25 @@ fn render_preview(path: &std::ffi::OsStr) {
+             }
+         }
+     }
++    // a notification (made up) over the collapsed row
++    if cfg.notifications {
++        let n = state::Notice { at_ms: 0, app: "Chat".into(), summary: "Alex: Are you home yet?".into() };
++        layers[ROW_STRIP_COLLAPSED].draw(&cfg, width as i32, height as i32, &bar, (0.0, 0.0), true);
++        let bc = Context::new(&bar).unwrap();
++        bc.translate(height as f64, 0.0);
++        bc.rotate((90.0f64).to_radians());
++        let area = app_area(&cfg, &layers[ROW_STRIP_COLLAPSED], width);
++        notice::draw(&bc, &cfg, area, height as f64, (pixel_shift_width(&cfg) / 2.0, 0.0), &n, named_icon(cfg.notification_icon.as_ref()).as_ref());
++        drop(bc);
++        bar.flush();
++        c.save().unwrap();
++        let y0 = ((rows_len + extra) as i32 * (height as i32 + gap)) as f64;
++        c.transform(cairo::Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, y0 + height as f64));
++        c.set_source_surface(&bar, 0.0, 0.0).unwrap();
++        c.paint().unwrap();
++        c.restore().unwrap();
++        extra += 1;
++    }
+     // the Touch ID hint in its four states
+     if cfg.touchid_hint {
+         let icon = touchid_icon(&cfg);
+@@ -1431,16 +1506,23 @@ fn slider_layout(cfg: &Config, layer: &FunctionLayer, width: u16, btn: usize) ->
+     SliderLayout::new(cfg, layer.geometry(cfg, avail)[btn], avail)
+ }
+ 
+-/// The now-playing panel over `layer`: right of Esc to the end
+-fn media_layout(cfg: &Config, layer: &FunctionLayer, width: u16) -> media::Layout {
++/// The program's part of `layer` (bar coordinates): right of Esc up to the
++/// collapsed Control Strip, or to the end of a row without one
++fn app_area(cfg: &Config, layer: &FunctionLayer, width: u16) -> (f64, f64) {
+     let avail = width as f64 - pixel_shift_width(cfg);
+-    let left = if width >= 2170 {
+-        let (l, w) = layer.geometry(cfg, avail)[0];
+-        l + w + cfg.group_spacing
+-    } else {
+-        0.0
++    let geometry = layer.geometry(cfg, avail);
++    let left = if width >= 2170 { geometry[0].0 + geometry[0].1 + cfg.group_spacing } else { 0.0 };
++    let right = match layer.strip_start() {
++        Some(i) => geometry[i].0 - cfg.group_spacing,
++        None => avail,
+     };
+-    media::Layout::new(cfg, left, avail)
++    (left, right.max(left))
++}
++
++/// The now-playing panel over the program's part of `layer` (the strip stays)
++fn media_layout(cfg: &Config, layer: &FunctionLayer, width: u16, players: usize) -> media::Layout {
++    let (left, right) = app_area(cfg, layer, width);
++    media::Layout::new(cfg, left, right, players > 1)
+ }
+ 
+ /// A key of the now-playing panel: to the helper (MPRIS), else as a media key
+@@ -1538,16 +1620,18 @@ fn real_main(drm: &mut DrmBackend) {
+     let mut fn_held = false;
+     // the collapsed row: the default one or the active program's key set
+     let mut collapsed_row = ROW_STRIP_COLLAPSED;
++    // the F-key row: plain F1-F12 or the program's FnSet
++    let mut fn_row = ROW_FKEYS;
+     // the program it was chosen for (window class), to notice a change
+     let mut current_app: Option<String> = None;
+-    let row = |base_is_media: bool, fn_held: bool, expanded: bool, collapsed_row: usize| {
++    let row = |base_is_media: bool, fn_held: bool, expanded: bool, collapsed_row: usize, fn_row: usize| {
+         match (base_is_media != fn_held, expanded) {
+-            (false, _) => ROW_FKEYS,
++            (false, _) => fn_row,
+             (true, false) => collapsed_row,
+             (true, true) => ROW_STRIP_EXPANDED,
+         }
+     };
+-    let mut active_layer = row(base_is_media, fn_held, expanded, collapsed_row);
++    let mut active_layer = row(base_is_media, fn_held, expanded, collapsed_row, fn_row);
+     let mut slider: Option<Slider> = None;
+     let mut slider_dirty = false;
+     // the now-playing panel, and whether its capsule needs drawing
+@@ -1570,6 +1654,10 @@ fn real_main(drm: &mut DrmBackend) {
+     let mut fingerprint = touchid_icon(&cfg);
+     let mut touchid_flash: Option<(state::TouchId, Instant)> = None;
+     let mut touchid_drawn: Option<state::TouchId> = None;
++    // notifications: the icon, the one tapped away, the one on the bar
++    let mut bell = named_icon(cfg.notification_icon.as_ref());
++    let mut notice_dismissed = 0i64;
++    let mut notice_drawn: Option<i64> = None;
+     let mut needs_complete_redraw = true;
+ 
+     let mut input_tb = Libinput::new_with_udev(Interface);
+@@ -1638,10 +1726,12 @@ fn real_main(drm: &mut DrmBackend) {
+             base_is_media = cfg.media_layer_default;
+             expanded = cfg.control_strip_expanded;
+             collapsed_row = ROW_STRIP_COLLAPSED;
++            fn_row = ROW_FKEYS;
+             current_app = None;
+             check_layer = true;
+             media = None;
+             fingerprint = touchid_icon(&cfg);
++            bell = named_icon(cfg.notification_icon.as_ref());
+             session = state_watch.read();
+             for layer in layers.iter_mut() {
+                 for (_, b) in &mut layer.buttons {
+@@ -1667,13 +1757,15 @@ fn real_main(drm: &mut DrmBackend) {
+                     cfg.control_strip_expanded,
+                 ),
+             };
+-            if app != current_app || want_media != base_is_media || want_row != collapsed_row {
++            let want_fn_row = app.as_deref().and_then(|a| cfg.fn_row_for(a)).unwrap_or(ROW_FKEYS);
++            if app != current_app || want_media != base_is_media || want_row != collapsed_row || want_fn_row != fn_row {
+                 // release what is held: another program, another row
+                 for (_, (layer, btn)) in touches.drain() {
+                     layers[layer].buttons[btn].1.set_active(&mut uinput, false);
+                 }
+                 base_is_media = want_media;
+                 collapsed_row = want_row;
++                fn_row = want_fn_row;
+                 // each program starts with its own strip state
+                 expanded = want_expanded;
+                 current_app = app;
+@@ -1704,7 +1796,7 @@ fn real_main(drm: &mut DrmBackend) {
+                 needs_complete_redraw = true;
+             }
+         }
+-        let wanted_row = row(base_is_media, fn_held, expanded, collapsed_row);
++        let wanted_row = row(base_is_media, fn_held, expanded, collapsed_row, fn_row);
+         if wanted_row != active_layer {
+             active_layer = wanted_row;
+             needs_complete_redraw = true;
+@@ -1816,6 +1908,12 @@ fn real_main(drm: &mut DrmBackend) {
+                 drm.dirty(&[ClipRect::new(0, 0, height, width)]).unwrap();
+             }
+         }
++        let notice_shown = notice_now(&cfg, &session, notice_dismissed)
++            .filter(|_| slider.is_none() && media.is_none())
++            .map(|n| n.at_ms);
++        if notice_shown != notice_drawn {
++            needs_complete_redraw = true;
++        }
+         let touchid = touchid_now(&cfg, &session, touchid_flash);
+         // the arrow moves while it waits; a result ends after TOUCHID_FLASH
+         let touchid_moving = touchid == Some(state::TouchId::Waiting) && anim::enabled();
+@@ -1880,24 +1978,27 @@ fn real_main(drm: &mut DrmBackend) {
+                     clips = vec![ClipRect::new(0, 0, height, width)];
+                 }
+             }
+-            if let Some(m) = &media {
+-                let layout = media_layout(&cfg, &layers[active_layer], width);
++            // the panel lies over the program's part (under a slider: hidden)
++            if let (Some(m), None) = (&media, &slider) {
++                let layout = media_layout(&cfg, &layers[active_layer], width, session.playing.as_ref().map_or(1, |n| n.players));
+                 let sx = shift.0 + pixel_shift_width(&cfg) / 2.0;
+                 let full = needs_complete_redraw || layer_changed;
+                 let c = Context::new(&surface).unwrap();
+                 c.translate(height as f64, 0.0);
+                 c.rotate((90.0f64).to_radians());
+-                if full {
+-                    // dark right of Esc
++                if full || media_full {
++                    // dark over the program's keys
+                     c.set_source_rgb(0.0, 0.0, 0.0);
+-                    c.rectangle(layout.left + sx - cfg.group_spacing / 2.0, 0.0, width as f64, height as f64);
++                    c.rectangle(layout.left + sx - cfg.group_spacing / 2.0, 0.0, layout.right - layout.left + cfg.group_spacing, height as f64);
+                     c.fill().unwrap();
+                 }
+                 c.set_font_face(&cfg.font_face);
+                 m.draw(&c, &cfg, &layout, session.playing.as_ref(), height as f64, (sx, shift.1), full || media_full);
+                 drop(c);
+                 if full || media_full {
+-                    clips = vec![ClipRect::new(0, 0, height, width)];
++                    let x1 = (layout.left + sx - cfg.group_spacing).max(0.0) as u16;
++                    let x2 = ((layout.right + sx + cfg.group_spacing) as u16).min(width);
++                    clips.push(ClipRect::new(0, x1, height, x2));
+                 } else {
+                     let (cl, cw) = layout.capsule;
+                     let x1 = (cl + sx - 2.0).max(0.0) as u16;
+@@ -1905,6 +2006,17 @@ fn real_main(drm: &mut DrmBackend) {
+                     clips.push(ClipRect::new(0, x1, height, x2));
+                 }
+             }
++            if let (Some(n), true) = (notice_now(&cfg, &session, notice_dismissed), notice_shown.is_some()) {
++                let area = app_area(&cfg, &layers[active_layer], width);
++                let sx = shift.0 + pixel_shift_width(&cfg) / 2.0;
++                let c = Context::new(&surface).unwrap();
++                c.translate(height as f64, 0.0);
++                c.rotate((90.0f64).to_radians());
++                notice::draw(&c, &cfg, area, height as f64, (sx, shift.1), n, bell.as_ref());
++                drop(c);
++                clips = vec![ClipRect::new(0, 0, height, width)];
++            }
++            notice_drawn = notice_shown;
+             if let Some(kind) = touchid {
+                 let avail = width as f64 - pixel_shift_width(&cfg);
+                 let left = if width >= 2170 {
+@@ -1951,6 +2063,14 @@ fn real_main(drm: &mut DrmBackend) {
+             next_timeout_ms = min(next_timeout_ms, ms.max(1));
+             media_dirty = true;
+         }
++        // a notification: wake when it ends
++        if let Some(n) = notice_now(&cfg, &session, notice_dismissed) {
++            let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
++            let left = n.at_ms + cfg.notification_time.as_millis() as i64 - now_ms;
++            next_timeout_ms = min(next_timeout_ms, left.clamp(1, i32::MAX as i64) as i32);
++        } else if notice_drawn.is_some() {
++            next_timeout_ms = min(next_timeout_ms, 1);
++        }
+         // Touch ID: the arrow's frames (15 a second), the end of a result
+         if touchid_now(&cfg, &session, touchid_flash).is_some() {
+             next_timeout_ms = min(next_timeout_ms, 66);
+@@ -2033,6 +2153,14 @@ fn real_main(drm: &mut DrmBackend) {
+                                     }
+                                 }
+                             }
++                            if let Some(at) = notice_drawn {
++                                let (l, r) = app_area(&cfg, &layers[active_layer], width);
++                                if x - half_shift >= l - 4.0 && x - half_shift < r + 4.0 {
++                                    // a tap on the notification takes it away
++                                    notice_dismissed = at;
++                                    continue;
++                                }
++                            }
+                             if touchid_drawn.is_some() {
+                                 // under the Touch ID hint only Esc
+                                 if layers[active_layer].hit(&cfg, width, height, x, y, None) == Some(0) {
+@@ -2042,7 +2170,7 @@ fn real_main(drm: &mut DrmBackend) {
+                                 continue;
+                             }
+                             if let Some(m) = &mut media {
+-                                let layout = media_layout(&cfg, &layers[active_layer], width);
++                                let layout = media_layout(&cfg, &layers[active_layer], width, session.playing.as_ref().map_or(1, |n| n.players));
+                                 match layout.hit(x - half_shift) {
+                                     media::Hit::Close => {
+                                         media = None;
+@@ -2054,6 +2182,11 @@ fn real_main(drm: &mut DrmBackend) {
+                                         media_full = true;
+                                         continue;
+                                     }
++                                    media::Hit::Switch => {
++                                        m.switching = Some(dn.seat_slot());
++                                        media_full = true;
++                                        continue;
++                                    }
+                                     media::Hit::Scrub => {
+                                         if session.playing.as_ref().is_some_and(|n| n.can_seek && n.length_us > 0) {
+                                             m.scrub = Some((dn.seat_slot(), layout.fraction_at(x - half_shift)));
+@@ -2061,13 +2194,18 @@ fn real_main(drm: &mut DrmBackend) {
+                                         }
+                                         continue;
+                                     }
+-                                    media::Hit::Outside => {} // Esc
++                                    media::Hit::Outside => {} // Esc, the strip
+                                 }
+                             }
+                             let hit = layers[active_layer]
+                                 .hit(&cfg, width, height, x, y, None)
+-                                // under the slider nothing, under the panel only Esc
+-                                .filter(|&b| slider.is_none() && (media.is_none() || b == 0));
++                                // under the slider nothing, beside the panel Esc and the strip
++                                .filter(|&b| {
++                                    slider.is_none()
++                                        && (media.is_none()
++                                            || b == 0
++                                            || layers[active_layer].strip_start().is_some_and(|s| b >= s))
++                                });
+                             if let Some(btn) = hit {
+                                 touches.insert(dn.seat_slot(), (active_layer, btn));
+                                 let button = &mut layers[active_layer].buttons[btn].1;
+@@ -2107,7 +2245,7 @@ fn real_main(drm: &mut DrmBackend) {
+                             if let Some(m) = &mut media {
+                                 if let Some((slot, _)) = m.scrub {
+                                     if slot == mtn.seat_slot() {
+-                                        let layout = media_layout(&cfg, &layers[active_layer], width);
++                                        let layout = media_layout(&cfg, &layers[active_layer], width, session.playing.as_ref().map_or(1, |n| n.players));
+                                         m.scrub = Some((slot, layout.fraction_at(x - half_shift)));
+                                         media_dirty = true;
+                                         continue;
+@@ -2184,6 +2322,12 @@ fn real_main(drm: &mut DrmBackend) {
+                                 }
+                             }
+                             if let Some(m) = &mut media {
++                                if m.switching == Some(up.seat_slot()) {
++                                    m.switching = None;
++                                    let _ = slider::bridge_send("player next");
++                                    media_full = true;
++                                    continue;
++                                }
+                                 if let Some((slot, k)) = m.pressed {
+                                     if slot == up.seat_slot() {
+                                         m.pressed = None;
+@@ -2255,8 +2399,12 @@ fn real_main(drm: &mut DrmBackend) {
+                                 }
+                                 // handled with layout_hold above
+                                 Some(Command::Layout) => {}
++                                Some(Command::Dnd) => {
++                                    let _ = slider::bridge_send("dnd toggle");
++                                }
+                                 Some(Command::NowPlaying) => {
+-                                    media = Some(media::Panel::new());
++                                    // a second tap closes it
++                                    media = if media.is_some() { None } else { Some(media::Panel::new()) };
+                                     slider = None;
+                                     needs_complete_redraw = true;
+                                 }
+diff --git a/src/media.rs b/src/media.rs
+index 3a66a9e..34711b0 100644
+--- a/src/media.rs
++++ b/src/media.rs
+@@ -1,8 +1,9 @@
+ // "Now playing" (macOS style): a button (Command = "NowPlaying") shown while
+ // the helper follows a media player with a track; tapped it opens a panel
+-// over the row right of Esc: a round close button, previous / play-pause /
+-// next, and a capsule with title, artist, time and a scrubber. Dragging the
+-// scrubber seeks on release. Commands go to the helper (mbp-touchbar-bridge:
++// over the program's part of the row (the Control Strip stays usable, for
++// the volume): a round close button, previous / play-pause / next, a switch
++// to the next player when there are several, and a capsule with title,
++// artist, player, time and a scrubber. Dragging the scrubber seeks on release. Commands go to the helper (mbp-touchbar-bridge:
+ // MPRIS of that player); without it the three keys are media keys.
+ use crate::{config::Config, state::NowPlaying};
+ use cairo::Context;
+@@ -17,6 +18,7 @@ const TIME_SIZE: f64 = 18.0;
+ const TRACK_HEIGHT: f64 = 5.0;
+ const KNOB_RADIUS: f64 = 8.0;
+ const PAD: f64 = 18.0;
++const SWITCH_WIDTH: f64 = 90.0;
+ 
+ #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+ pub enum Key {
+@@ -28,6 +30,7 @@ pub enum Key {
+ pub enum Hit {
+     Close,
+     Key(Key),
++    Switch,
+     Scrub,
+     Outside,
+ }
+@@ -37,13 +40,16 @@ pub struct Layout {
+     pub left: f64,
+     pub close: (f64, f64),
+     pub keys: [(f64, f64); 3],
++    // the next-player key, when there are several players
++    pub switch: Option<(f64, f64)>,
+     pub capsule: (f64, f64),
++    pub right: f64,
+     pub track: (f64, f64),
+ }
+ 
+ impl Layout {
+-    /// `left`: first px after Esc and its gap, `right`: end of the row
+-    pub fn new(cfg: &Config, left: f64, right: f64) -> Layout {
++    /// `left`..`right`: the program's part of the row
++    pub fn new(cfg: &Config, left: f64, right: f64, switch: bool) -> Layout {
+         let close = (left, CLOSE_BOX);
+         let mut x = close.0 + close.1 + cfg.group_spacing;
+         let mut keys = [(0.0, 0.0); 3];
+@@ -51,10 +57,15 @@ impl Layout {
+             *k = (x, KEY_WIDTH);
+             x += KEY_WIDTH + cfg.button_spacing;
+         }
++        let switch = switch.then(|| {
++            let k = (x - cfg.button_spacing + cfg.group_spacing, SWITCH_WIDTH);
++            x = k.0 + k.1 + cfg.button_spacing;
++            k
++        });
+         let capsule = (x - cfg.button_spacing + cfg.group_spacing, 0.0);
+         let capsule = (capsule.0, (right - capsule.0).max(KEY_WIDTH));
+         let track = (capsule.0 + PAD + KNOB_RADIUS, capsule.0 + capsule.1 - PAD - KNOB_RADIUS);
+-        Layout { left, close, keys, capsule, track }
++        Layout { left, close, keys, switch, capsule, right: capsule.0 + capsule.1, track }
+     }
+     pub fn hit(&self, x: f64) -> Hit {
+         let within = |(l, w): (f64, f64)| x >= l - 4.0 && x < l + w + 4.0;
+@@ -68,6 +79,8 @@ impl Layout {
+             Hit::Key(Key::PlayPause)
+         } else if within(self.keys[2]) {
+             Hit::Key(Key::Next)
++        } else if self.switch.is_some_and(within) {
++            Hit::Switch
+         } else if within(self.capsule) {
+             Hit::Scrub
+         } else {
+@@ -82,6 +95,8 @@ impl Layout {
+ pub struct Panel {
+     // a key held (shown pressed)
+     pub pressed: Option<(u32, Key)>,
++    // the next-player key held
++    pub switching: Option<u32>,
+     // the scrubber held: touch slot and where (0..1)
+     pub scrub: Option<(u32, f64)>,
+ }
+@@ -132,7 +147,7 @@ fn fit(c: &Context, text: &str, width: f64) -> String {
+ 
+ impl Panel {
+     pub fn new() -> Panel {
+-        Panel { pressed: None, scrub: None }
++        Panel { pressed: None, switching: None, scrub: None }
+     }
+ 
+     /// `full`: also the close button and the keys (else only the capsule,
+@@ -187,6 +202,25 @@ impl Panel {
+                     }
+                 }
+             }
++            // next player: two arrows, one each way
++            if let Some((l, w)) = layout.switch {
++                let (r, g, b) = if self.switching.is_some() { cfg.button_active_color } else { cfg.button_color };
++                c.set_source_rgb(r, g, b);
++                rounded_rect(c, l + sx, top, w, bh, cfg.button_radius);
++                c.fill().unwrap();
++                let mx = l + w / 2.0 + sx;
++                c.set_source_rgb(1.0, 1.0, 1.0);
++                c.set_line_width(3.0);
++                c.set_line_cap(cairo::LineCap::Round);
++                c.move_to(mx - 16.0, cy - 6.0);
++                c.line_to(mx + 14.0, cy - 6.0);
++                c.move_to(mx + 16.0, cy + 6.0);
++                c.line_to(mx - 14.0, cy + 6.0);
++                c.stroke().unwrap();
++                triangle(c, mx + 10.0, cy - 6.0, 10.0, 12.0, true);
++                triangle(c, mx - 20.0, cy + 6.0, 10.0, 12.0, false);
++                c.fill().unwrap();
++            }
+         }
+         // capsule: title — artist, time, scrubber
+         let (cl, cw) = layout.capsule;
+@@ -205,11 +239,14 @@ impl Panel {
+             return;
+         };
+         let pos = self.scrub.map_or(np.position_now(), |(_, f)| (f * np.length_us as f64) as i64);
+-        let times = if np.length_us > 0 {
++        let mut times = if np.length_us > 0 {
+             format!("{} / {}", time(pos), time(np.length_us))
+         } else {
+             time(pos)
+         };
++        if np.players > 1 && !np.player.is_empty() {
++            times = format!("{}   {times}", np.player);
++        }
+         c.set_font_size(TIME_SIZE);
+         let tw = c.text_extents(&times).map_or(0.0, |e| e.x_advance());
+         c.set_source_rgb(0.7, 0.7, 0.7);
+diff --git a/src/notice.rs b/src/notice.rs
+new file mode 100644
+index 0000000..a367c29
+--- /dev/null
++++ b/src/notice.rs
+@@ -0,0 +1,67 @@
++// A notification on the bar (Notifications = true): the helper reports each
++// new one (/run/tiny-dfr/bridge/notification: when, the program, the title;
++// none while do not disturb is on), and for NotificationSeconds a capsule
++// over the program's part of the row shows the icon, the program and the
++// title. A tap on it takes it away; the Control Strip stays usable.
++use crate::{config::Config, state::Notice, Button};
++use cairo::Context;
++
++const ICON_BOX: f64 = 56.0;
++const PAD: f64 = 18.0;
++
++/// `left`..`right`: the program's part of the row (cleared here)
++pub fn draw(c: &Context, cfg: &Config, (left, right): (f64, f64), height: f64, (sx, sy): (f64, f64), notice: &Notice, icon: Option<&Button>) {
++    let bh = if cfg.button_height > 0.0 { cfg.button_height.min(height) } else { height * 0.7 };
++    let top = (height - bh) / 2.0;
++    c.set_source_rgb(0.0, 0.0, 0.0);
++    c.rectangle(left + sx - cfg.group_spacing / 2.0, 0.0, right - left + cfg.group_spacing, height);
++    c.fill().unwrap();
++    let (r, g, b) = cfg.button_color;
++    c.set_source_rgb(r, g, b);
++    let rad = cfg.button_radius.min(bh / 2.0);
++    let w = right - left;
++    c.new_sub_path();
++    c.arc(left + w - rad + sx, top + rad, rad, (-90.0f64).to_radians(), 0.0);
++    c.arc(left + w - rad + sx, top + bh - rad, rad, 0.0, (90.0f64).to_radians());
++    c.arc(left + rad + sx, top + bh - rad, rad, (90.0f64).to_radians(), (180.0f64).to_radians());
++    c.arc(left + rad + sx, top + rad, rad, (180.0f64).to_radians(), (270.0f64).to_radians());
++    c.close_path();
++    c.fill().unwrap();
++    let mut x = left + PAD;
++    if let Some(icon) = icon {
++        c.set_source_rgb(1.0, 1.0, 1.0);
++        icon.render(c, height as i32, x + sx, ICON_BOX as u64, sy);
++        x += ICON_BOX + 8.0;
++    }
++    c.set_font_face(&cfg.font_face);
++    c.set_font_size(cfg.font_size * 0.85);
++    let room = right - PAD - x;
++    let base = (height / 2.0 + 9.0).round() + sy;
++    let app = fit(c, &notice.app, room * 0.4);
++    c.set_source_rgb(0.65, 0.65, 0.67);
++    c.move_to(x + sx, base);
++    let _ = c.show_text(&app);
++    let used = c.text_extents(&app).map_or(0.0, |e| e.x_advance());
++    if !notice.summary.is_empty() {
++        let sep = if app.is_empty() { "" } else { "   " };
++        let summary = fit(c, &format!("{sep}{}", notice.summary), room - used);
++        c.set_source_rgb(1.0, 1.0, 1.0);
++        let _ = c.show_text(&summary);
++    }
++}
++
++/// `text` cut to fit `width` at the current font size, with an ellipsis
++fn fit(c: &Context, text: &str, width: f64) -> String {
++    if c.text_extents(text).map_or(0.0, |e| e.x_advance()) <= width {
++        return text.to_string();
++    }
++    let mut chars: Vec<char> = text.chars().collect();
++    while !chars.is_empty() {
++        chars.pop();
++        let t = chars.iter().collect::<String>().trim_end().to_string() + "…";
++        if c.text_extents(&t).map_or(0.0, |e| e.x_advance()) <= width {
++            return t;
++        }
++    }
++    String::new()
++}
+diff --git a/src/state.rs b/src/state.rs
+index 1febc49..ef690d4 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -24,6 +24,18 @@ pub struct State {
+     pub layout: Option<(usize, Vec<String>)>,
+     /// fingerprint verification and when it was reported (ms since the epoch)
+     pub touchid: Option<(TouchId, i64)>,
++    /// do not disturb is on
++    pub dnd: Option<bool>,
++    /// the latest notification
++    pub notice: Option<Notice>,
++}
++
++/// .../notification: when (ms since the epoch), the program, the title
++#[derive(Default, Clone, PartialEq, Debug)]
++pub struct Notice {
++    pub at_ms: i64,
++    pub app: String,
++    pub summary: String,
+ }
+ 
+ #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+@@ -48,6 +60,9 @@ pub struct NowPlaying {
+     pub at_ms: i64,
+     pub rate: f64,
+     pub can_seek: bool,
++    /// the player's name, and how many players have a track
++    pub player: String,
++    pub players: usize,
+ }
+ 
+ impl NowPlaying {
+@@ -65,6 +80,8 @@ impl NowPlaying {
+                 "at_ms" => np.at_ms = value.parse().unwrap_or(0),
+                 "rate" => np.rate = value.parse().unwrap_or(1.0),
+                 "can_seek" => np.can_seek = value == "1",
++                "player" => np.player = value.to_string(),
++                "players" => np.players = value.parse().unwrap_or(1),
+                 _ => {}
+             }
+         }
+@@ -132,7 +149,15 @@ impl StateWatch {
+             };
+             Some((kind, w.next()?.parse::<i64>().ok()?))
+         });
+-        State { volume, mic_muted, playing, layout, touchid }
++        let dnd = read_to_string(format!("{DIR}/dnd")).ok().map(|s| s.trim() == "1");
++        let notice = read_to_string(format!("{DIR}/notification")).ok().and_then(|s| {
++            let mut lines = s.lines();
++            let at_ms = lines.next()?.trim().parse::<i64>().ok()?;
++            let app = lines.next().unwrap_or("").to_string();
++            let summary = lines.next().unwrap_or("").to_string();
++            Some(Notice { at_ms, app, summary })
++        });
++        State { volume, mic_muted, playing, layout, touchid, dnd, notice }
+     }
+     pub fn fd(&self) -> &impl AsFd {
+         &self.inotify_fd
+-- 
+2.53.0
+

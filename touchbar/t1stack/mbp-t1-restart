@@ -1,0 +1,17 @@
+#!/bin/bash
+# Hotkey (Meta+Ctrl+T, KDE): restart tiny-dfr, also after it fell back to
+# mbp-t1-fallback. No password: the polkit rule 50-mbp-t1-restart.rules lets
+# wheel do reset-failed/start/restart of tiny-dfr.service only.
+n() { notify-send -a "Touch Bar" -i input-keyboard "$@"; }
+c=$(cat /sys/bus/usb/devices/1-3/bConfigurationValue 2>/dev/null)
+if [[ $c != 2 ]]; then
+	n "Touch Bar" "T1 in configuration ${c:-?}: the T1 draws the Touch Bar itself, nothing to restart."
+	exit 0
+fi
+systemctl reset-failed tiny-dfr.service 2>/dev/null
+if systemctl restart tiny-dfr.service; then
+	sleep 2
+	n "Touch Bar" "tiny-dfr: $(systemctl is-active tiny-dfr.service)"
+else
+	n "Touch Bar" "tiny-dfr did not restart (journalctl -u tiny-dfr)"
+fi

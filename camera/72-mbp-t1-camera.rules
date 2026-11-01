@@ -1,0 +1,7 @@
+# T1 configuration 2: its camera nodes give only H.264, which programs cannot
+# use; mbp-t1-camera (group video) reads them and offers "FaceTime HD Camera"
+# (v4l2loopback) instead. Without uaccess the desktop user cannot open them,
+# so programs list only the virtual camera. Configuration 1 (1-3:1.x) is not
+# touched. Before 73-seat-late.rules, which turns the uaccess tag into ACLs;
+# ID_VENDOR_ID/ID_MODEL_ID come from 60-persistent-v4l.rules (usb_id).
+SUBSYSTEM=="video4linux", KERNELS=="*:2.0", ENV{ID_VENDOR_ID}=="05ac", ENV{ID_MODEL_ID}=="8600", TAG-="uaccess"

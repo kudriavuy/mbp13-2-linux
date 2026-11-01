@@ -1,0 +1,66 @@
+# T1Bridge (standardagents, MIT) Touch ID services only, for the MacBookPro13,2
+# T1 with our own Touch Bar stack (tiny-dfr, mbp-t1-display): no renderer, no
+# kernel modules (apple-t1-ncm is our DKMS), no recovery, no automatic import.
+# Built by build.sh (makepkg or a container).
+pkgname=t1bridge-touchid
+pkgver=0.1.12
+pkgrel=2
+_commit=81cbdf81026a16e02f0bea74735c6b029a8ffae2
+pkgdesc="T1Bridge Touch ID services (xART storage, keybag relay, broker, importer) for MacBookPro13,2"
+arch=(x86_64)
+url="https://github.com/standardagents/t1bridge"
+license=(MIT)
+depends=(curl gcc-libs glibc libarchive openssl 'systemd>=256' xz)
+makedepends=(cargo git pkgconf rust)
+conflicts=(t1bridge)
+options=('!debug')
+source=("git+https://github.com/standardagents/t1bridge.git#commit=$_commit"
+        0001-Refuse-recovery-USB-cycles-and-automatic-import.patch
+        91-t1bridge-xart-move.rules)
+sha256sums=('SKIP'
+            '88e5bfd9fadb8759e1c33c418376ba36e08583f9ded7e1d26da05e4b0007605b'
+            '20c0348cf5de186540107d25ab02be8f3b77a08f8166dee9abebb7336ac5567f')
+
+prepare() {
+	cd t1bridge
+	for p in "$srcdir"/0*.patch; do
+		patch -Np1 -i "$p"
+	done
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+	cd t1bridge
+	cargo build --frozen --release -p t1-daemons --bin t1-ncm-ready
+	cargo build --frozen --release -p t1-daemons --bin t1-xart-storage
+	cargo build --frozen --release -p t1-daemons --bin t1-keybag-relay --features keybag-relay-service
+	cargo build --frozen --release -p t1-daemons --bin t1-touchid-auth --features auth-broker-service
+	cargo build --frozen --release -p t1-import --bin t1bridge
+}
+
+check() {
+	cd t1bridge
+	# the CLI tests, our refusal test among them
+	cargo test --frozen --release -p t1-import --bin t1bridge
+}
+
+package() {
+	cd t1bridge
+	local b
+	for b in t1-ncm-ready t1-xart-storage t1-keybag-relay t1-touchid-auth; do
+		install -Dm755 target/release/$b "$pkgdir/usr/lib/t1bridge/$b"
+	done
+	install -Dm755 target/release/t1bridge "$pkgdir/usr/bin/t1bridge"
+	local u
+	for u in t1-ncm-ready@.service t1-xart-storage@.service t1bridge-keybag.service \
+		t1-touchid-auth.service t1-touchid-auth.socket t1bridge-fingerprint.socket; do
+		install -Dm644 systemd/$u "$pkgdir/usr/lib/systemd/system/$u"
+	done
+	install -Dm644 systemd/90-t1bridge-xart.rules "$pkgdir/usr/lib/udev/rules.d/90-t1bridge-xart.rules"
+	install -Dm644 "$srcdir"/91-t1bridge-xart-move.rules "$pkgdir/usr/lib/udev/rules.d/91-t1bridge-xart-move.rules"
+	install -Dm644 systemd/t1bridge.sysusers "$pkgdir/usr/lib/sysusers.d/t1bridge.conf"
+	install -Dm644 systemd/t1bridge.conf "$pkgdir/usr/lib/tmpfiles.d/t1bridge.conf"
+	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -Dm644 THIRD_PARTY_NOTICES.md "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES.md"
+	install -Dm644 "$srcdir"/0*.patch -t "$pkgdir/usr/share/doc/$pkgname/patches/"
+}

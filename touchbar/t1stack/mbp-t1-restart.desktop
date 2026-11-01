@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Restart Touch Bar (tiny-dfr)
+Name[uk]=Перезапустити Touch Bar (tiny-dfr)
+Exec=/usr/local/bin/mbp-t1-restart
+Icon=input-keyboard
+NoDisplay=true
+X-KDE-Shortcuts=Meta+Ctrl+T

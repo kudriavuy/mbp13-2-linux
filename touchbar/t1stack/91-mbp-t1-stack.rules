@@ -1,0 +1,9 @@
+# Stage 7: device units for tiny-dfr.service (its BindsTo=) and
+# mbp-t1-fallback.service, only for the T1 in configuration 2 (appletbdrm
+# display, hid-t1-touchbar backlight; in configuration 1 the backlight
+# belongs to hid-appletb-bl and gets no alias).
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DRIVERS=="appletbdrm", TAG+="systemd", ENV{SYSTEMD_ALIAS}+="/dev/tiny_dfr_display"
+SUBSYSTEM=="backlight", KERNEL=="appletb_backlight", DRIVERS=="hid-t1-touchbar", TAG+="systemd", ENV{SYSTEMD_ALIAS}+="/dev/tiny_dfr_backlight"
+# tiny-dfr.service also Wants=/After= the display backlight; without this
+# alias it waited 90 s for the device timeout (as upstream: acpi_video0).
+SUBSYSTEM=="backlight", KERNEL=="acpi_video0", TAG+="systemd", ENV{SYSTEMD_ALIAS}+="/dev/tiny_dfr_display_backlight"

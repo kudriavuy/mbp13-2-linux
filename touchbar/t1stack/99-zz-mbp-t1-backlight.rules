@@ -1,0 +1,5 @@
+# Stage 7: tiny-dfr sets the configuration-2 Touch Bar brightness itself;
+# keep systemd-backlight (wanted by 99-systemd.rules, hence this name sorting
+# after it) off that device only, as upstream tiny-dfr does with a mask.
+# The configuration-1 device (hid-appletb-bl) keeps it.
+SUBSYSTEM=="backlight", KERNEL=="appletb_backlight", DRIVERS=="hid-t1-touchbar", ENV{SYSTEMD_WANTS}=""

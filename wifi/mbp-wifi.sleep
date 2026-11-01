@@ -1,0 +1,60 @@
+#!/bin/bash
+# systemd-sleep hook (/usr/lib/systemd/system-sleep/mbp-wifi): unload brcmfmac
+# for the sleep and load it again after, only when Wi-Fi is on (airplane mode,
+# a soft-blocked radio: nothing happens; Bluetooth, hci_bcm on UART, is
+# another driver and not touched). On the charger the Broadcom firmware,
+# alive in D3, woke the Mac a few seconds into a sleep with the lid closed,
+# through no GPE the OS sees. A soft block (rfkill) did not always stop it
+# (2026-10-22: 3 self-wakes in a row); unloading resets the chip, no firmware
+# is left running: 7 of 7 clean, reconnect 3.8-4.3 s (about 1.5 s more than
+# with rfkill: firmware and NVRAM load again). The PCI wakeup of
+# 00:1d.3/02:00.0 is no fix (brcmfmac turns it back on at every probe).
+# After the resume the reconnect is watched and logged; not connected after
+# 25 s (iwd's first attempt right after a firmware load can fail with status
+# 16; it retries after a full scan): one 'nmcli device connect'.
+# Journal tag: mbp-wifi-sleep.
+M=/run/mbp-wifi-sleep
+W=0000:02:00.0
+log() { logger -t mbp-wifi-sleep "$*"; }
+now() { date +%s.%N; }
+case $1 in
+pre)
+	rm -f $M
+	# back-to-back sleeps: a modprobe of the last resume finishes first, then
+	# its reconnect watch goes
+	for _ in $(seq 20); do pgrep -x modprobe >/dev/null || break; sleep 0.5; done
+	systemctl stop mbp-wifi-load.service 2>/dev/null
+	soft=
+	for r in /sys/class/rfkill/rfkill*; do
+		[[ $(cat $r/type) == wlan ]] && soft=$(cat $r/soft)
+	done
+	if [[ $soft != 0 ]]; then
+		log "pre: Wi-Fi off or blocked (soft=${soft:--}): brcmfmac stays"
+		exit 0
+	fi
+	t=$(now)
+	modprobe -r brcmfmac_wcc brcmfmac && touch $M
+	log "pre: brcmfmac $([[ -e $M ]] && echo unloaded || echo NOT unloaded) in $(awk -v a="$t" -v b="$(now)" 'BEGIN{printf "%.2f", b-a}') s; $W $(cat /sys/bus/pci/devices/$W/power_state 2>/dev/null)" ;;
+post)
+	[[ -e $M ]] || { log "post: nothing to do"; exit 0; }
+	rm -f $M
+	# in a transient unit: loading (firmware, NVRAM) would otherwise hold the
+	# thaw of the desktop
+	systemd-run --no-block --collect --unit=mbp-wifi-load /bin/bash -c '
+		log() { logger -t mbp-wifi-sleep "$*"; }
+		t0=$(date +%s.%N)
+		modprobe brcmfmac
+		st() { nmcli -t -f TYPE,STATE device 2>/dev/null | awk -F: "\$1 == \"wifi\" {print \$2; exit}"; }
+		for i in $(seq 120); do
+			[[ $(st) == connected ]] && break
+			if ((i == 50)); then
+				log "post: not connected after 25 s ($(st)): nmcli device connect"
+				d=$(nmcli -t -f DEVICE,TYPE device | awk -F: "\$2 == \"wifi\" {print \$1; exit}")
+				[[ -n $d ]] && nmcli device connect "$d" >/dev/null 2>&1
+			fi
+			sleep 0.5
+		done
+		log "post: brcmfmac loaded, Wi-Fi $(st) after $(awk -v a="$t0" -v b="$(date +%s.%N)" "BEGIN{printf \"%.1f\", b-a}") s"'
+	log "post: loading brcmfmac" ;;
+esac
+exit 0

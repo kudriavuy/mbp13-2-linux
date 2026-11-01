@@ -1,0 +1,622 @@
+From 0958223205e85133cd716dae9d30e90000264773 Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 19:48:36 +0100
+Subject: [PATCH] Configurable button look and a PNG preview mode
+
+Colours, height, corner radius, gaps and text/icon sizes of the buttons come
+from the config (FontSize, IconSize, ButtonColor, ButtonActiveColor,
+ButtonHeight, ButtonRadius, ButtonSpacing, GroupSpacing, EscWidth); without
+them the upstream look stays. Per button, Width gives a fixed width and
+Group = true a wider gap before it, so that rows can be laid out like the
+macOS Touch Bar (narrow Esc, grouped keys).
+
+Drawing and touch use one layout function now: before, hit() ignored the
+room reserved for pixel shift and the two could disagree by up to 11 px. A
+touch in a gap goes to the nearer button instead of nowhere. A partial
+redraw clears and updates the whole button column.
+
+TINY_DFR_RENDER_PNG=<file> draws the configured layers into a PNG (base
+layer, the same with a pressed button, the Fn layer) without touching DRM
+or input, for checking a layout before installing it.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ share/tiny-dfr/config.toml |  14 ++
+ src/config.rs              |  62 ++++++++-
+ src/main.rs                | 260 +++++++++++++++++++++++--------------
+ 3 files changed, 237 insertions(+), 99 deletions(-)
+
+diff --git a/share/tiny-dfr/config.toml b/share/tiny-dfr/config.toml
+index e19815f..4c8f5b8 100644
+--- a/share/tiny-dfr/config.toml
++++ b/share/tiny-dfr/config.toml
+@@ -24,6 +24,20 @@ EnablePixelShift = false
+ # https://www.freedesktop.org/software/fontconfig/fontconfig-user.html
+ FontTemplate = ":bold"
+ 
++# Look of the buttons. Without these keys the upstream look stays.
++# FontSize = 32            # text size in px
++# IconSize = 48            # default icon size in px (IconWidth/IconHeight per button win)
++# ButtonColor = "#333333"  # button background, and while pressed
++# ButtonActiveColor = "#666666"
++# ButtonHeight = 0         # px; 0 means 70 % of the bar
++# ButtonRadius = 8         # corner radius in px
++# ButtonSpacing = 16       # gap between buttons in px
++# GroupSpacing = 16        # gap before a button with Group = true (default ButtonSpacing)
++# EscWidth = 0             # fixed width of the Esc key tiny-dfr adds; 0 or unset: like the others
++# Per button: Width = <px> gives a fixed width (Stretch shares the rest),
++# Group = true puts a GroupSpacing gap before it. A button with neither Text
++# nor Icon is an empty spacer, which can be used to push others aside.
++
+ # Set this to false if you want the brightness of the touchbar
+ # to be set to a static value instead of following the primary
+ # screen's brightness
+diff --git a/src/config.rs b/src/config.rs
+index 44d7cb7..d0a4110 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -1,5 +1,5 @@
+ use crate::fonts::{FontConfig, Pattern};
+-use crate::FunctionLayer;
++use crate::{FunctionLayer, DEFAULT_ICON_SIZE};
+ use anyhow::Error;
+ use cairo::FontFace;
+ use freetype::Library as FtLibrary;
+@@ -24,6 +24,13 @@ pub struct Config {
+     pub active_brightness: u32,
+     pub double_press_switch_layers: u32,
+     pub media_layer_default: bool,
++    pub button_color: (f64, f64, f64),
++    pub button_active_color: (f64, f64, f64),
++    pub button_height: f64,
++    pub button_radius: f64,
++    pub button_spacing: f64,
++    pub group_spacing: f64,
++    pub font_size: f64,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -38,6 +45,15 @@ struct ConfigProxy {
+     double_press_switch_layers: Option<u32>,
+     primary_layer_keys: Option<Vec<ButtonConfig>>,
+     media_layer_keys: Option<Vec<ButtonConfig>>,
++    button_color: Option<String>,
++    button_active_color: Option<String>,
++    button_height: Option<u32>,
++    button_radius: Option<u32>,
++    button_spacing: Option<u32>,
++    group_spacing: Option<u32>,
++    font_size: Option<u32>,
++    icon_size: Option<i32>,
++    esc_width: Option<u32>,
+ }
+ 
+ fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<Key>, D::Error>
+@@ -82,6 +98,22 @@ pub struct ButtonConfig {
+     pub stretch: Option<usize>,
+     pub icon_width: Option<i32>,
+     pub icon_height: Option<i32>,
++    pub width: Option<u32>,
++    pub group: Option<bool>,
++}
++
++// "#rrggbb" -> (r, g, b) in 0..1; a bad value keeps the default
++fn parse_color(name: &str, value: Option<String>, default: (f64, f64, f64)) -> (f64, f64, f64) {
++    let Some(value) = value else { return default };
++    let hex = value.trim().trim_start_matches('#');
++    let channel = |i: usize| hex.get(i..i + 2).and_then(|c| u8::from_str_radix(c, 16).ok());
++    match (hex.len(), channel(0), channel(2), channel(4)) {
++        (6, Some(r), Some(g), Some(b)) => (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0),
++        _ => {
++            eprintln!("{name} = \"{value}\" is not #rrggbb; using the default");
++            default
++        }
++    }
+ }
+ 
+ fn load_font(name: &str) -> FontFace {
+@@ -122,11 +154,24 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
+         base.primary_layer_keys = user.primary_layer_keys.or(base.primary_layer_keys);
+         base.active_brightness = user.active_brightness.or(base.active_brightness);
+         base.double_press_switch_layers = user.double_press_switch_layers.or(base.double_press_switch_layers);
++        base.button_color = user.button_color.or(base.button_color);
++        base.button_active_color = user.button_active_color.or(base.button_active_color);
++        base.button_height = user.button_height.or(base.button_height);
++        base.button_radius = user.button_radius.or(base.button_radius);
++        base.button_spacing = user.button_spacing.or(base.button_spacing);
++        base.group_spacing = user.group_spacing.or(base.group_spacing);
++        base.font_size = user.font_size.or(base.font_size);
++        base.icon_size = user.icon_size.or(base.icon_size);
++        base.esc_width = user.esc_width.or(base.esc_width);
+     };
+     let mut media_layer_keys = base.media_layer_keys.unwrap();
+     let mut primary_layer_keys = base.primary_layer_keys.unwrap();
+     if width >= 2170 {
+         for layer in [&mut media_layer_keys, &mut primary_layer_keys] {
++            // the key after Esc starts a new group (a wider gap)
++            if let Some(first) = layer.first_mut() {
++                first.group.get_or_insert(true);
++            }
+             layer.insert(
+                 0,
+                 ButtonConfig {
+@@ -140,12 +185,16 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
+                     battery: None,
+                     icon_width: None,
+                     icon_height: None,
++                    width: base.esc_width.filter(|w| *w > 0),
++                    group: None,
+                 },
+             );
+         }
+     }
+-    let media_layer = FunctionLayer::with_config(media_layer_keys);
+-    let fkey_layer = FunctionLayer::with_config(primary_layer_keys);
++    // the defaults are the upstream look
++    let icon_size = base.icon_size.unwrap_or(DEFAULT_ICON_SIZE);
++    let media_layer = FunctionLayer::with_config(media_layer_keys, icon_size);
++    let fkey_layer = FunctionLayer::with_config(primary_layer_keys, icon_size);
+     let layers = if base.media_layer_default.unwrap() {
+         [media_layer, fkey_layer]
+     } else {
+@@ -159,6 +208,13 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
+         active_brightness: base.active_brightness.unwrap(),
+         double_press_switch_layers: base.double_press_switch_layers.unwrap(),
+         media_layer_default: base.media_layer_default.unwrap(),
++        button_color: parse_color("ButtonColor", base.button_color, (0.2, 0.2, 0.2)),
++        button_active_color: parse_color("ButtonActiveColor", base.button_active_color, (0.4, 0.4, 0.4)),
++        button_height: base.button_height.unwrap_or(0) as f64,
++        button_radius: base.button_radius.unwrap_or(8) as f64,
++        button_spacing: base.button_spacing.unwrap_or(16) as f64,
++        group_spacing: base.group_spacing.or(base.button_spacing).unwrap_or(16) as f64,
++        font_size: base.font_size.unwrap_or(32) as f64,
+     };
+     (cfg, layers)
+ }
+diff --git a/src/main.rs b/src/main.rs
+index 87fbda3..cb9b86e 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -57,10 +57,7 @@ use display::DrmBackend;
+ use layer_switch::LayerSwitch;
+ use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
+ 
+-const BUTTON_SPACING_PX: i32 = 16;
+-const BUTTON_COLOR_INACTIVE: f64 = 0.200;
+-const BUTTON_COLOR_ACTIVE: f64 = 0.400;
+-const DEFAULT_ICON_SIZE: i32 = 48;
++pub const DEFAULT_ICON_SIZE: i32 = 48;
+ const TIMEOUT_MS: i32 = 10 * 1000;
+ 
+ #[derive(Clone, Copy, PartialEq, Eq)]
+@@ -108,6 +105,10 @@ struct Button {
+     action: Vec<Key>,
+     icon_width: f64,
+     icon_height: f64,
++    // a fixed width in px (Width), else a share of the free space (Stretch)
++    fixed_width: Option<f64>,
++    // a group gap before this button (Group)
++    group: bool,
+ }
+ 
+ fn try_load_svg(path: &str) -> Result<ButtonImage> {
+@@ -256,7 +257,15 @@ fn get_battery_state(battery: &str) -> (u32, BatteryState) {
+ }
+ 
+ impl Button {
+-    fn with_config(cfg: ButtonConfig) -> Button {
++    fn with_config(cfg: ButtonConfig, icon_size: i32) -> Button {
++        let fixed_width = cfg.width.map(f64::from);
++        let group = cfg.group.unwrap_or(false);
++        let mut button = Button::from_image_config(cfg, icon_size);
++        button.fixed_width = fixed_width;
++        button.group = group;
++        button
++    }
++    fn from_image_config(cfg: ButtonConfig, icon_size: i32) -> Button {
+         if let Some(text) = cfg.text {
+             Button::new_text(text, cfg.action)
+         } else if let Some(icon) = cfg.icon {
+@@ -264,8 +273,8 @@ impl Button {
+                 &icon,
+                 cfg.theme,
+                 cfg.action,
+-                cfg.icon_width.unwrap_or(DEFAULT_ICON_SIZE),
+-                cfg.icon_height.unwrap_or(DEFAULT_ICON_SIZE),
++                cfg.icon_width.unwrap_or(icon_size),
++                cfg.icon_height.unwrap_or(icon_size),
+             )
+         } else if let Some(time) = cfg.time {
+             Button::new_time(cfg.action, &time, cfg.locale.as_deref())
+@@ -287,6 +296,8 @@ impl Button {
+             image: ButtonImage::Spacer,
+             icon_width: 0.0,
+             icon_height: 0.0,
++            fixed_width: None,
++            group: false,
+         }
+     }
+     fn new_text(text: String, action: Vec<Key>) -> Button {
+@@ -297,6 +308,8 @@ impl Button {
+             image: ButtonImage::Text(text),
+             icon_width: 0.0,
+             icon_height: 0.0,
++            fixed_width: None,
++            group: false,
+         }
+     }
+     fn new_icon(
+@@ -315,6 +328,8 @@ impl Button {
+             icon_height: icon_height as f64,
+             active: false,
+             changed: false,
++            fixed_width: None,
++            group: false,
+         }
+     }
+     fn load_battery_image(icon: &str, theme: Option<impl AsRef<str>>) -> Handle {
+@@ -368,6 +383,8 @@ impl Button {
+             ),
+             icon_width: 0.0,
+             icon_height: 0.0,
++            fixed_width: None,
++            group: false,
+         }
+     }
+ 
+@@ -395,6 +412,8 @@ impl Button {
+             image: ButtonImage::Time(format_items, locale),
+             icon_width: 0.0,
+             icon_height: 0.0,
++            fixed_width: None,
++            group: false,
+         }
+     }
+     fn needs_faster_refresh(&self) -> bool {
+@@ -530,16 +549,17 @@ impl Button {
+             toggle_keys(uinput, &self.action, active as i32);
+         }
+     }
+-    fn set_background_color(&self, c: &Context, color: f64) {
++    fn set_background_color(&self, c: &Context, (r, g, b): (f64, f64, f64)) {
+         if let ButtonImage::Battery(battery, _, _) = &self.image {
+             let (_, state) = get_battery_state(battery);
++            let level = r.max(g).max(b);
+             match state {
+-                BatteryState::NotCharging => c.set_source_rgb(color, color, color),
+-                BatteryState::Charging => c.set_source_rgb(0.0, color, 0.0),
+-                BatteryState::Low => c.set_source_rgb(color, 0.0, 0.0),
++                BatteryState::NotCharging => c.set_source_rgb(r, g, b),
++                BatteryState::Charging => c.set_source_rgb(0.0, level, 0.0),
++                BatteryState::Low => c.set_source_rgb(level, 0.0, 0.0),
+             }
+         } else {
+-            c.set_source_rgb(color, color, color);
++            c.set_source_rgb(r, g, b);
+         }
+     }
+ }
+@@ -548,31 +568,28 @@ impl Button {
+ pub struct FunctionLayer {
+     displays_time: bool,
+     displays_battery: bool,
++    // (Stretch, button)
+     buttons: Vec<(usize, Button)>,
+-    virtual_button_count: usize,
+     faster_refresh: bool,
+ }
+ 
+ impl FunctionLayer {
+-    fn with_config(cfg: Vec<ButtonConfig>) -> FunctionLayer {
++    fn with_config(cfg: Vec<ButtonConfig>, icon_size: i32) -> FunctionLayer {
+         if cfg.is_empty() {
+             panic!("Invalid configuration, layer has 0 buttons");
+         }
+ 
+-        let mut virtual_button_count = 0;
+         let displays_time = cfg.iter().any(|cfg| cfg.time.is_some());
+         let displays_battery = cfg.iter().any(|cfg| cfg.battery.is_some());
+         let buttons = cfg
+             .into_iter()
+-            .scan(&mut virtual_button_count, |state, cfg| {
+-                let i = **state;
++            .map(|cfg| {
+                 let mut stretch = cfg.stretch.unwrap_or(1);
+                 if stretch < 1 {
+                     println!("Stretch value must be at least 1, setting to 1.");
+                     stretch = 1;
+                 }
+-                **state += stretch;
+-                Some((i, Button::with_config(cfg)))
++                (stretch, Button::with_config(cfg, icon_size))
+             })
+             .collect::<Vec<_>>();
+         let faster_refresh = buttons.iter().any(|(_, b)| b.needs_faster_refresh());
+@@ -580,10 +597,45 @@ impl FunctionLayer {
+             displays_time,
+             displays_battery,
+             buttons,
+-            virtual_button_count,
+             faster_refresh,
+         }
+     }
++    /// left edge and width of each button in a row `width` px wide: fixed
++    /// widths first, the rest shared by Stretch; Group adds GroupSpacing before
++    /// a button instead of ButtonSpacing. Rounded so that the gaps stay even.
++    fn geometry(&self, config: &Config, width: f64) -> Vec<(f64, f64)> {
++        let gap = |i: usize, b: &Button| match (i, b.group) {
++            (0, _) => 0.0,
++            (_, true) => config.group_spacing,
++            (_, false) => config.button_spacing,
++        };
++        let mut free = width;
++        let mut shares = 0usize;
++        for (i, (stretch, b)) in self.buttons.iter().enumerate() {
++            free -= gap(i, b);
++            match b.fixed_width {
++                Some(w) => free -= w,
++                None => {
++                    // a stretched button also covers the gaps it spans
++                    free -= (*stretch - 1) as f64 * config.button_spacing;
++                    shares += *stretch;
++                }
++            }
++        }
++        let share = if shares > 0 { (free / shares as f64).max(0.0) } else { 0.0 };
++        let mut x = 0.0;
++        let mut out = Vec::with_capacity(self.buttons.len());
++        for (i, (stretch, b)) in self.buttons.iter().enumerate() {
++            x += gap(i, b);
++            let w = b.fixed_width.unwrap_or(
++                *stretch as f64 * share + (*stretch - 1) as f64 * config.button_spacing,
++            );
++            let left = x.floor();
++            out.push((left, (x + w).floor() - left));
++            x += w;
++        }
++        out
++    }
+     fn draw(
+         &mut self,
+         config: &Config,
+@@ -606,13 +658,17 @@ impl FunctionLayer {
+         } else {
+             0
+         };
+-        let virtual_button_width = ((width - pixel_shift_width as i32)
+-            - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32))
+-            as f64
+-            / self.virtual_button_count as f64;
+-        let radius = 8.0f64;
+-        let bot = (height as f64) * 0.15;
+-        let top = (height as f64) * 0.85;
++        let geometry = self.geometry(config, (width - pixel_shift_width as i32) as f64);
++        // ButtonHeight 0: the upstream 70 % of the bar
++        let button_height = if config.button_height > 0.0 {
++            config.button_height.min(height as f64)
++        } else {
++            height as f64 * 0.7
++        };
++        let radius = config.button_radius.min(button_height / 2.0);
++        // centres of the corner arcs
++        let bot = (height as f64 - button_height) / 2.0 + radius;
++        let top = (height as f64 + button_height) / 2.0 - radius;
+         let (pixel_shift_x, pixel_shift_y) = pixel_shift;
+ 
+         if complete_redraw {
+@@ -620,45 +676,27 @@ impl FunctionLayer {
+             c.paint().unwrap();
+         }
+         c.set_font_face(&config.font_face);
+-        c.set_font_size(32.0);
+-
+-        for i in 0..self.buttons.len() {
+-            let end = if i + 1 < self.buttons.len() {
+-                self.buttons[i + 1].0
+-            } else {
+-                self.virtual_button_count
+-            };
+-            let (start, button) = &mut self.buttons[i];
+-            let start = *start;
++        c.set_font_size(config.font_size);
+ 
++        for (i, (_, button)) in self.buttons.iter_mut().enumerate() {
+             if !button.changed && !complete_redraw {
+                 continue;
+             };
+ 
+-            let left_edge = (start as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
+-                .floor()
+-                + pixel_shift_x
+-                + (pixel_shift_width / 2) as f64;
+-
+-            let button_width = virtual_button_width
+-                + ((end - start - 1) as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
+-                    .floor();
++            let left_edge = geometry[i].0 + pixel_shift_x + (pixel_shift_width / 2) as f64;
++            let button_width = geometry[i].1;
+ 
+             let color = if button.active {
+-                BUTTON_COLOR_ACTIVE
++                config.button_active_color
+             } else if config.show_button_outlines {
+-                BUTTON_COLOR_INACTIVE
++                config.button_color
+             } else {
+-                0.0
++                (0.0, 0.0, 0.0)
+             };
+             if !complete_redraw {
++                // the whole column: the icon may sit a pixel shift lower
+                 c.set_source_rgb(0.0, 0.0, 0.0);
+-                c.rectangle(
+-                    left_edge,
+-                    bot - radius,
+-                    button_width,
+-                    top - bot + radius * 2.0,
+-                );
++                c.rectangle(left_edge, 0.0, button_width, height as f64);
+                 c.fill().unwrap();
+             }
+             if !matches!(button.image, ButtonImage::Spacer) {
+@@ -710,57 +748,47 @@ impl FunctionLayer {
+             button.changed = false;
+ 
+             if !complete_redraw {
+-                modified_regions.push(ClipRect::new(
+-                    height as u16 - top as u16 - radius as u16,
+-                    left_edge as u16,
+-                    height as u16 - bot as u16 + radius as u16,
+-                    left_edge as u16 + button_width as u16,
+-                ));
++                let x1 = left_edge.max(0.0) as u16;
++                let x2 = ((left_edge + button_width).ceil() as u16).min(width as u16);
++                modified_regions.push(ClipRect::new(0, x1, height as u16, x2));
+             }
+         }
+ 
+         modified_regions
+     }
+ 
+-    fn hit(&self, width: u16, height: u16, x: f64, y: f64, i: Option<usize>) -> Option<usize> {
+-        let virtual_button_width =
+-            (width as i32 - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32)) as f64
+-                / self.virtual_button_count as f64;
+-
+-        let i = i.unwrap_or_else(|| {
+-            let virtual_i = (x / (width as f64 / self.virtual_button_count as f64)) as usize;
+-            self.buttons
+-                .iter()
+-                .position(|(start, _)| *start > virtual_i)
+-                .unwrap_or(self.buttons.len())
+-                - 1
+-        });
+-        if i >= self.buttons.len() {
++    /// The button under x (bar coordinates, pixel shift included). A touch in
++    /// a gap counts for the nearer neighbour; `Some(i)` checks that button only.
++    fn hit(
++        &self,
++        config: &Config,
++        width: u16,
++        height: u16,
++        x: f64,
++        y: f64,
++        i: Option<usize>,
++    ) -> Option<usize> {
++        if y < 0.1 * height as f64 || y > 0.9 * height as f64 {
+             return None;
+         }
+-
+-        let start = self.buttons[i].0;
+-        let end = if i + 1 < self.buttons.len() {
+-            self.buttons[i + 1].0
++        let pixel_shift_width = if config.enable_pixel_shift {
++            PIXEL_SHIFT_WIDTH_PX
+         } else {
+-            self.virtual_button_count
++            0
+         };
+-
+-        let left_edge = (start as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64)).floor();
+-
+-        let button_width = virtual_button_width
+-            + ((end - start - 1) as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
+-                .floor();
+-
+-        if x < left_edge
+-            || x > (left_edge + button_width)
+-            || y < 0.1 * height as f64
+-            || y > 0.9 * height as f64
+-        {
+-            return None;
++        let x = x - (pixel_shift_width / 2) as f64;
++        let geometry = self.geometry(config, (width as i32 - pixel_shift_width as i32) as f64);
++        let n = geometry.len();
++        let contains = |i: usize| {
++            let (left, w) = geometry[i];
++            let lo = if i == 0 { f64::MIN } else { (geometry[i - 1].0 + geometry[i - 1].1 + left) / 2.0 };
++            let hi = if i + 1 == n { f64::MAX } else { (left + w + geometry[i + 1].0) / 2.0 };
++            x >= lo && x < hi
++        };
++        match i {
++            Some(i) => (i < n && contains(i)).then_some(i),
++            None => (0..n).find(|&i| contains(i)),
+         }
+-
+-        Some(i)
+     }
+ }
+ 
+@@ -818,7 +846,47 @@ where
+     );
+ }
+ 
++/// TINY_DFR_RENDER_PNG=<file>: draw the configured layers into a PNG instead
++/// of the Touch Bar (no DRM, input or uinput), for checking a layout. Rows:
++/// base layer, the same with its second button pressed, the Fn layer.
++fn render_preview(path: &std::ffi::OsStr) {
++    let (width, height) = (2170u16, 60u16);
++    let (cfg, mut layers) = ConfigManager::new().load_config(width);
++    let gap = 12;
++    let rows = [(0, None), (0, Some(1)), (1, None)];
++    let bar = ImageSurface::create(Format::ARgb32, height as i32, width as i32).unwrap();
++    let out = ImageSurface::create(
++        Format::ARgb32,
++        width as i32,
++        rows.len() as i32 * (height as i32 + gap) - gap,
++    )
++    .unwrap();
++    let c = Context::new(&out).unwrap();
++    c.set_source_rgb(0.5, 0.5, 0.5);
++    c.paint().unwrap();
++    for (row, (layer, pressed)) in rows.into_iter().enumerate() {
++        for (i, (_, b)) in layers[layer].buttons.iter_mut().enumerate() {
++            b.active = Some(i) == pressed;
++        }
++        layers[layer].draw(&cfg, width as i32, height as i32, &bar, (0.0, 0.0), true);
++        bar.flush();
++        c.save().unwrap();
++        // the bar surface is portrait: (u, v) -> (v, height - u)
++        let y0 = (row as i32 * (height as i32 + gap)) as f64;
++        c.transform(cairo::Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, y0 + height as f64));
++        c.set_source_surface(&bar, 0.0, 0.0).unwrap();
++        c.paint().unwrap();
++        c.restore().unwrap();
++    }
++    drop(c);
++    out.write_to_png(&mut File::create(path).unwrap()).unwrap();
++}
++
+ fn main() {
++    if let Some(path) = env::var_os("TINY_DFR_RENDER_PNG") {
++        render_preview(&path);
++        return;
++    }
+     let mut drm = DrmBackend::open_card().unwrap();
+     let (height, width) = drm.mode().size();
+     let _ = panic::catch_unwind(AssertUnwindSafe(|| real_main(&mut drm)));
+@@ -1056,7 +1124,7 @@ fn real_main(drm: &mut DrmBackend) {
+                         TouchEvent::Down(dn) => {
+                             let x = dn.x_transformed(width as u32);
+                             let y = dn.y_transformed(height as u32);
+-                            if let Some(btn) = layers[active_layer].hit(width, height, x, y, None) {
++                            if let Some(btn) = layers[active_layer].hit(&cfg, width, height, x, y, None) {
+                                 touches.insert(dn.seat_slot(), (active_layer, btn));
+                                 layers[active_layer].buttons[btn]
+                                     .1
+@@ -1072,7 +1140,7 @@ fn real_main(drm: &mut DrmBackend) {
+                             let y = mtn.y_transformed(height as u32);
+                             let (layer, btn) = *touches.get(&mtn.seat_slot()).unwrap();
+                             let hit = layers[active_layer]
+-                                .hit(width, height, x, y, Some(btn))
++                                .hit(&cfg, width, height, x, y, Some(btn))
+                                 .is_some();
+                             layers[layer].buttons[btn].1.set_active(&mut uinput, hit);
+                         }
+-- 
+2.53.0
+

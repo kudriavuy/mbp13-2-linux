@@ -1,0 +1,14 @@
+#!/bin/bash
+# Called by 91-mbp-tiny-dfr-check.hook: warn if /usr/bin/tiny-dfr no longer
+# resolves its libraries. Always exits 0.
+B=/usr/bin/tiny-dfr
+[[ -x $B ]] || exit 0
+bad=$(ldd -r "$B" 2>&1 | grep -E 'not found|undefined symbol' || true)
+if [[ -n $bad ]]; then
+	echo "WARNING: tiny-dfr no longer links after this update:"
+	echo "$bad" | sed 's/^/    /'
+	echo "  Rebuild it: tiny-dfr/build.sh of this repository, then sudo ./install.sh tinydfr."
+else
+	echo "tiny-dfr: libraries OK"
+fi
+exit 0

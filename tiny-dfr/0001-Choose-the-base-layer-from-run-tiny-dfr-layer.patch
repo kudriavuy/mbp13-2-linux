@@ -1,0 +1,159 @@
+From def8362a89dff3f1ec504c0fa5395fb78431bde1 Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 22:02:43 +0200
+Subject: [PATCH] Choose the base layer from /run/tiny-dfr/layer
+
+A desktop helper writes "fn" or "media" there for the active program
+(MacBookPro13,2 with a T1: F1-F12 for terminals and editors, media keys
+otherwise). The file is watched with inotify; without it the configured
+MediaLayerDefault stays. Holding Fn still shows the other layer.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ src/config.rs       |  2 ++
+ src/layer_switch.rs | 39 +++++++++++++++++++++++++++++++++++++++
+ src/main.rs         | 24 ++++++++++++++++++++++++
+ 3 files changed, 65 insertions(+)
+ create mode 100644 src/layer_switch.rs
+
+diff --git a/src/config.rs b/src/config.rs
+index 063c318..af694ef 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -23,6 +23,7 @@ pub struct Config {
+     pub adaptive_brightness: bool,
+     pub active_brightness: u32,
+     pub double_press_switch_layers: u32,
++    pub media_layer_default: bool,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -151,6 +152,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
+         font_face: load_font(&base.font_template.unwrap()),
+         active_brightness: base.active_brightness.unwrap(),
+         double_press_switch_layers: base.double_press_switch_layers.unwrap(),
++        media_layer_default: base.media_layer_default.unwrap(),
+     };
+     (cfg, layers)
+ }
+diff --git a/src/layer_switch.rs b/src/layer_switch.rs
+new file mode 100644
+index 0000000..28eab11
+--- /dev/null
++++ b/src/layer_switch.rs
+@@ -0,0 +1,39 @@
++// The base layer (shown while Fn is not held) chosen from outside: a desktop
++// helper writes "fn" or "media" to /run/tiny-dfr/layer for the active program.
++// Without the file (or the directory) the configured MediaLayerDefault stays.
++use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
++use std::{fs::read_to_string, os::fd::AsFd};
++
++const LAYER_DIR: &str = "/run/tiny-dfr";
++const LAYER_FILE: &str = "/run/tiny-dfr/layer";
++
++pub struct LayerSwitch {
++    inotify_fd: Inotify,
++}
++
++impl LayerSwitch {
++    pub fn new() -> LayerSwitch {
++        let inotify_fd = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
++        // no directory: nothing to watch, the configured default stays
++        let _ = inotify_fd.add_watch(
++            LAYER_DIR,
++            AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_MOVED_TO,
++        );
++        LayerSwitch { inotify_fd }
++    }
++    /// Some(true) media keys, Some(false) F-keys, None the configured default
++    pub fn wanted(&self) -> Option<bool> {
++        match read_to_string(LAYER_FILE).ok()?.trim() {
++            "media" => Some(true),
++            "fn" => Some(false),
++            _ => None,
++        }
++    }
++    /// whether the directory changed since the last call
++    pub fn changed(&self) -> bool {
++        self.inotify_fd.read_events().is_ok_and(|evts| !evts.is_empty())
++    }
++    pub fn fd(&self) -> &impl AsFd {
++        &self.inotify_fd
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index ede1adc..df4290f 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -45,12 +45,14 @@ mod backlight;
+ mod config;
+ mod display;
+ mod fonts;
++mod layer_switch;
+ mod pixel_shift;
+ 
+ use crate::config::ConfigManager;
+ use backlight::BacklightManager;
+ use config::{ButtonConfig, Config};
+ use display::DrmBackend;
++use layer_switch::LayerSwitch;
+ use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
+ 
+ const BUTTON_SPACING_PX: i32 = 16;
+@@ -847,6 +849,9 @@ fn real_main(drm: &mut DrmBackend) {
+     let mut backlight = BacklightManager::new();
+     let mut cfg_mgr = ConfigManager::new();
+     let (mut cfg, mut layers) = cfg_mgr.load_config(width);
++    let layer_switch = LayerSwitch::new();
++    let mut base_is_media = cfg.media_layer_default;
++    let mut check_layer = true;
+     let mut pixel_shift = PixelShiftManager::new();
+     let mut last = Instant::now();
+ 
+@@ -887,6 +892,9 @@ fn real_main(drm: &mut DrmBackend) {
+     epoll
+         .add(&udev_monitor, EpollEvent::new(EpollFlags::EPOLLIN, 3))
+         .unwrap();
++    epoll
++        .add(layer_switch.fd(), EpollEvent::new(EpollFlags::EPOLLIN, 4))
++        .unwrap();
+     uinput.set_evbit(EventKind::Key).unwrap();
+     for k in Key::iter() {
+         uinput.set_keybit(k).unwrap();
+@@ -922,6 +930,21 @@ fn real_main(drm: &mut DrmBackend) {
+             touches = HashMap::<u32, (usize, usize)>::new();
+             active_layer = 0;
+             needs_complete_redraw = true;
++            base_is_media = cfg.media_layer_default;
++            check_layer = true;
++        }
++        if layer_switch.changed() || check_layer {
++            check_layer = false;
++            let want = layer_switch.wanted().unwrap_or(cfg.media_layer_default);
++            if want != base_is_media {
++                // release what is held: the button indices belong to the old order
++                for (_, (layer, btn)) in touches.drain() {
++                    layers[layer].buttons[btn].1.set_active(&mut uinput, false);
++                }
++                layers.swap(0, 1);
++                base_is_media = want;
++                needs_complete_redraw = true;
++            }
+         }
+ 
+         let now = Local::now();
+@@ -1003,6 +1026,7 @@ fn real_main(drm: &mut DrmBackend) {
+                         if cfg.double_press_switch_layers > 0 && key.key_state() == KeyState::Pressed {
+                             if last.elapsed() < Duration::from_millis(cfg.double_press_switch_layers.into()) {
+                                 layers.swap(0, 1);
++                                base_is_media = !base_is_media;
+                             }
+                             last = Instant::now();
+                         }
+-- 
+2.53.0
+

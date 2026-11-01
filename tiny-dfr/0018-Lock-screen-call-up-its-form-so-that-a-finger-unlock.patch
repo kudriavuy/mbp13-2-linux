@@ -1,0 +1,182 @@
+From b9ecb93fddabce2efe6e2b030cc4107400720dae Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 00:50:17 +0100
+Subject: [PATCH] Lock screen: call up its form so that a finger unlocks at
+ once
+
+KDE's lock screen starts its fingerprint check only once its form is shown
+(a key, the mouse); until then a finger on the sensor does nothing.
+LockScreenWakeKey (a key that types nothing, such as LeftShift) is pressed
+1.5 s after the screen locks, 1.5 s after the lid opens on a locked screen
+(after sleep), and on a touch beside Esc while no check is running. The
+form appears, fprintd waits, and the Touch ID hint shows.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01M5fvpySRgDHQss3fsr2hF6
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ share/tiny-dfr/config.toml |  5 ++++
+ src/config.rs              |  5 ++++
+ src/main.rs                | 48 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 58 insertions(+)
+
+diff --git a/share/tiny-dfr/config.toml b/share/tiny-dfr/config.toml
+index ec656db..d4f1648 100644
+--- a/share/tiny-dfr/config.toml
++++ b/share/tiny-dfr/config.toml
+@@ -114,6 +114,11 @@ FontTemplate = ":bold"
+ # While the screen is locked (the helper's .../locked) the bar shows only Esc
+ # and LockScreenKeys (default none), and no notification, media or slider.
+ # LockScreenKeys = []
++# LockScreenWakeKey = "LeftShift"   # pressed 1.5 s after the screen locks, when
++#                                  # the lid opens on a locked screen and on a
++#                                  # touch beside Esc: a lock screen that starts
++#                                  # its fingerprint check with its form (KDE)
++#                                  # then takes a finger at once
+ # MatchTitle = ["part of a title", ...] in an [[Apps]] rule: the window title
+ # (from the helper's .../title) must contain one of them; Match may be left out
+ # (any program). Put such rules before the general ones.
+diff --git a/src/config.rs b/src/config.rs
+index 5efbf64..de65e89 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -55,6 +55,8 @@ pub struct Config {
+     pub fn_rows: HashMap<String, usize>,
+     // the row shown while the screen is locked (LockScreenKeys after Esc)
+     pub lock_row: usize,
++    // pressed to call up the lock screen's form (and its fingerprint check)
++    pub lock_wake_key: Option<Key>,
+ }
+ 
+ /// Icons that follow the session (Live = ...)
+@@ -206,6 +208,7 @@ struct ConfigProxy {
+     notification_seconds: Option<u64>,
+     notification_icon: Option<String>,
+     lock_screen_keys: Option<Vec<ButtonConfig>>,
++    lock_screen_wake_key: Option<Key>,
+ }
+ 
+ fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<Key>, D::Error>
+@@ -352,6 +355,7 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+         base.notification_seconds = user.notification_seconds.or(base.notification_seconds);
+         base.notification_icon = user.notification_icon.or(base.notification_icon);
+         base.lock_screen_keys = user.lock_screen_keys.or(base.lock_screen_keys);
++        base.lock_screen_wake_key = user.lock_screen_wake_key.or(base.lock_screen_wake_key);
+     };
+     let media_layer_keys = base.media_layer_keys.unwrap();
+     let primary_layer_keys = base.primary_layer_keys.unwrap();
+@@ -493,6 +497,7 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+         notification_icon: base.notification_icon.clone(),
+         fn_rows,
+         lock_row,
++        lock_wake_key: base.lock_screen_wake_key,
+     };
+     crate::anim::set_enabled(cfg.animations);
+     (cfg, layers)
+diff --git a/src/main.rs b/src/main.rs
+index 98b9f19..af1cb7b 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -9,6 +9,7 @@ use freedesktop_icons::lookup;
+ use input::{
+     event::{
+         device::DeviceEvent,
++        switch::{Switch, SwitchEvent, SwitchState},
+         keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait},
+         touch::{TouchEvent, TouchEventPosition, TouchEventSlot},
+         Event, EventTrait,
+@@ -65,6 +66,9 @@ use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
+ use slider::{Hit as SliderHit, Kind as SliderKind, Layout as SliderLayout, Mode as SliderMode, Slider};
+ 
+ pub const DEFAULT_ICON_SIZE: i32 = 48;
++// after the screen locks: this long before calling up its form
++const LOCK_WAKE_DELAY: Duration = Duration::from_millis(1500);
++
+ // a Touch ID result stays this long on the bar
+ const TOUCHID_FLASH: Duration = Duration::from_millis(900);
+ // a "waiting" older than this is stale (the helper went away)
+@@ -1710,6 +1714,10 @@ fn real_main(drm: &mut DrmBackend) {
+     let mut layout_hold: Option<(u32, f64, usize, Option<usize>)> = None;
+     // the battery key: redraw due, and the minute it was last due
+     let mut battery_due = true;
++    // the lock screen: whether it was locked on the last pass, and when to
++    // press LockScreenWakeKey (its form starts the fingerprint check)
++    let mut was_locked = false;
++    let mut lock_wake_at: Option<Instant> = None;
+     // the player's cover (NowPlaying key, panel), if it gives one
+     let mut cover: Option<ButtonImage> = None;
+     let mut battery_minute = u32::MAX;
+@@ -1882,6 +1890,21 @@ fn real_main(drm: &mut DrmBackend) {
+                 needs_complete_redraw = true;
+             }
+         }
++        // just locked: call up the form soon, so that a finger unlocks at once
++        if session.locked && !was_locked && cfg.lock_wake_key.is_some() {
++            lock_wake_at = Some(Instant::now() + LOCK_WAKE_DELAY);
++        }
++        if !session.locked {
++            lock_wake_at = None;
++        }
++        was_locked = session.locked;
++        if let (Some(at), Some(key)) = (lock_wake_at, cfg.lock_wake_key) {
++            if Instant::now() >= at {
++                lock_wake_at = None;
++                toggle_keys(&mut uinput, &vec![key], 1);
++                toggle_keys(&mut uinput, &vec![key], 0);
++            }
++        }
+         // locked: only the lock row (Esc), nothing of the session on the bar
+         let wanted_row = if session.locked {
+             if media.take().is_some() {
+@@ -2176,6 +2199,11 @@ fn real_main(drm: &mut DrmBackend) {
+             next_timeout_ms = min(next_timeout_ms, ms.max(1));
+             media_dirty = true;
+         }
++        // the lock screen's wake key is due
++        if let Some(at) = lock_wake_at {
++            let left = at.saturating_duration_since(Instant::now()).as_millis() as i32;
++            next_timeout_ms = min(next_timeout_ms, left.max(1));
++        }
+         // a notification: wake when it ends
+         if let Some(n) = notice_now(&cfg, &session, notice_dismissed) {
+             let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+@@ -2211,6 +2239,15 @@ fn real_main(drm: &mut DrmBackend) {
+         for event in &mut input_tb.clone().chain(input_main.clone()) {
+             backlight.process_event(&event);
+             match event {
++                // the lid opened on a locked screen (after sleep): call up the form
++                Event::Switch(SwitchEvent::Toggle(toggle))
++                    if toggle.switch() == Some(Switch::Lid)
++                        && toggle.switch_state() == SwitchState::Off
++                        && session.locked
++                        && cfg.lock_wake_key.is_some() =>
++                {
++                    lock_wake_at = Some(Instant::now() + LOCK_WAKE_DELAY);
++                }
+                 Event::Device(DeviceEvent::Added(evt)) => {
+                     let dev = evt.device();
+                     if dev.name().contains(" Touch Bar") {
+@@ -2268,6 +2305,17 @@ fn real_main(drm: &mut DrmBackend) {
+                                     }
+                                 }
+                             }
++                            // a touch beside Esc on the locked screen: its form (if the
++                            // fingerprint check is not running already)
++                            if session.locked && touchid_drawn.is_none() {
++                                if let Some(key) = cfg.lock_wake_key {
++                                    if layers[active_layer].hit(&cfg, width, height, x, y, None) != Some(0) {
++                                        toggle_keys(&mut uinput, &vec![key], 1);
++                                        toggle_keys(&mut uinput, &vec![key], 0);
++                                        continue;
++                                    }
++                                }
++                            }
+                             if let Some(at) = notice_drawn {
+                                 let (l, r) = app_area(&cfg, &layers[active_layer], width);
+                                 if x - half_shift >= l - 4.0 && x - half_shift < r + 4.0 {
+-- 
+2.53.0
+

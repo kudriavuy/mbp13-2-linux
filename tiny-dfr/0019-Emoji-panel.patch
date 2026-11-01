@@ -1,0 +1,1134 @@
+From f99e10fec99c5d67c8526bce4543c69a415f133b Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 16:19:24 +0100
+Subject: [PATCH] Emoji panel
+
+Command = "Emoji" opens a panel over the program's part of the row: a
+close button, a category key and one row of all emoji (Unicode's
+emoji-test.txt, no skin tones; recently used first) that scrolls with
+the finger and runs on after a flick. A tapped emoji goes to the helper
+("emoji <text>"), which puts it on the clipboard and reports it in
+.../paste; tiny-dfr then presses Ctrl+V (Ctrl+Shift+V in the programs of
+EmojiPasteShift). Glyphs are drawn once by Pango (pangocairo: sequences,
+flags, colour) and kept; EmojiFont picks the font.
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ Cargo.lock               | 102 +++++++++-
+ Cargo.toml               |   1 +
+ share/tiny-dfr/emoji.txt |  17 ++
+ src/config.rs            |  34 +++-
+ src/emoji.rs             | 393 +++++++++++++++++++++++++++++++++++++++
+ src/main.rs              | 157 +++++++++++++++-
+ src/media.rs             |  32 ++--
+ src/state.rs             |  10 +-
+ 8 files changed, 711 insertions(+), 35 deletions(-)
+ create mode 100644 share/tiny-dfr/emoji.txt
+ create mode 100644 src/emoji.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 9f97fe2..0428675 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -76,7 +76,7 @@ checksum = "f8b4985713047f5faee02b8db6a6ef32bbb50269ff53c1aee716d1d195b76d54"
+ dependencies = [
+  "glib-sys",
+  "libc",
+- "system-deps",
++ "system-deps 7.0.7",
+ ]
+ 
+ [[package]]
+@@ -322,7 +322,7 @@ dependencies = [
+  "glib-sys",
+  "gobject-sys",
+  "libc",
+- "system-deps",
++ "system-deps 7.0.7",
+ ]
+ 
+ [[package]]
+@@ -362,7 +362,7 @@ dependencies = [
+  "glib-sys",
+  "gobject-sys",
+  "libc",
+- "system-deps",
++ "system-deps 7.0.7",
+  "windows-sys 0.61.2",
+ ]
+ 
+@@ -406,7 +406,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "1eb23a616a3dbc7fc15bbd26f58756ff0b04c8a894df3f0680cd21011db6a642"
+ dependencies = [
+  "libc",
+- "system-deps",
++ "system-deps 7.0.7",
+ ]
+ 
+ [[package]]
+@@ -417,7 +417,7 @@ checksum = "18eda93f09d3778f38255b231b17ef67195013a592c91624a4daf8bead875565"
+ dependencies = [
+  "glib-sys",
+  "libc",
+- "system-deps",
++ "system-deps 7.0.7",
+ ]
+ 
+ [[package]]
+@@ -583,7 +583,7 @@ dependencies = [
+  "glib-sys",
+  "gobject-sys",
+  "libc",
+- "system-deps",
++ "system-deps 7.0.7",
+ ]
+ 
+ [[package]]
+@@ -683,6 +683,54 @@ version = "0.2.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+ 
++[[package]]
++name = "pango"
++version = "0.22.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0b2022dbbd82e1c42bd950a6f1df9b98c796e725dce5ec275e03cbf9772e4efa"
++dependencies = [
++ "gio",
++ "glib",
++ "pango-sys",
++]
++
++[[package]]
++name = "pango-sys"
++version = "0.22.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ca02d64761b74d56cdd4b437db6d73dc95e6c0d40f27e1c707952c0f09052948"
++dependencies = [
++ "glib-sys",
++ "gobject-sys",
++ "libc",
++ "system-deps 9.0.1",
++]
++
++[[package]]
++name = "pangocairo"
++version = "0.22.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bd199a0fef965b3ebda91a929a1ab5e7729538882c68e8de38e1904d2e094757"
++dependencies = [
++ "cairo-rs",
++ "glib",
++ "pango",
++ "pangocairo-sys",
++]
++
++[[package]]
++name = "pangocairo-sys"
++version = "0.22.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a649a616d67ae68539bc85f00fb45d36fba742ed20fc20e6712a15d8ee52bd3f"
++dependencies = [
++ "cairo-sys-rs",
++ "glib-sys",
++ "libc",
++ "pango-sys",
++ "system-deps 9.0.1",
++]
++
+ [[package]]
+ name = "pin-project-lite"
+ version = "0.2.17"
+@@ -691,9 +739,9 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+ 
+ [[package]]
+ name = "pkg-config"
+-version = "0.3.32"
++version = "0.3.34"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
++checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+ 
+ [[package]]
+ name = "ppv-lite86"
+@@ -901,6 +949,19 @@ dependencies = [
+  "version-compare",
+ ]
+ 
++[[package]]
++name = "system-deps"
++version = "9.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "db551ad38aac61d5e0343e0eeeb0163be3115c4e23b6a025959570ee0c03c67d"
++dependencies = [
++ "cfg-expr",
++ "heck",
++ "pkg-config",
++ "toml 1.1.2+spec-1.1.0",
++ "version-compare",
++]
++
+ [[package]]
+ name = "target-lexicon"
+ version = "0.13.3"
+@@ -943,6 +1004,7 @@ dependencies = [
+  "libc",
+  "librsvg-rebind",
+  "nix 0.29.0",
++ "pangocairo",
+  "pkg-config",
+  "privdrop",
+  "rand",
+@@ -978,6 +1040,21 @@ dependencies = [
+  "winnow 0.7.15",
+ ]
+ 
++[[package]]
++name = "toml"
++version = "1.1.2+spec-1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "81f3d15e84cbcd896376e6730314d59fb5a87f31e4b038454184435cd57defee"
++dependencies = [
++ "indexmap",
++ "serde_core",
++ "serde_spanned 1.1.1",
++ "toml_datetime 1.1.2+spec-1.1.0",
++ "toml_parser",
++ "toml_writer",
++ "winnow 1.0.1",
++]
++
+ [[package]]
+ name = "toml_datetime"
+ version = "0.6.11"
+@@ -996,6 +1073,15 @@ dependencies = [
+  "serde_core",
+ ]
+ 
++[[package]]
++name = "toml_datetime"
++version = "1.1.2+spec-1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2b86d767906c6c42421dcba507eb9d203e779497710a47782a224bb871653053"
++dependencies = [
++ "serde_core",
++]
++
+ [[package]]
+ name = "toml_edit"
+ version = "0.22.27"
+diff --git a/Cargo.toml b/Cargo.toml
+index 7ffa07a..d473abc 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -24,6 +24,7 @@ serde = { version = "1", features = ["derive"] }
+ toml = "0.8"
+ rand = "0.8"
+ freetype-rs = "0.38"
++pangocairo = "0.22"
+ freedesktop-icons = "0.4.0"
+ chrono = { version = "0.4", features = ["unstable-locales"] }
+ udev = "0.9"
+diff --git a/share/tiny-dfr/emoji.txt b/share/tiny-dfr/emoji.txt
+new file mode 100644
+index 0000000..88aa8f3
+--- /dev/null
++++ b/share/tiny-dfr/emoji.txt
+@@ -0,0 +1,17 @@
++# generated by emoji-list.py from emoji-test.txt, emoji <= 17.0
++@smileys 😀
++😀 😃 😄 😁 😆 😅 🤣 😂 🙂 🙃 🫠 😉 😊 😇 🥰 😍 🤩 😘 😗 ☺️ 😚 😙 🥲 😋 😛 😜 🤪 😝 🤑 🤗 🤭 🫢 🫣 🤫 🤔 🫡 🤐 🤨 😐 😑 😶 🫥 😶‍🌫️ 😏 😒 🙄 😬 😮‍💨 🤥 🫨 🙂‍↔️ 🙂‍↕️ 😌 😔 😪 🤤 😴 🫩 😷 🤒 🤕 🤢 🤮 🤧 🥵 🥶 🥴 😵 😵‍💫 🤯 🤠 🥳 🥸 😎 🤓 🧐 😕 🫤 😟 🙁 ☹️ 😮 😯 😲 😳 🫪 🥺 🥹 😦 😧 😨 😰 😥 😢 😭 😱 😖 😣 😞 😓 😩 😫 🥱 😤 😡 😠 🤬 😈 👿 💀 ☠️ 💩 🤡 👹 👺 👻 👽 👾 🤖 😺 😸 😹 😻 😼 😽 🙀 😿 😾 🙈 🙉 🙊 💌 💘 💝 💖 💗 💓 💞 💕 💟 ❣️ 💔 ❤️‍🔥 ❤️‍🩹 ❤️ 🩷 🧡 💛 💚 💙 🩵 💜 🤎 🖤 🩶 🤍 💋 💯 💢 🫯 💥 💫 💦 💨 🕳️ 💬 👁️‍🗨️ 🗨️ 🗯️ 💭 💤 👋 🤚 🖐️ ✋ 🖖 🫱 🫲 🫳 🫴 🫷 🫸 👌 🤌 🤏 ✌️ 🤞 🫰 🤟 🤘 🤙 👈 👉 👆 🖕 👇 ☝️ 🫵 👍 👎 ✊ 👊 🤛 🤜 👏 🙌 🫶 👐 🤲 🤝 🙏 ✍️ 💅 🤳 💪 🦾 🦿 🦵 🦶 👂 🦻 👃 🧠 🫀 🫁 🦷 🦴 👀 👁️ 👅 👄 🫦 👶 🧒 👦 👧 🧑 👱 👨 🧔 🧔‍♂️ 🧔‍♀️ 👨‍🦰 👨‍🦱 👨‍🦳 👨‍🦲 👩 👩‍🦰 🧑‍🦰 👩‍🦱 🧑‍🦱 👩‍🦳 🧑‍🦳 👩‍🦲 🧑‍🦲 👱‍♀️ 👱‍♂️ 🧓 👴 👵 🙍 🙍‍♂️ 🙍‍♀️ 🙎 🙎‍♂️ 🙎‍♀️ 🙅 🙅‍♂️ 🙅‍♀️ 🙆 🙆‍♂️ 🙆‍♀️ 💁 💁‍♂️ 💁‍♀️ 🙋 🙋‍♂️ 🙋‍♀️ 🧏 🧏‍♂️ 🧏‍♀️ 🙇 🙇‍♂️ 🙇‍♀️ 🤦 🤦‍♂️ 🤦‍♀️ 🤷 🤷‍♂️ 🤷‍♀️ 🧑‍⚕️ 👨‍⚕️ 👩‍⚕️ 🧑‍🎓 👨‍🎓 👩‍🎓 🧑‍🏫 👨‍🏫 👩‍🏫 🧑‍⚖️ 👨‍⚖️ 👩‍⚖️ 🧑‍🌾 👨‍🌾 👩‍🌾 🧑‍🍳 👨‍🍳 👩‍🍳 🧑‍🔧 👨‍🔧 👩‍🔧 🧑‍🏭 👨‍🏭 👩‍🏭 🧑‍💼 👨‍💼 👩‍💼 🧑‍🔬 👨‍🔬 👩‍🔬 🧑‍💻 👨‍💻 👩‍💻 🧑‍🎤 👨‍🎤 👩‍🎤 🧑‍🎨 👨‍🎨 👩‍🎨 🧑‍✈️ 👨‍✈️ 👩‍✈️ 🧑‍🚀 👨‍🚀 👩‍🚀 🧑‍🚒 👨‍🚒 👩‍🚒 👮 👮‍♂️ 👮‍♀️ 🕵️ 🕵️‍♂️ 🕵️‍♀️ 💂 💂‍♂️ 💂‍♀️ 🥷 👷 👷‍♂️ 👷‍♀️ 🫅 🤴 👸 👳 👳‍♂️ 👳‍♀️ 👲 🧕 🤵 🤵‍♂️ 🤵‍♀️ 👰 👰‍♂️ 👰‍♀️ 🤰 🫃 🫄 🤱 👩‍🍼 👨‍🍼 🧑‍🍼 👼 🎅 🤶 🧑‍🎄 🦸 🦸‍♂️ 🦸‍♀️ 🦹 🦹‍♂️ 🦹‍♀️ 🧙 🧙‍♂️ 🧙‍♀️ 🧚 🧚‍♂️ 🧚‍♀️ 🧛 🧛‍♂️ 🧛‍♀️ 🧜 🧜‍♂️ 🧜‍♀️ 🧝 🧝‍♂️ 🧝‍♀️ 🧞 🧞‍♂️ 🧞‍♀️ 🧟 🧟‍♂️ 🧟‍♀️ 🧌 🫈 💆 💆‍♂️ 💆‍♀️ 💇 💇‍♂️ 💇‍♀️ 🚶 🚶‍♂️ 🚶‍♀️ 🚶‍➡️ 🚶‍♀️‍➡️ 🚶‍♂️‍➡️ 🧍 🧍‍♂️ 🧍‍♀️ 🧎 🧎‍♂️ 🧎‍♀️ 🧎‍➡️ 🧎‍♀️‍➡️ 🧎‍♂️‍➡️ 🧑‍🦯 🧑‍🦯‍➡️ 👨‍🦯 👨‍🦯‍➡️ 👩‍🦯 👩‍🦯‍➡️ 🧑‍🦼 🧑‍🦼‍➡️ 👨‍🦼 👨‍🦼‍➡️ 👩‍🦼 👩‍🦼‍➡️ 🧑‍🦽 🧑‍🦽‍➡️ 👨‍🦽 👨‍🦽‍➡️ 👩‍🦽 👩‍🦽‍➡️ 🏃 🏃‍♂️ 🏃‍♀️ 🏃‍➡️ 🏃‍♀️‍➡️ 🏃‍♂️‍➡️ 🧑‍🩰 💃 🕺 🕴️ 👯 👯‍♂️ 👯‍♀️ 🧖 🧖‍♂️ 🧖‍♀️ 🧗 🧗‍♂️ 🧗‍♀️ 🤺 🏇 ⛷️ 🏂 🏌️ 🏌️‍♂️ 🏌️‍♀️ 🏄 🏄‍♂️ 🏄‍♀️ 🚣 🚣‍♂️ 🚣‍♀️ 🏊 🏊‍♂️ 🏊‍♀️ ⛹️ ⛹️‍♂️ ⛹️‍♀️ 🏋️ 🏋️‍♂️ 🏋️‍♀️ 🚴 🚴‍♂️ 🚴‍♀️ 🚵 🚵‍♂️ 🚵‍♀️ 🤸 🤸‍♂️ 🤸‍♀️ 🤼 🤼‍♂️ 🤼‍♀️ 🤽 🤽‍♂️ 🤽‍♀️ 🤾 🤾‍♂️ 🤾‍♀️ 🤹 🤹‍♂️ 🤹‍♀️ 🧘 🧘‍♂️ 🧘‍♀️ 🛀 🛌 🧑‍🤝‍🧑 👭 👫 👬 💏 👩‍❤️‍💋‍👨 👨‍❤️‍💋‍👨 👩‍❤️‍💋‍👩 💑 👩‍❤️‍👨 👨‍❤️‍👨 👩‍❤️‍👩 👨‍👩‍👦 👨‍👩‍👧 👨‍👩‍👧‍👦 👨‍👩‍👦‍👦 👨‍👩‍👧‍👧 👨‍👨‍👦 👨‍👨‍👧 👨‍👨‍👧‍👦 👨‍👨‍👦‍👦 👨‍👨‍👧‍👧 👩‍👩‍👦 👩‍👩‍👧 👩‍👩‍👧‍👦 👩‍👩‍👦‍👦 👩‍👩‍👧‍👧 👨‍👦 👨‍👦‍👦 👨‍👧 👨‍👧‍👦 👨‍👧‍👧 👩‍👦 👩‍👦‍👦 👩‍👧 👩‍👧‍👦 👩‍👧‍👧 🗣️ 👤 👥 🫂 👪 🧑‍🧑‍🧒 🧑‍🧑‍🧒‍🧒 🧑‍🧒 🧑‍🧒‍🧒 👣 🫆
++@animals 🐻
++🐵 🐒 🦍 🦧 🐶 🐕 🦮 🐕‍🦺 🐩 🐺 🦊 🦝 🐱 🐈 🐈‍⬛ 🦁 🐯 🐅 🐆 🐴 🫎 🫏 🐎 🦄 🦓 🦌 🦬 🐮 🐂 🐃 🐄 🐷 🐖 🐗 🐽 🐏 🐑 🐐 🐪 🐫 🦙 🦒 🐘 🦣 🦏 🦛 🐭 🐁 🐀 🐹 🐰 🐇 🐿️ 🦫 🦔 🦇 🐻 🐻‍❄️ 🐨 🐼 🦥 🦦 🦨 🦘 🦡 🐾 🦃 🐔 🐓 🐣 🐤 🐥 🐦 🐧 🕊️ 🦅 🦆 🦢 🦉 🦤 🪶 🦩 🦚 🦜 🪽 🐦‍⬛ 🪿 🐦‍🔥 🐸 🐊 🐢 🦎 🐍 🐲 🐉 🦕 🦖 🐳 🐋 🐬 🫍 🦭 🐟 🐠 🐡 🦈 🐙 🐚 🪸 🪼 🦀 🦞 🦐 🦑 🦪 🐌 🦋 🐛 🐜 🐝 🪲 🐞 🦗 🪳 🕷️ 🕸️ 🦂 🦟 🪰 🪱 🦠 💐 🌸 💮 🪷 🏵️ 🌹 🥀 🌺 🌻 🌼 🌷 🪻 🌱 🪴 🌲 🌳 🌴 🌵 🌾 🌿 ☘️ 🍀 🍁 🍂 🍃 🪹 🪺 🍄 🪾
++@food 🍔
++🍇 🍈 🍉 🍊 🍋 🍋‍🟩 🍌 🍍 🥭 🍎 🍏 🍐 🍑 🍒 🍓 🫐 🥝 🍅 🫒 🥥 🥑 🍆 🥔 🥕 🌽 🌶️ 🫑 🥒 🥬 🥦 🧄 🧅 🥜 🫘 🌰 🫚 🫛 🍄‍🟫 🫜 🍞 🥐 🥖 🫓 🥨 🥯 🥞 🧇 🧀 🍖 🍗 🥩 🥓 🍔 🍟 🍕 🌭 🥪 🌮 🌯 🫔 🥙 🧆 🥚 🍳 🥘 🍲 🫕 🥣 🥗 🍿 🧈 🧂 🥫 🍱 🍘 🍙 🍚 🍛 🍜 🍝 🍠 🍢 🍣 🍤 🍥 🥮 🍡 🥟 🥠 🥡 🍦 🍧 🍨 🍩 🍪 🎂 🍰 🧁 🥧 🍫 🍬 🍭 🍮 🍯 🍼 🥛 ☕ 🫖 🍵 🍶 🍾 🍷 🍸 🍹 🍺 🍻 🥂 🥃 🫗 🥤 🧋 🧃 🧉 🧊 🥢 🍽️ 🍴 🥄 🔪 🫙 🏺
++@activity ⚽
++🎃 🎄 🎆 🎇 🧨 ✨ 🎈 🎉 🎊 🎋 🎍 🎎 🎏 🎐 🎑 🧧 🎀 🎁 🎗️ 🎟️ 🎫 🎖️ 🏆 🏅 🥇 🥈 🥉 ⚽ ⚾ 🥎 🏀 🏐 🏈 🏉 🎾 🥏 🎳 🏏 🏑 🏒 🥍 🏓 🏸 🥊 🥋 🥅 ⛳ ⛸️ 🎣 🤿 🎽 🎿 🛷 🥌 🎯 🪀 🪁 🔫 🎱 🔮 🪄 🎮 🕹️ 🎰 🎲 🧩 🧸 🪅 🪩 🪆 ♠️ ♥️ ♦️ ♣️ ♟️ 🃏 🀄 🎴 🎭 🖼️ 🎨 🧵 🪡 🧶 🪢
++@travel 🚗
++🌍 🌎 🌏 🌐 🗺️ 🗾 🧭 🏔️ ⛰️ 🛘 🌋 🗻 🏕️ 🏖️ 🏜️ 🏝️ 🏞️ 🏟️ 🏛️ 🏗️ 🧱 🪨 🪵 🛖 🏘️ 🏚️ 🏠 🏡 🏢 🏣 🏤 🏥 🏦 🏨 🏩 🏪 🏫 🏬 🏭 🏯 🏰 💒 🗼 🗽 ⛪ 🕌 🛕 🕍 ⛩️ 🕋 ⛲ ⛺ 🌁 🌃 🏙️ 🌄 🌅 🌆 🌇 🌉 ♨️ 🎠 🛝 🎡 🎢 💈 🎪 🚂 🚃 🚄 🚅 🚆 🚇 🚈 🚉 🚊 🚝 🚞 🚋 🚌 🚍 🚎 🚐 🚑 🚒 🚓 🚔 🚕 🚖 🚗 🚘 🚙 🛻 🚚 🚛 🚜 🏎️ 🏍️ 🛵 🦽 🦼 🛺 🚲 🛴 🛹 🛼 🚏 🛣️ 🛤️ 🛢️ ⛽ 🛞 🚨 🚥 🚦 🛑 🚧 ⚓ 🛟 ⛵ 🛶 🚤 🛳️ ⛴️ 🛥️ 🚢 ✈️ 🛩️ 🛫 🛬 🪂 💺 🚁 🚟 🚠 🚡 🛰️ 🚀 🛸 🛎️ 🧳 ⌛ ⏳ ⌚ ⏰ ⏱️ ⏲️ 🕰️ 🕛 🕧 🕐 🕜 🕑 🕝 🕒 🕞 🕓 🕟 🕔 🕠 🕕 🕡 🕖 🕢 🕗 🕣 🕘 🕤 🕙 🕥 🕚 🕦 🌑 🌒 🌓 🌔 🌕 🌖 🌗 🌘 🌙 🌚 🌛 🌜 🌡️ ☀️ 🌝 🌞 🪐 ⭐ 🌟 🌠 🌌 ☁️ ⛅ ⛈️ 🌤️ 🌥️ 🌦️ 🌧️ 🌨️ 🌩️ 🌪️ 🌫️ 🌬️ 🌀 🌈 🌂 ☂️ ☔ ⛱️ ⚡ ❄️ ☃️ ⛄ ☄️ 🔥 💧 🌊
++@objects 💡
++👓 🕶️ 🥽 🥼 🦺 👔 👕 👖 🧣 🧤 🧥 🧦 👗 👘 🥻 🩱 🩲 🩳 👙 👚 🪭 👛 👜 👝 🛍️ 🎒 🩴 👞 👟 🥾 🥿 👠 👡 🩰 👢 🪮 👑 👒 🎩 🎓 🧢 🪖 ⛑️ 📿 💄 💍 💎 🔇 🔈 🔉 🔊 📢 📣 📯 🔔 🔕 🎼 🎵 🎶 🎙️ 🎚️ 🎛️ 🎤 🎧 📻 🎷 🎺 🪊 🪗 🎸 🎹 🎻 🪕 🥁 🪘 🪇 🪈 🪉 📱 📲 ☎️ 📞 📟 📠 🔋 🪫 🔌 💻 🖥️ 🖨️ ⌨️ 🖱️ 🖲️ 💽 💾 💿 📀 🧮 🎥 🎞️ 📽️ 🎬 📺 📷 📸 📹 📼 🔍 🔎 🕯️ 💡 🔦 🏮 🪔 📔 📕 📖 📗 📘 📙 📚 📓 📒 📃 📜 📄 📰 🗞️ 📑 🔖 🏷️ 🪙 💰 🪎 💴 💵 💶 💷 💸 💳 🧾 💹 ✉️ 📧 📨 📩 📤 📥 📦 📫 📪 📬 📭 📮 🗳️ ✏️ ✒️ 🖋️ 🖊️ 🖌️ 🖍️ 📝 💼 📁 📂 🗂️ 📅 📆 🗒️ 🗓️ 📇 📈 📉 📊 📋 📌 📍 📎 🖇️ 📏 📐 ✂️ 🗃️ 🗄️ 🗑️ 🔒 🔓 🔏 🔐 🔑 🗝️ 🔨 🪓 ⛏️ ⚒️ 🛠️ 🗡️ ⚔️ 💣 🪃 🏹 🛡️ 🪚 🔧 🪛 🔩 ⚙️ 🗜️ ⚖️ 🦯 🔗 ⛓️‍💥 ⛓️ 🪝 🧰 🧲 🪜 🪏 ⚗️ 🧪 🧫 🧬 🔬 🔭 📡 💉 🩸 💊 🩹 🩼 🩺 🩻 🚪 🛗 🪞 🪟 🛏️ 🛋️ 🪑 🚽 🪠 🚿 🛁 🪤 🪒 🧴 🧷 🧹 🧺 🧻 🪣 🧼 🫧 🪥 🧽 🧯 🛒 🚬 ⚰️ 🪦 ⚱️ 🧿 🪬 🗿 🪧 🪪
++@symbols 🔣
++🏧 🚮 🚰 ♿ 🚹 🚺 🚻 🚼 🚾 🛂 🛃 🛄 🛅 ⚠️ 🚸 ⛔ 🚫 🚳 🚭 🚯 🚱 🚷 📵 🔞 ☢️ ☣️ ⬆️ ↗️ ➡️ ↘️ ⬇️ ↙️ ⬅️ ↖️ ↕️ ↔️ ↩️ ↪️ ⤴️ ⤵️ 🔃 🔄 🔙 🔚 🔛 🔜 🔝 🛐 ⚛️ 🕉️ ✡️ ☸️ ☯️ ✝️ ☦️ ☪️ ☮️ 🕎 🔯 🪯 ♈ ♉ ♊ ♋ ♌ ♍ ♎ ♏ ♐ ♑ ♒ ♓ ⛎ 🔀 🔁 🔂 ▶️ ⏩ ⏭️ ⏯️ ◀️ ⏪ ⏮️ 🔼 ⏫ 🔽 ⏬ ⏸️ ⏹️ ⏺️ ⏏️ 🎦 🔅 🔆 📶 🛜 📳 📴 ♀️ ♂️ ⚧️ ✖️ ➕ ➖ ➗ 🟰 ♾️ ‼️ ⁉️ ❓ ❔ ❕ ❗ 〰️ 💱 💲 ⚕️ ♻️ ⚜️ 🔱 📛 🔰 ⭕ ✅ ☑️ ✔️ ❌ ❎ ➰ ➿ 〽️ ✳️ ✴️ ❇️ ©️ ®️ ™️ 🫟 #️⃣ *️⃣ 0️⃣ 1️⃣ 2️⃣ 3️⃣ 4️⃣ 5️⃣ 6️⃣ 7️⃣ 8️⃣ 9️⃣ 🔟 🔠 🔡 🔢 🔣 🔤 🅰️ 🆎 🅱️ 🆑 🆒 🆓 ℹ️ 🆔 Ⓜ️ 🆕 🆖 🅾️ 🆗 🅿️ 🆘 🆙 🆚 🈁 🈂️ 🈷️ 🈶 🈯 🉐 🈹 🈚 🈲 🉑 🈸 🈴 🈳 ㊗️ ㊙️ 🈺 🈵 🔴 🟠 🟡 🟢 🔵 🟣 🟤 ⚫ ⚪ 🟥 🟧 🟨 🟩 🟦 🟪 🟫 ⬛ ⬜ ◼️ ◻️ ◾ ◽ ▪️ ▫️ 🔶 🔷 🔸 🔹 🔺 🔻 💠 🔘 🔳 🔲
++@flags 🏳️
++🏁 🚩 🎌 🏴 🏳️ 🏳️‍🌈 🏳️‍⚧️ 🏴‍☠️ 🇦🇨 🇦🇩 🇦🇪 🇦🇫 🇦🇬 🇦🇮 🇦🇱 🇦🇲 🇦🇴 🇦🇶 🇦🇷 🇦🇸 🇦🇹 🇦🇺 🇦🇼 🇦🇽 🇦🇿 🇧🇦 🇧🇧 🇧🇩 🇧🇪 🇧🇫 🇧🇬 🇧🇭 🇧🇮 🇧🇯 🇧🇱 🇧🇲 🇧🇳 🇧🇴 🇧🇶 🇧🇷 🇧🇸 🇧🇹 🇧🇻 🇧🇼 🇧🇾 🇧🇿 🇨🇦 🇨🇨 🇨🇩 🇨🇫 🇨🇬 🇨🇭 🇨🇮 🇨🇰 🇨🇱 🇨🇲 🇨🇳 🇨🇴 🇨🇵 🇨🇶 🇨🇷 🇨🇺 🇨🇻 🇨🇼 🇨🇽 🇨🇾 🇨🇿 🇩🇪 🇩🇬 🇩🇯 🇩🇰 🇩🇲 🇩🇴 🇩🇿 🇪🇦 🇪🇨 🇪🇪 🇪🇬 🇪🇭 🇪🇷 🇪🇸 🇪🇹 🇪🇺 🇫🇮 🇫🇯 🇫🇰 🇫🇲 🇫🇴 🇫🇷 🇬🇦 🇬🇧 🇬🇩 🇬🇪 🇬🇫 🇬🇬 🇬🇭 🇬🇮 🇬🇱 🇬🇲 🇬🇳 🇬🇵 🇬🇶 🇬🇷 🇬🇸 🇬🇹 🇬🇺 🇬🇼 🇬🇾 🇭🇰 🇭🇲 🇭🇳 🇭🇷 🇭🇹 🇭🇺 🇮🇨 🇮🇩 🇮🇪 🇮🇱 🇮🇲 🇮🇳 🇮🇴 🇮🇶 🇮🇷 🇮🇸 🇮🇹 🇯🇪 🇯🇲 🇯🇴 🇯🇵 🇰🇪 🇰🇬 🇰🇭 🇰🇮 🇰🇲 🇰🇳 🇰🇵 🇰🇷 🇰🇼 🇰🇾 🇰🇿 🇱🇦 🇱🇧 🇱🇨 🇱🇮 🇱🇰 🇱🇷 🇱🇸 🇱🇹 🇱🇺 🇱🇻 🇱🇾 🇲🇦 🇲🇨 🇲🇩 🇲🇪 🇲🇫 🇲🇬 🇲🇭 🇲🇰 🇲🇱 🇲🇲 🇲🇳 🇲🇴 🇲🇵 🇲🇶 🇲🇷 🇲🇸 🇲🇹 🇲🇺 🇲🇻 🇲🇼 🇲🇽 🇲🇾 🇲🇿 🇳🇦 🇳🇨 🇳🇪 🇳🇫 🇳🇬 🇳🇮 🇳🇱 🇳🇴 🇳🇵 🇳🇷 🇳🇺 🇳🇿 🇴🇲 🇵🇦 🇵🇪 🇵🇫 🇵🇬 🇵🇭 🇵🇰 🇵🇱 🇵🇲 🇵🇳 🇵🇷 🇵🇸 🇵🇹 🇵🇼 🇵🇾 🇶🇦 🇷🇪 🇷🇴 🇷🇸 🇷🇺 🇷🇼 🇸🇦 🇸🇧 🇸🇨 🇸🇩 🇸🇪 🇸🇬 🇸🇭 🇸🇮 🇸🇯 🇸🇰 🇸🇱 🇸🇲 🇸🇳 🇸🇴 🇸🇷 🇸🇸 🇸🇹 🇸🇻 🇸🇽 🇸🇾 🇸🇿 🇹🇦 🇹🇨 🇹🇩 🇹🇫 🇹🇬 🇹🇭 🇹🇯 🇹🇰 🇹🇱 🇹🇲 🇹🇳 🇹🇴 🇹🇷 🇹🇹 🇹🇻 🇹🇼 🇹🇿 🇺🇦 🇺🇬 🇺🇲 🇺🇳 🇺🇸 🇺🇾 🇺🇿 🇻🇦 🇻🇨 🇻🇪 🇻🇬 🇻🇮 🇻🇳 🇻🇺 🇼🇫 🇼🇸 🇽🇰 🇾🇪 🇾🇹 🇿🇦 🇿🇲 🇿🇼 🏴󠁧󠁢󠁥󠁮󠁧󠁿 🏴󠁧󠁢󠁳󠁣󠁴󠁿 🏴󠁧󠁢󠁷󠁬󠁳󠁿
+diff --git a/src/config.rs b/src/config.rs
+index de65e89..d051928 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -57,6 +57,9 @@ pub struct Config {
+     pub lock_row: usize,
+     // pressed to call up the lock screen's form (and its fingerprint check)
+     pub lock_wake_key: Option<Key>,
++    // the emoji panel: its font, and programs that paste with Ctrl+Shift+V
++    pub emoji_font: String,
++    pub emoji_paste_shift: Vec<String>,
+ }
+ 
+ /// Icons that follow the session (Live = ...)
+@@ -107,6 +110,16 @@ pub enum AppSet {
+     Keys(usize),
+ }
+ 
++/// A window class (lower case) and a pattern: case does not matter, a
++/// trailing * matches the start
++fn class_fits(class: &str, pattern: &str) -> bool {
++    let p = pattern.to_lowercase();
++    match p.strip_suffix('*') {
++        Some(prefix) => class.starts_with(prefix),
++        None => class == p,
++    }
++}
++
+ impl Config {
+     /// The first rule matching window class `class` and title `title`
+     fn rule_for(&self, class: &str, title: &str) -> Option<&AppRule> {
+@@ -117,15 +130,14 @@ impl Config {
+                 .match_title
+                 .as_ref()
+                 .is_none_or(|parts| parts.iter().any(|t| title.contains(&t.to_lowercase())));
+-            title_fits && (r.r#match.is_empty() || r.r#match.iter().any(|p| {
+-                let p = p.to_lowercase();
+-                match p.strip_suffix('*') {
+-                    Some(prefix) => class.starts_with(prefix),
+-                    None => class == p,
+-                }
+-            }))
++            title_fits && (r.r#match.is_empty() || r.r#match.iter().any(|p| class_fits(&class, p)))
+         })
+     }
++    /// Whether the program pastes with Ctrl+Shift+V (EmojiPasteShift)
++    pub fn paste_shift(&self, class: &str) -> bool {
++        let class = class.to_lowercase();
++        self.emoji_paste_shift.iter().any(|p| class_fits(&class, p))
++    }
+     /// The F-key row of that program (FnSet), if it has one
+     pub fn fn_row_for(&self, class: &str, title: &str) -> Option<usize> {
+         self.fn_rows.get(self.rule_for(class, title)?.fn_set.as_ref()?).copied()
+@@ -160,6 +172,8 @@ pub enum Command {
+     Layout,
+     /// do not disturb on/off ("dnd toggle" to the helper)
+     Dnd,
++    /// open the emoji panel
++    Emoji,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -209,6 +223,8 @@ struct ConfigProxy {
+     notification_icon: Option<String>,
+     lock_screen_keys: Option<Vec<ButtonConfig>>,
+     lock_screen_wake_key: Option<Key>,
++    emoji_font: Option<String>,
++    emoji_paste_shift: Option<Vec<String>>,
+ }
+ 
+ fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<Key>, D::Error>
+@@ -356,6 +372,8 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+         base.notification_icon = user.notification_icon.or(base.notification_icon);
+         base.lock_screen_keys = user.lock_screen_keys.or(base.lock_screen_keys);
+         base.lock_screen_wake_key = user.lock_screen_wake_key.or(base.lock_screen_wake_key);
++        base.emoji_font = user.emoji_font.or(base.emoji_font);
++        base.emoji_paste_shift = user.emoji_paste_shift.or(base.emoji_paste_shift);
+     };
+     let media_layer_keys = base.media_layer_keys.unwrap();
+     let primary_layer_keys = base.primary_layer_keys.unwrap();
+@@ -498,6 +516,8 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+         fn_rows,
+         lock_row,
+         lock_wake_key: base.lock_screen_wake_key,
++        emoji_font: base.emoji_font.clone().unwrap_or_else(|| "Noto Color Emoji".into()),
++        emoji_paste_shift: base.emoji_paste_shift.clone().unwrap_or_default(),
+     };
+     crate::anim::set_enabled(cfg.animations);
+     (cfg, layers)
+diff --git a/src/emoji.rs b/src/emoji.rs
+new file mode 100644
+index 0000000..d97364b
+--- /dev/null
++++ b/src/emoji.rs
+@@ -0,0 +1,393 @@
++// The emoji panel (macOS style): a key (Command = "Emoji") opens it over the
++// program's part of the row (Esc and the Control Strip stay): a round close
++// button, a key with the current category, and one row of all emoji that
++// scrolls with the finger and runs on after a flick. The category key shows
++// the categories instead; one tapped jumps to its start. A tapped emoji goes
++// to the helper ("emoji <text>"): it puts it on the clipboard, says so in
++// .../paste, and tiny-dfr presses paste (Ctrl+V, Ctrl+Shift+V in the programs
++// of EmojiPasteShift); the helper puts the old clipboard back after it.
++// The list: /usr/share/tiny-dfr/emoji.txt (from Unicode's emoji-test.txt),
++// recently used ones first (.../emoji-recent). Each emoji is drawn once by
++// Pango (sequences, flags, colour glyphs; librsvg would draw them as black
++// outlines) and kept.
++use crate::{config::Config, media};
++use cairo::{Context, Format, ImageSurface};
++use pangocairo::{functions as pc, pango};
++use std::{
++    collections::HashMap,
++    fs::read_to_string,
++    time::{Duration, Instant},
++};
++
++const LIST: &str = "/usr/share/tiny-dfr/emoji.txt";
++const CLOSE_BOX: f64 = 72.0;
++const CATEGORY_WIDTH: f64 = 80.0;
++// one emoji's place in the row, and the size it is drawn at
++const PITCH: f64 = 64.0;
++const GLYPH: i32 = 38;
++// a category in the category row
++const CATEGORY_PITCH: f64 = 84.0;
++const RECENT_ICON: &str = "\u{1F552}";
++// a flick: speed it keeps (px/s), how fast it fades, when it stops
++const FLING_MIN: f64 = 150.0;
++const FLING_TAU: f64 = 0.45;
++const FLING_STOP: f64 = 15.0;
++// the finger's speed: from its moves in the last this long
++const VELOCITY_WINDOW: Duration = Duration::from_millis(80);
++const MAX_CACHED: usize = 600;
++
++pub struct Group {
++    pub icon: String,
++    pub start: usize,
++}
++
++pub struct Catalog {
++    pub items: Vec<String>,
++    pub groups: Vec<Group>,
++}
++
++impl Catalog {
++    /// The list with `recent` (most recent first) as its first group
++    pub fn load(recent: &[String]) -> Option<Catalog> {
++        let text = read_to_string(LIST).map_err(|e| eprintln!("{LIST}: {e}")).ok()?;
++        let mut items: Vec<String> = Vec::new();
++        let mut groups = Vec::new();
++        if !recent.is_empty() {
++            groups.push(Group { icon: RECENT_ICON.into(), start: 0 });
++            items.extend(recent.iter().cloned());
++        }
++        let mut lines = text.lines().filter(|l| !l.starts_with('#'));
++        while let Some(head) = lines.next() {
++            let Some(icon) = head.strip_prefix('@').and_then(|h| h.split_whitespace().nth(1)) else {
++                continue;
++            };
++            groups.push(Group { icon: icon.to_string(), start: items.len() });
++            items.extend(lines.next().unwrap_or("").split_whitespace().map(str::to_string));
++        }
++        (!items.is_empty()).then_some(Catalog { items, groups })
++    }
++}
++
++pub enum Hit {
++    Close,
++    Category,
++    Strip,
++    Outside,
++}
++
++/// Parts in bar coordinates without pixel shift
++pub struct Layout {
++    pub left: f64,
++    pub close: (f64, f64),
++    pub category: (f64, f64),
++    pub strip: (f64, f64),
++    pub right: f64,
++}
++
++impl Layout {
++    /// `left`..`right`: the program's part of the row
++    pub fn new(cfg: &Config, left: f64, right: f64) -> Layout {
++        let close = (left, CLOSE_BOX);
++        let category = (close.0 + close.1 + cfg.group_spacing, CATEGORY_WIDTH);
++        let s = category.0 + category.1 + cfg.group_spacing;
++        let strip = (s, (right - s).max(PITCH));
++        Layout { left, close, category, strip, right: strip.0 + strip.1 }
++    }
++    pub fn hit(&self, x: f64) -> Hit {
++        let within = |(l, w): (f64, f64)| x >= l - 4.0 && x < l + w + 4.0;
++        if x < self.left - 4.0 || x >= self.right + 4.0 {
++            Hit::Outside
++        } else if within(self.close) {
++            Hit::Close
++        } else if within(self.category) {
++            Hit::Category
++        } else if within(self.strip) {
++            Hit::Strip
++        } else {
++            Hit::Outside
++        }
++    }
++}
++
++/// A finger on the row
++struct Touch {
++    slot: u32,
++    x0: f64,
++    offset0: f64,
++    dragging: bool,
++    // recent (time, x) for the speed at release
++    trail: Vec<(Instant, f64)>,
++}
++
++pub struct Panel {
++    pub catalog: Catalog,
++    /// how far the row is scrolled (px from the first emoji)
++    offset: f64,
++    touch: Option<Touch>,
++    /// the emoji (or category, while choosing) under a finger that has not slid
++    pub pressed: Option<(u32, usize)>,
++    /// the category key held
++    pub category_held: Option<u32>,
++    /// the category row is shown instead of the emoji
++    pub choosing: bool,
++    /// running on after a flick: speed in px/s (positive: towards the end)
++    fling: Option<(f64, Instant)>,
++    cache: HashMap<String, ImageSurface>,
++    font: String,
++}
++
++impl Panel {
++    pub fn new(cfg: &Config, recent: &[String]) -> Option<Panel> {
++        Some(Panel {
++            catalog: Catalog::load(recent)?,
++            offset: 0.0,
++            touch: None,
++            pressed: None,
++            category_held: None,
++            choosing: false,
++            fling: None,
++            cache: HashMap::new(),
++            font: cfg.emoji_font.clone(),
++        })
++    }
++
++    /// The PNG preview: scrolled to `group`, an emoji pressed, choosing
++    pub fn preview(&mut self, layout: &Layout, group: usize, pressed: Option<usize>, choosing: bool) {
++        let start = self.catalog.groups.get(group).map_or(0, |g| g.start);
++        self.offset = (start as f64 * PITCH).min(self.max_offset(layout));
++        self.pressed = pressed.map(|i| (0, start + i));
++        self.choosing = choosing;
++    }
++
++    fn max_offset(&self, layout: &Layout) -> f64 {
++        (self.catalog.items.len() as f64 * PITCH - layout.strip.1).max(0.0)
++    }
++
++    /// The emoji at `x` (bar coordinates without pixel shift), if any
++    fn item_at(&self, layout: &Layout, x: f64) -> Option<usize> {
++        let i = ((x - layout.strip.0 + self.offset) / PITCH).floor();
++        (i >= 0.0 && (i as usize) < self.catalog.items.len()).then_some(i as usize)
++    }
++
++    fn category_at(&self, layout: &Layout, x: f64) -> Option<usize> {
++        let i = ((x - layout.strip.0) / CATEGORY_PITCH).floor();
++        (i >= 0.0 && (i as usize) < self.catalog.groups.len()).then_some(i as usize)
++    }
++
++    /// The category the row's left end is in
++    pub fn current_group(&self) -> usize {
++        let first = (self.offset / PITCH + 0.5) as usize;
++        self.catalog.groups.iter().rposition(|g| g.start <= first).unwrap_or(0)
++    }
++
++    /// Whether this finger scrolls or holds the row
++    pub fn touching(&self, slot: u32) -> bool {
++        self.touch.as_ref().is_some_and(|t| t.slot == slot)
++    }
++
++    pub fn moving(&self) -> bool {
++        self.fling.is_some()
++    }
++
++    /// One step of a flick; false when it has stopped
++    pub fn step(&mut self, layout: &Layout) -> bool {
++        let Some((v, at)) = self.fling else { return false };
++        let dt = at.elapsed().as_secs_f64();
++        let v1 = v * (-dt / FLING_TAU).exp();
++        // the distance run over dt with the speed fading exponentially
++        self.offset += v * FLING_TAU * (1.0 - (-dt / FLING_TAU).exp());
++        let max = self.max_offset(layout);
++        let stopped = v1.abs() < FLING_STOP || self.offset <= 0.0 || self.offset >= max;
++        self.offset = self.offset.clamp(0.0, max);
++        self.fling = (!stopped).then_some((v1, Instant::now()));
++        true
++    }
++
++    pub fn down(&mut self, layout: &Layout, slot: u32, x: f64) {
++        // a touch stops a flick (and is then not a tap)
++        let was_moving = self.fling.take().is_some();
++        if self.choosing {
++            self.pressed = self.category_at(layout, x).map(|i| (slot, i));
++            return;
++        }
++        self.touch = Some(Touch { slot, x0: x, offset0: self.offset, dragging: was_moving, trail: vec![(Instant::now(), x)] });
++        self.pressed = if was_moving { None } else { self.item_at(layout, x).map(|i| (slot, i)) };
++    }
++
++    /// true when it is this panel's finger
++    pub fn motion(&mut self, layout: &Layout, slot: u32, x: f64) -> bool {
++        if self.choosing {
++            if self.pressed.is_some_and(|(s, _)| s == slot) {
++                self.pressed = self.category_at(layout, x).map(|i| (slot, i));
++                return true;
++            }
++            return false;
++        }
++        let max = self.max_offset(layout);
++        let Some(t) = self.touch.as_mut().filter(|t| t.slot == slot) else { return false };
++        if !t.dragging && (x - t.x0).abs() > crate::slider::DRAG_THRESHOLD_PX {
++            t.dragging = true;
++            // the row follows the finger from where it is now, without a jump
++            t.x0 = x;
++            self.pressed = None;
++        }
++        if t.dragging {
++            self.offset = (t.offset0 - (x - t.x0)).clamp(0.0, max);
++        }
++        let now = Instant::now();
++        t.trail.push((now, x));
++        t.trail.retain(|&(at, _)| now.duration_since(at) <= VELOCITY_WINDOW);
++        true
++    }
++
++    /// The finger went up: the emoji tapped, if any
++    pub fn up(&mut self, layout: &Layout, slot: u32) -> Option<String> {
++        if self.choosing {
++            let Some((s, i)) = self.pressed.filter(|(s, _)| *s == slot) else { return None };
++            let _ = s;
++            self.pressed = None;
++            self.choosing = false;
++            self.offset = (self.catalog.groups[i].start as f64 * PITCH).min(self.max_offset(layout));
++            return None;
++        }
++        let t = self.touch.take().filter(|t| t.slot == slot)?;
++        if t.dragging {
++            if let (Some(&(t0, x0)), Some(&(t1, x1))) = (t.trail.first(), t.trail.last()) {
++                let dt = t1.duration_since(t0).as_secs_f64();
++                // recent moves only: a finger that stopped before lifting does not fling
++                if dt > 0.005 && t1.elapsed() < VELOCITY_WINDOW {
++                    let v = -(x1 - x0) / dt;
++                    if v.abs() > FLING_MIN {
++                        self.fling = Some((v, Instant::now()));
++                    }
++                }
++            }
++            return None;
++        }
++        let (_, i) = self.pressed.take().filter(|(s, _)| *s == slot)?;
++        Some(self.catalog.items[i].clone())
++    }
++
++    /// A ready-drawn emoji: drawn once by librsvg (Pango lays it out), its
++    /// ink centred in a GLYPH square
++    fn glyph(&mut self, text: &str) -> Option<&ImageSurface> {
++        if !self.cache.contains_key(text) {
++            if self.cache.len() >= MAX_CACHED {
++                self.cache.clear();
++            }
++            let surface = render_glyph(text, &self.font)?;
++            self.cache.insert(text.to_string(), surface);
++        }
++        self.cache.get(text)
++    }
++
++    /// Draw it all; the bar under it is cleared by the caller
++    pub fn draw(&mut self, c: &Context, cfg: &Config, layout: &Layout, height: f64, (sx, sy): (f64, f64)) {
++        let bh = if cfg.button_height > 0.0 { cfg.button_height.min(height) } else { height * 0.7 };
++        let top = (height - bh) / 2.0 + sy;
++        media::close_button(c, layout.close.0 + layout.close.1 / 2.0 + sx, height);
++        // the category key: the current one's emoji (an open one: highlighted)
++        let (l, w) = layout.category;
++        let (r, g, b) = if self.category_held.is_some() || self.choosing { cfg.button_active_color } else { cfg.button_color };
++        c.set_source_rgb(r, g, b);
++        media::rounded_rect(c, l + sx, top, w, bh, cfg.button_radius);
++        c.fill().unwrap();
++        let icon = self.catalog.groups[self.current_group()].icon.clone();
++        self.paint_glyph(c, &icon, l + w / 2.0 + sx, height / 2.0 + sy);
++        // the row, cut at its ends
++        let (sl, sw) = layout.strip;
++        c.save().unwrap();
++        c.rectangle(sl + sx, 0.0, sw, height);
++        c.clip();
++        if self.choosing {
++            let current = self.current_group();
++            for i in 0..self.catalog.groups.len() {
++                let x = sl + i as f64 * CATEGORY_PITCH;
++                let pressed = self.pressed.is_some_and(|(_, p)| p == i);
++                if pressed || i == current {
++                    let (r, g, b) = if pressed { cfg.button_active_color } else { cfg.button_color };
++                    c.set_source_rgb(r, g, b);
++                    media::rounded_rect(c, x + 4.0 + sx, top, CATEGORY_PITCH - 8.0, bh, cfg.button_radius);
++                    c.fill().unwrap();
++                }
++                let icon = self.catalog.groups[i].icon.clone();
++                self.paint_glyph(c, &icon, x + CATEGORY_PITCH / 2.0 + sx, height / 2.0 + sy);
++            }
++        } else {
++            let first = (self.offset / PITCH).floor().max(0.0) as usize;
++            let last = (((self.offset + sw) / PITCH).ceil() as usize).min(self.catalog.items.len());
++            for i in first..last {
++                let x = sl + i as f64 * PITCH - self.offset;
++                if self.pressed.is_some_and(|(_, p)| p == i) {
++                    let (r, g, b) = cfg.button_active_color;
++                    c.set_source_rgb(r, g, b);
++                    media::rounded_rect(c, x + 2.0 + sx, top, PITCH - 4.0, bh, cfg.button_radius);
++                    c.fill().unwrap();
++                }
++                let item = self.catalog.items[i].clone();
++                self.paint_glyph(c, &item, x + PITCH / 2.0 + sx, height / 2.0 + sy);
++            }
++        }
++        c.restore().unwrap();
++    }
++
++    fn paint_glyph(&mut self, c: &Context, text: &str, cx: f64, cy: f64) {
++        if let Some(s) = self.glyph(text) {
++            let x = (cx - GLYPH as f64 / 2.0).round();
++            let y = (cy - GLYPH as f64 / 2.0).round();
++            c.set_source_surface(s, x, y).unwrap();
++            c.paint().unwrap();
++        }
++    }
++}
++
++fn render_glyph(text: &str, font: &str) -> Option<ImageSurface> {
++    // drawn big on a roomy canvas, then its ink is found and fitted
++    let size = GLYPH * 3;
++    let fs = GLYPH * 2;
++    let mut big = ImageSurface::create(Format::ARgb32, size, size).ok()?;
++    {
++        let c = Context::new(&big).ok()?;
++        let layout = pc::create_layout(&c);
++        let mut desc = pango::FontDescription::from_string(font);
++        desc.set_absolute_size(fs as f64 * pango::SCALE as f64);
++        layout.set_font_description(Some(&desc));
++        layout.set_text(text);
++        let (_, logical) = layout.pixel_extents();
++        c.move_to(((size - logical.width()) / 2) as f64, ((size - logical.height()) / 2) as f64);
++        c.set_source_rgb(1.0, 1.0, 1.0);
++        pc::show_layout(&c, &layout);
++    }
++    // the ink's bounds (alpha), in the big canvas
++    let stride = big.stride() as usize;
++    let (mut x0, mut y0, mut x1, mut y1) = (size, size, -1, -1);
++    {
++        let data = big.data().ok()?;
++        for y in 0..size {
++            for x in 0..size {
++                if data[y as usize * stride + x as usize * 4 + 3] > 8 {
++                    x0 = x0.min(x);
++                    x1 = x1.max(x);
++                    y0 = y0.min(y);
++                    y1 = y1.max(y);
++                }
++            }
++        }
++    }
++    if x1 < x0 {
++        return None;
++    }
++    let (w, h) = ((x1 - x0 + 1) as f64, (y1 - y0 + 1) as f64);
++    // down to GLYPH (wide ones, flags, by their width), never up
++    let scale = (GLYPH as f64 / w.max(h)).min(GLYPH as f64 / fs as f64 * 1.25);
++    let out = ImageSurface::create(Format::ARgb32, GLYPH, GLYPH).ok()?;
++    let c = Context::new(&out).ok()?;
++    c.translate(GLYPH as f64 / 2.0, GLYPH as f64 / 2.0);
++    c.scale(scale, scale);
++    c.translate(-(x0 as f64 + w / 2.0), -(y0 as f64 + h / 2.0));
++    c.set_source_surface(&big, 0.0, 0.0).ok()?;
++    c.source().set_filter(cairo::Filter::Best);
++    c.paint().ok()?;
++    drop(c);
++    Some(out)
++}
+diff --git a/src/main.rs b/src/main.rs
+index af1cb7b..67f90c9 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -48,6 +48,7 @@ mod anim;
+ mod backlight;
+ mod config;
+ mod display;
++mod emoji;
+ mod fonts;
+ mod layer_switch;
+ mod media;
+@@ -73,6 +74,8 @@ const LOCK_WAKE_DELAY: Duration = Duration::from_millis(1500);
+ const TOUCHID_FLASH: Duration = Duration::from_millis(900);
+ // a "waiting" older than this is stale (the helper went away)
+ const TOUCHID_STALE_MS: i64 = 60_000;
++// an emoji sent to the helper is pasted only if it answers within this
++const EMOJI_PASTE_WAIT: Duration = Duration::from_millis(1500);
+ 
+ /// The Touch ID icon of the config
+ fn touchid_icon(cfg: &Config) -> Option<Button> {
+@@ -1250,10 +1253,11 @@ fn render_preview(path: &std::ffi::OsStr) {
+     }
+     let mut bar = ImageSurface::create(Format::ARgb32, height as i32, width as i32).unwrap();
+     let has_np_row = layers[ROW_STRIP_COLLAPSED].buttons.iter().any(|(_, b)| b.command == Some(Command::NowPlaying));
++    let has_emoji = layers.iter().any(|l| l.buttons.iter().any(|(_, b)| b.command == Some(Command::Emoji)));
+     let out = ImageSurface::create(
+         Format::ARgb32,
+         width as i32,
+-        (rows.len() + frames.len() + if has_np_row { 2 } else { 0 } + if cfg.touchid_hint { 4 } else { 0 } + cfg.notifications as usize) as i32
++        (rows.len() + frames.len() + if has_np_row { 2 } else { 0 } + if has_emoji { 3 } else { 0 } + if cfg.touchid_hint { 4 } else { 0 } + cfg.notifications as usize) as i32
+             * (height as i32 + gap)
+             - gap,
+     )
+@@ -1338,6 +1342,38 @@ fn render_preview(path: &std::ffi::OsStr) {
+             }
+         }
+     }
++    // the emoji panel (some made-up recent ones): at the start, in the
++    // flags with one pressed, the categories
++    if has_emoji {
++        let recent: Vec<String> = ["\u{1F44D}", "\u{2764}\u{FE0F}", "\u{1F602}", "\u{1F1FA}\u{1F1E6}", "\u{1F468}\u{200D}\u{1F4BB}"].map(String::from).into();
++        if let Some(mut panel) = emoji::Panel::new(&cfg, &recent) {
++            let layout = emoji_layout(&cfg, &layers[ROW_STRIP_COLLAPSED], width);
++            let flags = panel.catalog.groups.len() - 1;
++            for (group, pressed, choosing) in [(0, None, false), (flags, Some(3), false), (0, Some(2), true)] {
++                panel.preview(&layout, group, pressed, choosing);
++                layers[ROW_STRIP_COLLAPSED].draw(&cfg, width as i32, height as i32, &bar, (0.0, 0.0), true);
++                let bc = Context::new(&bar).unwrap();
++                bc.translate(height as f64, 0.0);
++                bc.rotate((90.0f64).to_radians());
++                let sx = pixel_shift_width(&cfg) / 2.0;
++                bc.set_source_rgb(0.0, 0.0, 0.0);
++                bc.rectangle(layout.left + sx - cfg.group_spacing / 2.0, 0.0, layout.right - layout.left + cfg.group_spacing, height as f64);
++                bc.fill().unwrap();
++                let t = Instant::now();
++                panel.draw(&bc, &cfg, &layout, height as f64, (sx, 0.0));
++                eprintln!("emoji panel drawn in {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
++                drop(bc);
++                bar.flush();
++                c.save().unwrap();
++                let y0 = ((rows_len + extra) as i32 * (height as i32 + gap)) as f64;
++                c.transform(cairo::Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, y0 + height as f64));
++                c.set_source_surface(&bar, 0.0, 0.0).unwrap();
++                c.paint().unwrap();
++                c.restore().unwrap();
++                extra += 1;
++            }
++        }
++    }
+     // a notification (made up) over the collapsed row
+     if cfg.notifications {
+         let n = state::Notice { at_ms: 0, app: "Chat".into(), summary: "Alex: Are you home yet?".into() };
+@@ -1581,6 +1617,12 @@ fn app_area(cfg: &Config, layer: &FunctionLayer, width: u16) -> (f64, f64) {
+     (left, right.max(left))
+ }
+ 
++/// The emoji panel over the program's part of `layer` (the strip stays)
++fn emoji_layout(cfg: &Config, layer: &FunctionLayer, width: u16) -> emoji::Layout {
++    let (left, right) = app_area(cfg, layer, width);
++    emoji::Layout::new(cfg, left, right)
++}
++
+ /// The now-playing panel over the program's part of `layer` (the strip stays)
+ fn media_layout(cfg: &Config, layer: &FunctionLayer, width: u16, players: usize, cover: bool) -> media::Layout {
+     let (left, right) = app_area(cfg, layer, width);
+@@ -1701,6 +1743,13 @@ fn real_main(drm: &mut DrmBackend) {
+     let mut media_dirty = false;
+     // the panel's keys changed (pressed, play/pause): all of it
+     let mut media_full = false;
++    // the emoji panel, whether it needs drawing, the emoji sent to the
++    // helper and not pasted yet (one paste each time it reports the
++    // clipboard ready) and when the last went, and the last report seen
++    let mut emoji: Option<emoji::Panel> = None;
++    let mut emoji_dirty = false;
++    let mut emoji_sent: (usize, Instant) = (0, Instant::now());
++    let mut paste_seen = session.paste;
+     // animations: the row under a slider as it opened (fades out behind it),
+     // the strip changing rows, and whether the next row change is the strip's
+     let mut slider_backdrop: Option<ImageSurface> = None;
+@@ -1803,6 +1852,7 @@ fn real_main(drm: &mut DrmBackend) {
+             current_app = None;
+             check_layer = true;
+             media = None;
++            emoji = None;
+             fingerprint = touchid_icon(&cfg);
+             bell = named_icon(cfg.notification_icon.as_ref());
+             session = state_watch.read();
+@@ -1884,6 +1934,21 @@ fn real_main(drm: &mut DrmBackend) {
+                     needs_complete_redraw = true;
+                 }
+             }
++            // the helper has the emoji on the clipboard: paste it
++            if session.paste != paste_seen {
++                paste_seen = session.paste;
++                // too late (the helper lost some): none is pending any more
++                if emoji_sent.1.elapsed() >= EMOJI_PASTE_WAIT * emoji_sent.0.max(1) as u32 {
++                    emoji_sent.0 = 0;
++                }
++                if emoji_sent.0 > 0 {
++                    emoji_sent.0 -= 1;
++                    let shift = current_app.as_deref().is_some_and(|a| cfg.paste_shift(a));
++                    let keys = if shift { vec![Key::LeftCtrl, Key::LeftShift, Key::V] } else { vec![Key::LeftCtrl, Key::V] };
++                    toggle_keys(&mut uinput, &keys, 1);
++                    toggle_keys(&mut uinput, &keys, 0);
++                }
++            }
+             media_dirty = true;
+             if media.is_some() && session.playing.is_none() {
+                 media = None;
+@@ -1907,7 +1972,7 @@ fn real_main(drm: &mut DrmBackend) {
+         }
+         // locked: only the lock row (Esc), nothing of the session on the bar
+         let wanted_row = if session.locked {
+-            if media.take().is_some() {
++            if media.take().is_some() || emoji.take().is_some() {
+                 needs_complete_redraw = true;
+             }
+             cfg.lock_row
+@@ -1945,8 +2010,16 @@ fn real_main(drm: &mut DrmBackend) {
+             slider_backdrop = None;
+             pending = None;
+             media = None;
++            emoji = None;
+         }
+         strip_animate = false;
++        // a flick runs on
++        if let Some(e) = &mut emoji {
++            if e.moving() {
++                let layout = emoji_layout(&cfg, &layers[active_layer], width);
++                emoji_dirty |= e.step(&layout);
++            }
++        }
+         // a tapped slider closes after SliderTimeout without a touch
+         if let Some(s) = &mut slider {
+             if let SliderMode::Tap { deadline } = s.mode {
+@@ -2044,7 +2117,7 @@ fn real_main(drm: &mut DrmBackend) {
+             }
+         }
+         let notice_shown = notice_now(&cfg, &session, notice_dismissed)
+-            .filter(|_| slider.is_none() && media.is_none())
++            .filter(|_| slider.is_none() && media.is_none() && emoji.is_none())
+             .map(|n| n.at_ms);
+         if notice_shown != notice_drawn {
+             needs_complete_redraw = true;
+@@ -2065,6 +2138,7 @@ fn real_main(drm: &mut DrmBackend) {
+             || layer_changed
+             || (slider.is_some() && (slider_dirty || slider_moving))
+             || (media.is_some() && (media_dirty || media_full))
++            || (emoji.is_some() && emoji_dirty)
+             || (touchid.is_some() && touchid_moving)
+         {
+             let shift = if cfg.enable_pixel_shift {
+@@ -2142,6 +2216,22 @@ fn real_main(drm: &mut DrmBackend) {
+                     clips.push(ClipRect::new(0, x1, height, x2));
+                 }
+             }
++            // the emoji panel, like the now-playing one
++            if let (Some(e), None) = (&mut emoji, &slider) {
++                let layout = emoji_layout(&cfg, &layers[active_layer], width);
++                let sx = shift.0 + pixel_shift_width(&cfg) / 2.0;
++                let c = Context::new(&surface).unwrap();
++                c.translate(height as f64, 0.0);
++                c.rotate((90.0f64).to_radians());
++                c.set_source_rgb(0.0, 0.0, 0.0);
++                c.rectangle(layout.left + sx - cfg.group_spacing / 2.0, 0.0, layout.right - layout.left + cfg.group_spacing, height as f64);
++                c.fill().unwrap();
++                e.draw(&c, &cfg, &layout, height as f64, (sx, shift.1));
++                drop(c);
++                let x1 = (layout.left + sx - cfg.group_spacing).max(0.0) as u16;
++                let x2 = ((layout.right + sx + cfg.group_spacing) as u16).min(width);
++                clips.push(ClipRect::new(0, x1, height, x2));
++            }
+             if let (Some(n), true) = (notice_now(&cfg, &session, notice_dismissed), notice_shown.is_some()) {
+                 let area = app_area(&cfg, &layers[active_layer], width);
+                 let sx = shift.0 + pixel_shift_width(&cfg) / 2.0;
+@@ -2187,6 +2277,7 @@ fn real_main(drm: &mut DrmBackend) {
+             slider_dirty = false;
+             media_dirty = false;
+             media_full = false;
++            emoji_dirty = false;
+             let data = surface.data().unwrap();
+             drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
+             drm.dirty(&clips).unwrap();
+@@ -2219,7 +2310,7 @@ fn real_main(drm: &mut DrmBackend) {
+             next_timeout_ms = min(next_timeout_ms, 1);
+         }
+         // animating: come back for the next frame
+-        if fading || transition.is_some() || slider.as_ref().is_some_and(|s| s.animating()) {
++        if fading || transition.is_some() || slider.as_ref().is_some_and(|s| s.animating()) || emoji.as_ref().is_some_and(|e| e.moving()) {
+             next_timeout_ms = min(next_timeout_ms, anim::FRAME.as_millis() as i32);
+         }
+         match epoll.wait(
+@@ -2360,12 +2451,33 @@ fn real_main(drm: &mut DrmBackend) {
+                                     media::Hit::Outside => {} // Esc, the strip
+                                 }
+                             }
++                            if let Some(e) = &mut emoji {
++                                let layout = emoji_layout(&cfg, &layers[active_layer], width);
++                                match layout.hit(x - half_shift) {
++                                    emoji::Hit::Close => {
++                                        emoji = None;
++                                        needs_complete_redraw = true;
++                                        continue;
++                                    }
++                                    emoji::Hit::Category => {
++                                        e.category_held = Some(dn.seat_slot());
++                                        emoji_dirty = true;
++                                        continue;
++                                    }
++                                    emoji::Hit::Strip => {
++                                        e.down(&layout, dn.seat_slot(), x - half_shift);
++                                        emoji_dirty = true;
++                                        continue;
++                                    }
++                                    emoji::Hit::Outside => {} // Esc, the strip
++                                }
++                            }
+                             let hit = layers[active_layer]
+                                 .hit(&cfg, width, height, x, y, None)
+                                 // under the slider nothing, beside the panel Esc and the strip
+                                 .filter(|&b| {
+                                     slider.is_none()
+-                                        && (media.is_none()
++                                        && ((media.is_none() && emoji.is_none())
+                                             || b == 0
+                                             || layers[active_layer].strip_start().is_some_and(|s| b >= s))
+                                 });
+@@ -2415,6 +2527,13 @@ fn real_main(drm: &mut DrmBackend) {
+                                     }
+                                 }
+                             }
++                            if let Some(e) = &mut emoji {
++                                let layout = emoji_layout(&cfg, &layers[active_layer], width);
++                                if e.motion(&layout, mtn.seat_slot(), x - half_shift) {
++                                    emoji_dirty = true;
++                                    continue;
++                                }
++                            }
+                             if let Some((slot, x0, start, shown)) = layout_hold {
+                                 if slot == mtn.seat_slot() {
+                                     let names = session.layout.as_ref().map(|l| l.1.clone()).unwrap_or_default();
+@@ -2508,6 +2627,27 @@ fn real_main(drm: &mut DrmBackend) {
+                                     }
+                                 }
+                             }
++                            if let Some(e) = &mut emoji {
++                                if e.category_held == Some(up.seat_slot()) {
++                                    // the categories instead of the emoji, or back
++                                    e.category_held = None;
++                                    e.choosing = !e.choosing;
++                                    e.pressed = None;
++                                    emoji_dirty = true;
++                                    continue;
++                                }
++                                let layout = emoji_layout(&cfg, &layers[active_layer], width);
++                                let mine = e.pressed.is_some_and(|(s, _)| s == up.seat_slot()) || e.touching(up.seat_slot());
++                                if mine {
++                                    if let Some(text) = e.up(&layout, up.seat_slot()) {
++                                        if slider::bridge_send(&format!("emoji {text}")).is_ok() {
++                                            emoji_sent = (emoji_sent.0 + 1, Instant::now());
++                                        }
++                                    }
++                                    emoji_dirty = true;
++                                    continue;
++                                }
++                            }
+                             if let Some((slot, _, _, shown)) = layout_hold {
+                                 if slot == up.seat_slot() {
+                                     layout_hold = None;
+@@ -2568,6 +2708,13 @@ fn real_main(drm: &mut DrmBackend) {
+                                 Some(Command::NowPlaying) => {
+                                     // a second tap closes it
+                                     media = if media.is_some() { None } else { Some(media::Panel::new()) };
++                                    emoji = None;
++                                    slider = None;
++                                    needs_complete_redraw = true;
++                                }
++                                Some(Command::Emoji) => {
++                                    emoji = if emoji.is_some() { None } else { emoji::Panel::new(&cfg, &session.emoji_recent) };
++                                    media = None;
+                                     slider = None;
+                                     needs_complete_redraw = true;
+                                 }
+diff --git a/src/media.rs b/src/media.rs
+index a36a33e..6613933 100644
+--- a/src/media.rs
++++ b/src/media.rs
+@@ -104,7 +104,7 @@ pub struct Panel {
+     pub scrub: Option<(u32, f64)>,
+ }
+ 
+-fn rounded_rect(c: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
++pub fn rounded_rect(c: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
+     let r = r.min(h / 2.0).min(w / 2.0);
+     c.new_sub_path();
+     c.arc(x + w - r, y + r, r, (-90.0f64).to_radians(), 0.0);
+@@ -114,6 +114,22 @@ fn rounded_rect(c: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
+     c.close_path();
+ }
+ 
++/// The round close button (×) of a panel, centred at `cx`
++pub fn close_button(c: &Context, cx: f64, height: f64) {
++    c.set_source_rgb(CLOSE_COLOR, CLOSE_COLOR, CLOSE_COLOR);
++    c.arc(cx, height / 2.0, CLOSE_DIAMETER / 2.0, 0.0, TAU);
++    c.fill().unwrap();
++    let arm = 7.5;
++    c.set_source_rgb(0.0, 0.0, 0.0);
++    c.set_line_width(3.5);
++    c.set_line_cap(cairo::LineCap::Round);
++    c.move_to(cx - arm, height / 2.0 - arm);
++    c.line_to(cx + arm, height / 2.0 + arm);
++    c.move_to(cx + arm, height / 2.0 - arm);
++    c.line_to(cx - arm, height / 2.0 + arm);
++    c.stroke().unwrap();
++}
++
+ fn triangle(c: &Context, x: f64, cy: f64, w: f64, h: f64, right: bool) {
+     if right {
+         c.move_to(x, cy - h / 2.0);
+@@ -160,19 +176,7 @@ impl Panel {
+         let top = (height - bh) / 2.0;
+         let cy = height / 2.0 + sy;
+         if full {
+-            let cx = layout.close.0 + layout.close.1 / 2.0 + sx;
+-            c.set_source_rgb(CLOSE_COLOR, CLOSE_COLOR, CLOSE_COLOR);
+-            c.arc(cx, height / 2.0, CLOSE_DIAMETER / 2.0, 0.0, TAU);
+-            c.fill().unwrap();
+-            let arm = 7.5;
+-            c.set_source_rgb(0.0, 0.0, 0.0);
+-            c.set_line_width(3.5);
+-            c.set_line_cap(cairo::LineCap::Round);
+-            c.move_to(cx - arm, height / 2.0 - arm);
+-            c.line_to(cx + arm, height / 2.0 + arm);
+-            c.move_to(cx + arm, height / 2.0 - arm);
+-            c.line_to(cx - arm, height / 2.0 + arm);
+-            c.stroke().unwrap();
++            close_button(c, layout.close.0 + layout.close.1 / 2.0 + sx, height);
+             let playing = np.is_some_and(|n| n.playing);
+             for (i, key) in [Key::Previous, Key::PlayPause, Key::Next].into_iter().enumerate() {
+                 let (l, w) = layout.keys[i];
+diff --git a/src/state.rs b/src/state.rs
+index 8230c03..93e9088 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -32,6 +32,10 @@ pub struct State {
+     pub locked: bool,
+     /// the active window's title (rules with MatchTitle)
+     pub title: Option<String>,
++    /// emoji used lately, the latest first (the emoji panel's first group)
++    pub emoji_recent: Vec<String>,
++    /// the helper put an emoji on the clipboard: when (ms since the epoch)
++    pub paste: Option<i64>,
+ }
+ 
+ /// .../notification: when (ms since the epoch), the program, the title
+@@ -166,7 +170,11 @@ impl StateWatch {
+         });
+         let locked = read_to_string(format!("{DIR}/locked")).is_ok_and(|s| s.trim() == "1");
+         let title = read_to_string(format!("{DIR}/title")).ok().map(|s| s.trim_end().to_string());
+-        State { volume, mic_muted, playing, layout, touchid, dnd, notice, locked, title }
++        let emoji_recent = read_to_string(format!("{DIR}/emoji-recent"))
++            .map(|s| s.split_whitespace().map(str::to_string).collect())
++            .unwrap_or_default();
++        let paste = read_to_string(format!("{DIR}/paste")).ok().and_then(|s| s.trim().parse().ok());
++        State { volume, mic_muted, playing, layout, touchid, dnd, notice, locked, title, emoji_recent, paste }
+     }
+     pub fn fd(&self) -> &impl AsFd {
+         &self.inotify_fd
+-- 
+2.53.0
+

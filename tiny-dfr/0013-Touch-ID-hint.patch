@@ -1,0 +1,462 @@
+From 6abf130f06ab4b6168b102250898d1d562e1bdb1 Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:46:31 +0100
+Subject: [PATCH] Touch ID hint
+
+With TouchIdHint = true, while /run/tiny-dfr/touchid says "waiting" (a
+helper watching fprintd: sudo, the lock screen) the bar right of Esc shows
+TouchIdIcon and TouchIdText with an arrow to the sensor, the key right of
+the Touch Bar, as on macOS. "retry" shows TouchIdRetryText (orange), a
+match flashes a green tick and "nomatch" TouchIdFailText (red) for 0.9 s,
+even when "idle" follows at once. A "waiting" older than 60 s is taken as
+stale. With Animations the arrow moves towards the sensor, 15 frames a
+second of only its own area. Only Esc stays usable under the hint. The
+file is "<state> <ms since the epoch>" and is watched with inotify; the
+PNG preview shows the four states.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ share/tiny-dfr/config.toml |   9 +++
+ src/config.rs              |  20 ++++++
+ src/main.rs                | 126 ++++++++++++++++++++++++++++++++++++-
+ src/state.rs               |  29 ++++++++-
+ src/touchid.rs             |  76 ++++++++++++++++++++++
+ 5 files changed, 258 insertions(+), 2 deletions(-)
+ create mode 100644 src/touchid.rs
+
+diff --git a/share/tiny-dfr/config.toml b/share/tiny-dfr/config.toml
+index 93102cf..4e675c6 100644
+--- a/share/tiny-dfr/config.toml
++++ b/share/tiny-dfr/config.toml
+@@ -93,6 +93,15 @@ FontTemplate = ":bold"
+ # ("layout next" to the helper, else the key's Action, e.g. the layout toggle
+ # keys), holding and sliding goes through the layouts on the key itself and
+ # picks one on release ("layout <n>").
++# TouchIdHint = false   # true: while /run/tiny-dfr/touchid says "waiting" (a
++#                       # helper watching fprintd), the bar right of Esc shows
++#                       # TouchIdIcon, TouchIdText and an arrow to the sensor;
++#                       # a match flashes a tick, "nomatch" TouchIdFailText,
++#                       # "retry" TouchIdRetryText. File: "<state> <ms since epoch>".
++# TouchIdText = "Touch ID"
++# TouchIdRetryText = "Try again"
++# TouchIdFailText = "Not recognized"
++# TouchIdIcon = "fingerprint"
+ # PixelShiftSmooth = true   # false: one whole pixel every 10 s instead of a
+ #                           # 4 s animation (fewer frames); no shifting at all
+ #                           # while the bar is dark
+diff --git a/src/config.rs b/src/config.rs
+index 5bd581b..8c59ed4 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -43,6 +43,11 @@ pub struct Config {
+     pub apps: Vec<AppRule>,
+     pub app_sets: HashMap<String, usize>,
+     pub pixel_shift_smooth: bool,
++    pub touchid_hint: bool,
++    pub touchid_text: String,
++    pub touchid_retry_text: String,
++    pub touchid_fail_text: String,
++    pub touchid_icon: Option<String>,
+ }
+ 
+ /// Icons that follow the session (Live = ...)
+@@ -160,6 +165,11 @@ struct ConfigProxy {
+     pixel_shift_smooth: Option<bool>,
+     volume_icons: Option<Vec<String>>,
+     mic_icons: Option<Vec<String>>,
++    touch_id_hint: Option<bool>,
++    touch_id_text: Option<String>,
++    touch_id_retry_text: Option<String>,
++    touch_id_fail_text: Option<String>,
++    touch_id_icon: Option<String>,
+ }
+ 
+ fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<Key>, D::Error>
+@@ -294,6 +304,11 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+         base.pixel_shift_smooth = user.pixel_shift_smooth.or(base.pixel_shift_smooth);
+         base.volume_icons = user.volume_icons.or(base.volume_icons);
+         base.mic_icons = user.mic_icons.or(base.mic_icons);
++        base.touch_id_hint = user.touch_id_hint.or(base.touch_id_hint);
++        base.touch_id_text = user.touch_id_text.or(base.touch_id_text);
++        base.touch_id_retry_text = user.touch_id_retry_text.or(base.touch_id_retry_text);
++        base.touch_id_fail_text = user.touch_id_fail_text.or(base.touch_id_fail_text);
++        base.touch_id_icon = user.touch_id_icon.or(base.touch_id_icon);
+     };
+     let media_layer_keys = base.media_layer_keys.unwrap();
+     let primary_layer_keys = base.primary_layer_keys.unwrap();
+@@ -406,6 +421,11 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+         apps,
+         app_sets,
+         pixel_shift_smooth: base.pixel_shift_smooth.unwrap_or(true),
++        touchid_hint: base.touch_id_hint.unwrap_or(false),
++        touchid_text: base.touch_id_text.clone().unwrap_or_else(|| "Touch ID".into()),
++        touchid_retry_text: base.touch_id_retry_text.clone().unwrap_or_else(|| "Try again".into()),
++        touchid_fail_text: base.touch_id_fail_text.clone().unwrap_or_else(|| "Not recognized".into()),
++        touchid_icon: base.touch_id_icon.clone(),
+     };
+     crate::anim::set_enabled(cfg.animations);
+     (cfg, layers)
+diff --git a/src/main.rs b/src/main.rs
+index c45fecc..2536fe3 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -53,6 +53,7 @@ mod media;
+ mod pixel_shift;
+ mod slider;
+ mod state;
++mod touchid;
+ 
+ use crate::config::ConfigManager;
+ use backlight::BacklightManager;
+@@ -63,6 +64,40 @@ use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
+ use slider::{Hit as SliderHit, Kind as SliderKind, Layout as SliderLayout, Mode as SliderMode, Slider};
+ 
+ pub const DEFAULT_ICON_SIZE: i32 = 48;
++// a Touch ID result stays this long on the bar
++const TOUCHID_FLASH: Duration = Duration::from_millis(900);
++// a "waiting" older than this is stale (the helper went away)
++const TOUCHID_STALE_MS: i64 = 60_000;
++
++/// The Touch ID icon of the config
++fn touchid_icon(cfg: &Config) -> Option<Button> {
++    let name = cfg.touchid_icon.as_ref()?;
++    try_load_image(name, None::<&str>, 48, 48).ok().map(|image| {
++        let mut b = Button::new_spacer();
++        b.image = image;
++        b.icon_width = 48.0;
++        b.icon_height = 48.0;
++        b
++    })
++}
++
++/// What the Touch ID hint shows now: a recent result, else a fresh wait
++fn touchid_now(cfg: &Config, session: &state::State, flash: Option<(state::TouchId, Instant)>) -> Option<state::TouchId> {
++    if !cfg.touchid_hint {
++        return None;
++    }
++    if let Some((kind, at)) = flash {
++        if at.elapsed() < TOUCHID_FLASH {
++            return Some(kind);
++        }
++    }
++    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
++    match session.touchid {
++        Some((k @ (state::TouchId::Waiting | state::TouchId::Retry), at)) if now_ms - at < TOUCHID_STALE_MS => Some(k),
++        _ => None,
++    }
++}
++
+ // the layout key slid: one layout per this many px
+ const LAYOUT_STEP_PX: f64 = 90.0;
+ // rows from config::load_config (the key sets of [AppSets] follow)
+@@ -1105,7 +1140,9 @@ fn render_preview(path: &std::ffi::OsStr) {
+     let out = ImageSurface::create(
+         Format::ARgb32,
+         width as i32,
+-        (rows.len() + frames.len() + if has_np_row { 2 } else { 0 }) as i32 * (height as i32 + gap) - gap,
++        (rows.len() + frames.len() + if has_np_row { 2 } else { 0 } + if cfg.touchid_hint { 4 } else { 0 }) as i32
++            * (height as i32 + gap)
++            - gap,
+     )
+     .unwrap();
+     let c = Context::new(&out).unwrap();
+@@ -1185,6 +1222,29 @@ fn render_preview(path: &std::ffi::OsStr) {
+             }
+         }
+     }
++    // the Touch ID hint in its four states
++    if cfg.touchid_hint {
++        let icon = touchid_icon(&cfg);
++        for kind in [state::TouchId::Waiting, state::TouchId::Match, state::TouchId::Retry, state::TouchId::NoMatch] {
++            layers[ROW_STRIP_COLLAPSED].draw(&cfg, width as i32, height as i32, &bar, (0.0, 0.0), true);
++            let avail = width as f64 - pixel_shift_width(&cfg);
++            let (l, w) = layers[ROW_STRIP_COLLAPSED].geometry(&cfg, avail)[0];
++            let bc = Context::new(&bar).unwrap();
++            bc.translate(height as f64, 0.0);
++            bc.rotate((90.0f64).to_radians());
++            let sx = pixel_shift_width(&cfg) / 2.0;
++            touchid::draw(&bc, &cfg, (l + w + cfg.group_spacing / 2.0, avail), height as f64, (sx, 0.0), kind, icon.as_ref(), 0.0);
++            drop(bc);
++            bar.flush();
++            c.save().unwrap();
++            let y0 = ((rows_len + extra) as i32 * (height as i32 + gap)) as f64;
++            c.transform(cairo::Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, y0 + height as f64));
++            c.set_source_surface(&bar, 0.0, 0.0).unwrap();
++            c.paint().unwrap();
++            c.restore().unwrap();
++            extra += 1;
++        }
++    }
+     // animation frames, time moved back by hand
+     let shift = (0.0, 0.0);
+     let n_rows = rows_len + extra;
+@@ -1506,6 +1566,10 @@ fn real_main(drm: &mut DrmBackend) {
+     // the layout key held: (touch slot, x at touch, layout it started on,
+     // the one shown now if it is sliding)
+     let mut layout_hold: Option<(u32, f64, usize, Option<usize>)> = None;
++    // Touch ID: the icon, a result being shown (kind, since), what is drawn
++    let mut fingerprint = touchid_icon(&cfg);
++    let mut touchid_flash: Option<(state::TouchId, Instant)> = None;
++    let mut touchid_drawn: Option<state::TouchId> = None;
+     let mut needs_complete_redraw = true;
+ 
+     let mut input_tb = Libinput::new_with_udev(Interface);
+@@ -1577,6 +1641,7 @@ fn real_main(drm: &mut DrmBackend) {
+             current_app = None;
+             check_layer = true;
+             media = None;
++            fingerprint = touchid_icon(&cfg);
+             session = state_watch.read();
+             for layer in layers.iter_mut() {
+                 for (_, b) in &mut layer.buttons {
+@@ -1617,6 +1682,12 @@ fn real_main(drm: &mut DrmBackend) {
+         // the session changed (volume, mute): icons that follow it
+         if state_watch.changed() {
+             session = state_watch.read();
++            // a result: show it a moment even if "idle" follows at once
++            if let Some((k @ (state::TouchId::Match | state::TouchId::NoMatch), _)) = session.touchid {
++                if touchid_flash.is_none_or(|(fk, t)| fk != k || t.elapsed() > TOUCHID_FLASH) {
++                    touchid_flash = Some((k, Instant::now()));
++                }
++            }
+             for layer in layers.iter_mut() {
+                 let before: Vec<bool> = layer.buttons.iter().map(|(_, b)| b.hidden).collect();
+                 for (_, b) in &mut layer.buttons {
+@@ -1745,6 +1816,13 @@ fn real_main(drm: &mut DrmBackend) {
+                 drm.dirty(&[ClipRect::new(0, 0, height, width)]).unwrap();
+             }
+         }
++        let touchid = touchid_now(&cfg, &session, touchid_flash);
++        // the arrow moves while it waits; a result ends after TOUCHID_FLASH
++        let touchid_moving = touchid == Some(state::TouchId::Waiting) && anim::enabled();
++        if touchid != touchid_drawn {
++            // it came, went or changed: everything again
++            needs_complete_redraw = true;
++        }
+         let slider_moving = slider.as_ref().is_some_and(|s| s.animating());
+         let layer_changed = layers[active_layer].buttons.iter().any(|b| b.1.changed);
+         if transition.is_some() {
+@@ -1753,6 +1831,7 @@ fn real_main(drm: &mut DrmBackend) {
+             || layer_changed
+             || (slider.is_some() && (slider_dirty || slider_moving))
+             || (media.is_some() && (media_dirty || media_full))
++            || (touchid.is_some() && touchid_moving)
+         {
+             let shift = if cfg.enable_pixel_shift {
+                 pixel_shift.get()
+@@ -1826,6 +1905,37 @@ fn real_main(drm: &mut DrmBackend) {
+                     clips.push(ClipRect::new(0, x1, height, x2));
+                 }
+             }
++            if let Some(kind) = touchid {
++                let avail = width as f64 - pixel_shift_width(&cfg);
++                let left = if width >= 2170 {
++                    let (l, w) = layers[active_layer].geometry(&cfg, avail)[0];
++                    l + w + cfg.group_spacing / 2.0
++                } else {
++                    0.0
++                };
++                let sx = shift.0 + pixel_shift_width(&cfg) / 2.0;
++                let swing = if anim::enabled() && kind == state::TouchId::Waiting {
++                    let t = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
++                    (0.5 - 0.5 * (t * std::f64::consts::TAU).cos()).powi(2)
++                } else {
++                    0.0
++                };
++                let c = Context::new(&surface).unwrap();
++                c.translate(height as f64, 0.0);
++                c.rotate((90.0f64).to_radians());
++                touchid::draw(&c, &cfg, (left, avail), height as f64, (sx, shift.1), kind, fingerprint.as_ref(), swing);
++                drop(c);
++                if touchid_drawn == touchid && !needs_complete_redraw && !layer_changed {
++                    // only the arrow moved
++                    let (al, aw) = touchid::arrow_area(avail);
++                    let x1 = (al + sx).max(0.0) as u16;
++                    let x2 = ((al + aw + sx).ceil() as u16).min(width);
++                    clips = vec![ClipRect::new(0, x1, height, x2)];
++                } else {
++                    clips = vec![ClipRect::new(0, 0, height, width)];
++                }
++            }
++            touchid_drawn = touchid;
+             slider_dirty = false;
+             media_dirty = false;
+             media_full = false;
+@@ -1841,6 +1951,12 @@ fn real_main(drm: &mut DrmBackend) {
+             next_timeout_ms = min(next_timeout_ms, ms.max(1));
+             media_dirty = true;
+         }
++        // Touch ID: the arrow's frames (15 a second), the end of a result
++        if touchid_now(&cfg, &session, touchid_flash).is_some() {
++            next_timeout_ms = min(next_timeout_ms, 66);
++        } else if touchid_drawn.is_some() {
++            next_timeout_ms = min(next_timeout_ms, 1);
++        }
+         // animating: come back for the next frame
+         if fading || transition.is_some() || slider.as_ref().is_some_and(|s| s.animating()) {
+             next_timeout_ms = min(next_timeout_ms, anim::FRAME.as_millis() as i32);
+@@ -1917,6 +2033,14 @@ fn real_main(drm: &mut DrmBackend) {
+                                     }
+                                 }
+                             }
++                            if touchid_drawn.is_some() {
++                                // under the Touch ID hint only Esc
++                                if layers[active_layer].hit(&cfg, width, height, x, y, None) == Some(0) {
++                                    touches.insert(dn.seat_slot(), (active_layer, 0));
++                                    layers[active_layer].buttons[0].1.set_active(&mut uinput, true);
++                                }
++                                continue;
++                            }
+                             if let Some(m) = &mut media {
+                                 let layout = media_layout(&cfg, &layers[active_layer], width);
+                                 match layout.hit(x - half_shift) {
+diff --git a/src/state.rs b/src/state.rs
+index 9640609..1febc49 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -9,6 +9,8 @@ use std::{
+ };
+ 
+ const DIR: &str = "/run/tiny-dfr/bridge";
++// written by root (mbp-touchid-hint), next to the layer file
++const TOUCHID: &str = "/run/tiny-dfr/touchid";
+ 
+ #[derive(Default, Clone, PartialEq)]
+ pub struct State {
+@@ -20,6 +22,18 @@ pub struct State {
+     pub playing: Option<NowPlaying>,
+     /// keyboard layouts: the active one and their short names
+     pub layout: Option<(usize, Vec<String>)>,
++    /// fingerprint verification and when it was reported (ms since the epoch)
++    pub touchid: Option<(TouchId, i64)>,
++}
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum TouchId {
++    /// someone waits for a finger (sudo, the lock screen)
++    Waiting,
++    /// read but not usable: try again
++    Retry,
++    Match,
++    NoMatch,
+ }
+ 
+ /// .../nowplaying: "key value" lines
+@@ -80,6 +94,8 @@ impl StateWatch {
+         let inotify_fd = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
+         // no directory (no tmpfiles entry): the icons keep their first image
+         let _ = inotify_fd.add_watch(DIR, AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_MOVED_TO);
++        // the Touch ID hint lives one level up (written by root)
++        let _ = inotify_fd.add_watch("/run/tiny-dfr", AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_MOVED_TO);
+         StateWatch { inotify_fd }
+     }
+     /// whether a file changed since the last call
+@@ -105,7 +121,18 @@ impl StateWatch {
+             let names: Vec<String> = lines.next()?.split_whitespace().map(str::to_string).collect();
+             (index < names.len()).then_some((index, names))
+         });
+-        State { volume, mic_muted, playing, layout }
++        let touchid = read_to_string(TOUCHID).ok().and_then(|s| {
++            let mut w = s.split_whitespace();
++            let kind = match w.next()? {
++                "waiting" => TouchId::Waiting,
++                "retry" => TouchId::Retry,
++                "match" => TouchId::Match,
++                "nomatch" => TouchId::NoMatch,
++                _ => return None,
++            };
++            Some((kind, w.next()?.parse::<i64>().ok()?))
++        });
++        State { volume, mic_muted, playing, layout, touchid }
+     }
+     pub fn fd(&self) -> &impl AsFd {
+         &self.inotify_fd
+diff --git a/src/touchid.rs b/src/touchid.rs
+new file mode 100644
+index 0000000..888b187
+--- /dev/null
++++ b/src/touchid.rs
+@@ -0,0 +1,76 @@
++// Touch ID hint (macOS style): while something waits for a fingerprint
++// (sudo, the lock screen; reported by root's mbp-touchid-hint watching
++// fprintd) the bar right of Esc shows the fingerprint icon and TouchIdText
++// with an arrow to the sensor, which is the key right of the Touch Bar. A
++// match flashes a green tick, a failure TouchIdFailText, a bad read
++// TouchIdRetryText.
++use crate::{config::Config, state::TouchId, Button};
++use cairo::Context;
++use std::f64::consts::TAU;
++
++const ICON_BOX: f64 = 56.0;
++const ARROW_WIDTH: f64 = 44.0;
++const RIGHT_PAD: f64 = 16.0;
++// how far the arrow moves while it waits (animations)
++pub const ARROW_SWING_PX: f64 = 8.0;
++
++/// The arrow's area, for redrawing only it: (left, width)
++pub fn arrow_area(right: f64) -> (f64, f64) {
++    (right - RIGHT_PAD - ARROW_WIDTH - ARROW_SWING_PX - 2.0, ARROW_WIDTH + ARROW_SWING_PX + 4.0)
++}
++
++/// `left`..`right`: the part of the bar it covers (cleared here); `swing`
++/// 0..1 moves the arrow towards the sensor
++pub fn draw(c: &Context, cfg: &Config, (left, right): (f64, f64), height: f64, (sx, sy): (f64, f64), kind: TouchId, icon: Option<&Button>, swing: f64) {
++    c.set_source_rgb(0.0, 0.0, 0.0);
++    c.rectangle(left + sx, 0.0, right - left + 2.0, height);
++    c.fill().unwrap();
++    let cy = height / 2.0 + sy;
++    // arrow to the sensor
++    let ax = right - RIGHT_PAD - ARROW_WIDTH + swing * ARROW_SWING_PX + sx;
++    let (r, g, b) = match kind {
++        TouchId::Match => (0.19, 0.82, 0.35),
++        TouchId::NoMatch => (1.0, 0.27, 0.23),
++        TouchId::Retry => (1.0, 0.62, 0.04),
++        TouchId::Waiting => (1.0, 1.0, 1.0),
++    };
++    c.set_source_rgb(r, g, b);
++    c.set_line_width(3.5);
++    c.set_line_cap(cairo::LineCap::Round);
++    c.set_line_join(cairo::LineJoin::Round);
++    c.move_to(ax, cy);
++    c.line_to(ax + ARROW_WIDTH - 4.0, cy);
++    c.move_to(ax + ARROW_WIDTH - 16.0, cy - 12.0);
++    c.line_to(ax + ARROW_WIDTH - 4.0, cy);
++    c.line_to(ax + ARROW_WIDTH - 16.0, cy + 12.0);
++    c.stroke().unwrap();
++    // text left of the arrow
++    let text = match kind {
++        TouchId::Waiting | TouchId::Match => cfg.touchid_text.as_str(),
++        TouchId::Retry => cfg.touchid_retry_text.as_str(),
++        TouchId::NoMatch => cfg.touchid_fail_text.as_str(),
++    };
++    c.set_font_face(&cfg.font_face);
++    c.set_font_size(cfg.font_size);
++    let ext = c.text_extents(text).unwrap();
++    let tx = right - RIGHT_PAD - ARROW_WIDTH - ARROW_SWING_PX - 20.0 - ext.x_advance();
++    c.move_to(tx + sx, (height / 2.0 + ext.height() / 2.0).round() + sy);
++    let _ = c.show_text(text);
++    // fingerprint, or a green tick on a match
++    let ix = tx - 12.0 - ICON_BOX;
++    if kind == TouchId::Match {
++        let (mx, r0) = (ix + ICON_BOX / 2.0 + sx, 20.0);
++        c.set_source_rgb(0.19, 0.82, 0.35);
++        c.arc(mx, cy, r0, 0.0, TAU);
++        c.fill().unwrap();
++        c.set_source_rgb(0.0, 0.0, 0.0);
++        c.set_line_width(4.0);
++        c.move_to(mx - 9.0, cy + 1.0);
++        c.line_to(mx - 2.0, cy + 8.0);
++        c.line_to(mx + 10.0, cy - 7.0);
++        c.stroke().unwrap();
++    } else if let Some(icon) = icon {
++        c.set_source_rgb(1.0, 1.0, 1.0);
++        icon.render(c, height as i32, ix + sx, ICON_BOX as u64, sy);
++    }
++}
+-- 
+2.53.0
+

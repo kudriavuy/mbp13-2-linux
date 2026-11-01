@@ -1,0 +1,43 @@
+# Virtual "FaceTime HD Camera" for the T1 camera in USB configuration 2
+# (H.264 only there): v4l2loopback /dev/video42 fed by mbp-t1-camera, which
+# runs the real camera only while a program streams. Not enabled: started by
+# mbp-t1-cfg2.target after a successful switch to configuration 2 (stage 7).
+[Unit]
+Description=T1 camera as a normal V4L2 camera (configuration 2)
+
+[Service]
+Type=simple
+# root only for the module: '+' runs these with full privileges
+ExecStartPre=+/usr/bin/modprobe v4l2loopback video_nr=42 card_label="FaceTime HD Camera" exclusive_caps=1 max_buffers=2
+ExecStart=/usr/local/bin/mbp-t1-camera --loopback /dev/video42
+ExecStopPost=+-/usr/bin/modprobe -r v4l2loopback
+Restart=on-failure
+RestartSec=2
+
+DynamicUser=yes
+SupplementaryGroups=video render
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+DevicePolicy=closed
+DeviceAllow=char-video4linux rw
+DeviceAllow=/dev/dri/renderD128 rw
+
+[Install]
+WantedBy=multi-user.target

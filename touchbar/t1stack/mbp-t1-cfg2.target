@@ -1,0 +1,5 @@
+# What runs only in T1 configuration 2, started by mbp-t1-switch after a
+# successful switch: tiny-dfr (mbp-t1-fallback on its failure) and the camera.
+[Unit]
+Description=Touch Bar: T1 configuration 2 stack
+Wants=tiny-dfr.service mbp-t1-camera.service

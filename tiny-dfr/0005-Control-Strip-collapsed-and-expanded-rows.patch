@@ -1,0 +1,432 @@
+From 043a0a098fc74b76d91302f1d48a6cf2a820abb6 Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 20:05:06 +0100
+Subject: [PATCH] Control Strip: collapsed and expanded rows
+
+With ControlStripKeys in the config the media row becomes the expanded
+Control Strip, and a second row shows AppLayerKeys on the left and the
+collapsed strip (ControlStripKeys) at the right end, as on macOS. Buttons
+with Command = "Expand" / "Collapse" switch between the two on release,
+while the finger is still on the button. ControlStripDefault sets the state
+at start and after each /run/tiny-dfr/layer change. Without ControlStripKeys
+both rows are the media row and nothing changes.
+
+The rows now have fixed places (F-keys, collapsed, expanded) and the one
+shown follows from the base (MediaLayerDefault, /run/tiny-dfr/layer, double
+Fn), Fn held and the strip state, instead of swapping two layers.
+
+Also: a finished touch is forgotten (a later touch that missed every button
+could move the old one), and a moving touch is checked against the row it
+started on.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ share/tiny-dfr/config.toml | 13 +++++++
+ src/config.rs              | 75 +++++++++++++++++++++++++------------
+ src/main.rs                | 76 ++++++++++++++++++++++++++++----------
+ 3 files changed, 121 insertions(+), 43 deletions(-)
+
+diff --git a/share/tiny-dfr/config.toml b/share/tiny-dfr/config.toml
+index 4c8f5b8..fb5a6e7 100644
+--- a/share/tiny-dfr/config.toml
++++ b/share/tiny-dfr/config.toml
+@@ -38,6 +38,19 @@ FontTemplate = ":bold"
+ # Group = true puts a GroupSpacing gap before it. A button with neither Text
+ # nor Icon is an empty spacer, which can be used to push others aside.
+ 
++# Control Strip (macOS style). With ControlStripKeys set, MediaLayerKeys is the
++# expanded strip and the other row is: AppLayerKeys, free space, ControlStripKeys
++# at the right end (the collapsed strip). A button with Command = "Expand" or
++# "Collapse" switches between the two when released (it may also have an Action).
++# ControlStripDefault ("Expanded" or "Collapsed") is the state at start and
++# whenever /run/tiny-dfr/layer changes. Without ControlStripKeys nothing changes.
++# ControlStripDefault = "Expanded"
++# ControlStripKeys = [
++#     { Text = "<", Command = "Expand", Width = 72 },
++#     { Icon = "volume_off", Action = "Mute", Width = 120 }
++# ]
++# AppLayerKeys = []
++
+ # Set this to false if you want the brightness of the touchbar
+ # to be set to a static value instead of following the primary
+ # screen's brightness
+diff --git a/src/config.rs b/src/config.rs
+index d0a4110..95055f5 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -31,6 +31,16 @@ pub struct Config {
+     pub button_spacing: f64,
+     pub group_spacing: f64,
+     pub font_size: f64,
++    pub control_strip_expanded: bool,
++}
++
++/// What a button does inside tiny-dfr instead of (or besides) sending keys
++#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Command {
++    /// show the expanded Control Strip
++    Expand,
++    /// back to the app keys and the collapsed Control Strip
++    Collapse,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -54,6 +64,9 @@ struct ConfigProxy {
+     font_size: Option<u32>,
+     icon_size: Option<i32>,
+     esc_width: Option<u32>,
++    control_strip_keys: Option<Vec<ButtonConfig>>,
++    app_layer_keys: Option<Vec<ButtonConfig>>,
++    control_strip_default: Option<String>,
+ }
+ 
+ fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<Key>, D::Error>
+@@ -83,7 +96,7 @@ where
+     deserializer.deserialize_any(ArrayOrSingle)
+ }
+ 
+-#[derive(Deserialize)]
++#[derive(Deserialize, Clone, Default)]
+ #[serde(rename_all = "PascalCase")]
+ pub struct ButtonConfig {
+     #[serde(alias = "Svg")]
+@@ -100,6 +113,7 @@ pub struct ButtonConfig {
+     pub icon_height: Option<i32>,
+     pub width: Option<u32>,
+     pub group: Option<bool>,
++    pub command: Option<Command>,
+ }
+ 
+ // "#rrggbb" -> (r, g, b) in 0..1; a bad value keeps the default
+@@ -131,7 +145,7 @@ fn load_font(name: &str) -> FontFace {
+     FontFace::create_from_ft(&face).unwrap()
+ }
+ 
+-fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
++fn load_config(width: u16) -> (Config, [FunctionLayer; 3]) {
+     let mut base =
+         toml::from_str::<ConfigProxy>(&read_to_string("/usr/share/tiny-dfr/config.toml").unwrap())
+             .unwrap();
+@@ -163,11 +177,30 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
+         base.font_size = user.font_size.or(base.font_size);
+         base.icon_size = user.icon_size.or(base.icon_size);
+         base.esc_width = user.esc_width.or(base.esc_width);
++        base.control_strip_keys = user.control_strip_keys.or(base.control_strip_keys);
++        base.app_layer_keys = user.app_layer_keys.or(base.app_layer_keys);
++        base.control_strip_default = user.control_strip_default.or(base.control_strip_default);
++    };
++    let media_layer_keys = base.media_layer_keys.unwrap();
++    let primary_layer_keys = base.primary_layer_keys.unwrap();
++    // With ControlStripKeys the media row is the expanded Control Strip and the
++    // collapsed one is: app keys, free space, the strip at the right end.
++    // Without them both are the media row, as before.
++    let collapsed_keys = match base.control_strip_keys {
++        Some(mut strip) => {
++            let mut row = base.app_layer_keys.unwrap_or_default();
++            row.push(ButtonConfig::default()); // a spacer takes the free space
++            if let Some(first) = strip.first_mut() {
++                first.group.get_or_insert(true);
++            }
++            row.append(&mut strip);
++            row
++        }
++        None => media_layer_keys.clone(),
+     };
+-    let mut media_layer_keys = base.media_layer_keys.unwrap();
+-    let mut primary_layer_keys = base.primary_layer_keys.unwrap();
++    let mut rows = [primary_layer_keys, collapsed_keys, media_layer_keys];
+     if width >= 2170 {
+-        for layer in [&mut media_layer_keys, &mut primary_layer_keys] {
++        for layer in &mut rows {
+             // the key after Esc starts a new group (a wider gap)
+             if let Some(first) = layer.first_mut() {
+                 first.group.get_or_insert(true);
+@@ -175,30 +208,25 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
+             layer.insert(
+                 0,
+                 ButtonConfig {
+-                    icon: None,
+                     text: Some("esc".into()),
+-                    theme: None,
+                     action: vec![Key::Esc],
+-                    stretch: None,
+-                    time: None,
+-                    locale: None,
+-                    battery: None,
+-                    icon_width: None,
+-                    icon_height: None,
+                     width: base.esc_width.filter(|w| *w > 0),
+-                    group: None,
++                    ..Default::default()
+                 },
+             );
+         }
+     }
+     // the defaults are the upstream look
+     let icon_size = base.icon_size.unwrap_or(DEFAULT_ICON_SIZE);
+-    let media_layer = FunctionLayer::with_config(media_layer_keys, icon_size);
+-    let fkey_layer = FunctionLayer::with_config(primary_layer_keys, icon_size);
+-    let layers = if base.media_layer_default.unwrap() {
+-        [media_layer, fkey_layer]
+-    } else {
+-        [fkey_layer, media_layer]
++    // fixed order: F-keys, collapsed strip, expanded strip (see View in main)
++    let layers = rows.map(|keys| FunctionLayer::with_config(keys, icon_size));
++    let control_strip_expanded = match base.control_strip_default.as_deref() {
++        None | Some("Expanded") => true,
++        Some("Collapsed") => false,
++        Some(other) => {
++            eprintln!("ControlStripDefault = \"{other}\" is not Expanded or Collapsed; using Expanded");
++            true
++        }
+     };
+     let cfg = Config {
+         show_button_outlines: base.show_button_outlines.unwrap(),
+@@ -215,6 +243,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
+         button_spacing: base.button_spacing.unwrap_or(16) as f64,
+         group_spacing: base.group_spacing.or(base.button_spacing).unwrap_or(16) as f64,
+         font_size: base.font_size.unwrap_or(32) as f64,
++        control_strip_expanded,
+     };
+     (cfg, layers)
+ }
+@@ -242,13 +271,13 @@ impl ConfigManager {
+             watch_desc,
+         }
+     }
+-    pub fn load_config(&self, width: u16) -> (Config, [FunctionLayer; 2]) {
++    pub fn load_config(&self, width: u16) -> (Config, [FunctionLayer; 3]) {
+         load_config(width)
+     }
+     pub fn update_config(
+         &mut self,
+         cfg: &mut Config,
+-        layers: &mut [FunctionLayer; 2],
++        layers: &mut [FunctionLayer; 3],
+         width: u16,
+     ) -> bool {
+         if self.watch_desc.is_none() {
+@@ -261,7 +290,7 @@ impl ConfigManager {
+         }
+     }
+     #[cold]
+-    fn handle_events(&mut self, cfg: &mut Config, layers: &mut [FunctionLayer; 2], width: u16, evts: Result<Vec<InotifyEvent>, Errno>) -> bool {
++    fn handle_events(&mut self, cfg: &mut Config, layers: &mut [FunctionLayer; 3], width: u16, evts: Result<Vec<InotifyEvent>, Errno>) -> bool {
+         let mut ret = false;
+         for evt in evts.unwrap() {
+             if Some(evt.wd) != self.watch_desc {
+diff --git a/src/main.rs b/src/main.rs
+index cb9b86e..b446e06 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -52,12 +52,16 @@ mod pixel_shift;
+ 
+ use crate::config::ConfigManager;
+ use backlight::BacklightManager;
+-use config::{ButtonConfig, Config};
++use config::{ButtonConfig, Command, Config};
+ use display::DrmBackend;
+ use layer_switch::LayerSwitch;
+ use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
+ 
+ pub const DEFAULT_ICON_SIZE: i32 = 48;
++// rows from config::load_config
++const ROW_FKEYS: usize = 0;
++const ROW_STRIP_COLLAPSED: usize = 1;
++const ROW_STRIP_EXPANDED: usize = 2;
+ const TIMEOUT_MS: i32 = 10 * 1000;
+ 
+ #[derive(Clone, Copy, PartialEq, Eq)]
+@@ -109,6 +113,7 @@ struct Button {
+     fixed_width: Option<f64>,
+     // a group gap before this button (Group)
+     group: bool,
++    command: Option<Command>,
+ }
+ 
+ fn try_load_svg(path: &str) -> Result<ButtonImage> {
+@@ -260,9 +265,11 @@ impl Button {
+     fn with_config(cfg: ButtonConfig, icon_size: i32) -> Button {
+         let fixed_width = cfg.width.map(f64::from);
+         let group = cfg.group.unwrap_or(false);
++        let command = cfg.command;
+         let mut button = Button::from_image_config(cfg, icon_size);
+         button.fixed_width = fixed_width;
+         button.group = group;
++        button.command = command;
+         button
+     }
+     fn from_image_config(cfg: ButtonConfig, icon_size: i32) -> Button {
+@@ -298,6 +305,7 @@ impl Button {
+             icon_height: 0.0,
+             fixed_width: None,
+             group: false,
++            command: None,
+         }
+     }
+     fn new_text(text: String, action: Vec<Key>) -> Button {
+@@ -310,6 +318,7 @@ impl Button {
+             icon_height: 0.0,
+             fixed_width: None,
+             group: false,
++            command: None,
+         }
+     }
+     fn new_icon(
+@@ -330,6 +339,7 @@ impl Button {
+             changed: false,
+             fixed_width: None,
+             group: false,
++            command: None,
+         }
+     }
+     fn load_battery_image(icon: &str, theme: Option<impl AsRef<str>>) -> Handle {
+@@ -385,6 +395,7 @@ impl Button {
+             icon_height: 0.0,
+             fixed_width: None,
+             group: false,
++            command: None,
+         }
+     }
+ 
+@@ -414,6 +425,7 @@ impl Button {
+             icon_height: 0.0,
+             fixed_width: None,
+             group: false,
++            command: None,
+         }
+     }
+     fn needs_faster_refresh(&self) -> bool {
+@@ -848,12 +860,18 @@ where
+ 
+ /// TINY_DFR_RENDER_PNG=<file>: draw the configured layers into a PNG instead
+ /// of the Touch Bar (no DRM, input or uinput), for checking a layout. Rows:
+-/// base layer, the same with its second button pressed, the Fn layer.
++/// collapsed strip, expanded strip, the same with its second button pressed,
++/// F-keys (without ControlStripKeys the first two are the same media row).
+ fn render_preview(path: &std::ffi::OsStr) {
+     let (width, height) = (2170u16, 60u16);
+     let (cfg, mut layers) = ConfigManager::new().load_config(width);
+     let gap = 12;
+-    let rows = [(0, None), (0, Some(1)), (1, None)];
++    let rows = [
++        (ROW_STRIP_COLLAPSED, None),
++        (ROW_STRIP_EXPANDED, None),
++        (ROW_STRIP_EXPANDED, Some(1)),
++        (ROW_FKEYS, None),
++    ];
+     let bar = ImageSurface::create(Format::ARgb32, height as i32, width as i32).unwrap();
+     let out = ImageSurface::create(
+         Format::ARgb32,
+@@ -942,7 +960,19 @@ fn real_main(drm: &mut DrmBackend) {
+ 
+     let mut surface =
+         ImageSurface::create(Format::ARgb32, db_width as i32, db_height as i32).unwrap();
+-    let mut active_layer = 0;
++    // which row shows: the base (F-keys or the Control Strip, from the
++    // config and /run/tiny-dfr/layer), Fn held shows the other one, and the
++    // strip is collapsed or expanded
++    let mut expanded = cfg.control_strip_expanded;
++    let mut fn_held = false;
++    let row = |base_is_media: bool, fn_held: bool, expanded: bool| {
++        match (base_is_media != fn_held, expanded) {
++            (false, _) => ROW_FKEYS,
++            (true, false) => ROW_STRIP_COLLAPSED,
++            (true, true) => ROW_STRIP_EXPANDED,
++        }
++    };
++    let mut active_layer = row(base_is_media, fn_held, expanded);
+     let mut needs_complete_redraw = true;
+ 
+     let mut input_tb = Libinput::new_with_udev(Interface);
+@@ -1004,24 +1034,29 @@ fn real_main(drm: &mut DrmBackend) {
+     loop {
+         if cfg_mgr.update_config(&mut cfg, &mut layers, width) {
+             touches = HashMap::<u32, (usize, usize)>::new();
+-            active_layer = 0;
+             needs_complete_redraw = true;
+             base_is_media = cfg.media_layer_default;
++            expanded = cfg.control_strip_expanded;
+             check_layer = true;
+         }
+         if layer_switch.changed() || check_layer {
+             check_layer = false;
+             let want = layer_switch.wanted().unwrap_or(cfg.media_layer_default);
+             if want != base_is_media {
+-                // release what is held: the button indices belong to the old order
++                // release what is held: another program, another row
+                 for (_, (layer, btn)) in touches.drain() {
+                     layers[layer].buttons[btn].1.set_active(&mut uinput, false);
+                 }
+-                layers.swap(0, 1);
+                 base_is_media = want;
+-                needs_complete_redraw = true;
++                // each program starts with the configured strip
++                expanded = cfg.control_strip_expanded;
+             }
+         }
++        let wanted_row = row(base_is_media, fn_held, expanded);
++        if wanted_row != active_layer {
++            active_layer = wanted_row;
++            needs_complete_redraw = true;
++        }
+ 
+         let now = Local::now();
+         let ms_left = if layers[active_layer].faster_refresh {
+@@ -1101,19 +1136,12 @@ fn real_main(drm: &mut DrmBackend) {
+                     if key.key() == Key::Fn as u32 {
+                         if cfg.double_press_switch_layers > 0 && key.key_state() == KeyState::Pressed {
+                             if last.elapsed() < Duration::from_millis(cfg.double_press_switch_layers.into()) {
+-                                layers.swap(0, 1);
+                                 base_is_media = !base_is_media;
+                             }
+                             last = Instant::now();
+                         }
+-                        let new_layer = match key.key_state() {
+-                            KeyState::Pressed => 1,
+-                            KeyState::Released => 0,
+-                        };
+-                        if active_layer != new_layer {
+-                            active_layer = new_layer;
+-                            needs_complete_redraw = true;
+-                        }
++                        // the row changes at the top of the loop
++                        fn_held = key.key_state() == KeyState::Pressed;
+                     }
+                 }
+                 Event::Touch(te) => {
+@@ -1139,7 +1167,7 @@ fn real_main(drm: &mut DrmBackend) {
+                             let x = mtn.x_transformed(width as u32);
+                             let y = mtn.y_transformed(height as u32);
+                             let (layer, btn) = *touches.get(&mtn.seat_slot()).unwrap();
+-                            let hit = layers[active_layer]
++                            let hit = layers[layer]
+                                 .hit(&cfg, width, height, x, y, Some(btn))
+                                 .is_some();
+                             layers[layer].buttons[btn].1.set_active(&mut uinput, hit);
+@@ -1148,8 +1176,16 @@ fn real_main(drm: &mut DrmBackend) {
+                             if !touches.contains_key(&up.seat_slot()) {
+                                 continue;
+                             }
+-                            let (layer, btn) = *touches.get(&up.seat_slot()).unwrap();
+-                            layers[layer].buttons[btn].1.set_active(&mut uinput, false);
++                            let (layer, btn) = touches.remove(&up.seat_slot()).unwrap();
++                            let button = &mut layers[layer].buttons[btn].1;
++                            // a command runs on release, while the finger is still on it
++                            let command = button.command.filter(|_| button.active);
++                            button.set_active(&mut uinput, false);
++                            match command {
++                                Some(Command::Expand) => expanded = true,
++                                Some(Command::Collapse) => expanded = false,
++                                None => {}
++                            }
+                         }
+                         _ => {}
+                     }
+-- 
+2.53.0
+

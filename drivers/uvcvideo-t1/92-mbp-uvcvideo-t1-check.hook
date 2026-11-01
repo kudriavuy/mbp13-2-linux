@@ -1,0 +1,15 @@
+# After a kernel (or its headers) changed and the DKMS hook ran: is
+# uvcvideo-t1 there for every kernel? Never stops pacman.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = linux
+Target = linux-lts
+Target = linux-headers
+Target = linux-lts-headers
+
+[Action]
+Description = Checking uvcvideo-t1 (T1 camera)...
+When = PostTransaction
+Exec = /usr/local/bin/mbp-uvcvideo-t1-check

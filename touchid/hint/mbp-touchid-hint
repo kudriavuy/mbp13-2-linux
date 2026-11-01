@@ -1,0 +1,100 @@
+#!/usr/bin/python3
+"""Touch ID hint for the Touch Bar (tiny-dfr patch 0013): watch fprintd on the
+system bus and write /run/tiny-dfr/touchid = "<state> <ms since the epoch>":
+  waiting   a client started a verification (sudo, the lock screen: VerifyStart)
+  retry     a bad read, the client waits on (verify-retry-scan and the like)
+  match     verify-match
+  nomatch   verify-no-match
+  idle      the client stopped (VerifyStop / Release), the client went away
+            (Ctrl+C on sudo) or fprintd went away
+fprintd sends its signals only to the client that claimed the reader, so this
+runs as root and watches as a bus monitor (dbus-monitor), matching only
+net.reactivated.Fprint.Device calls and signals: names of messages and the
+verification result, nothing else, and it sends nothing.
+"""
+import os
+import subprocess
+import sys
+import time
+
+OUT = "/run/tiny-dfr/touchid"
+IFACE = "net.reactivated.Fprint.Device"
+RETRY = {"verify-retry-scan", "verify-swipe-too-short", "verify-finger-not-centered",
+         "verify-remove-and-retry"}
+last = None
+
+
+def write(state):
+    global last
+    # a new "waiting" always: its time keeps it fresh (the lock screen
+    # starts verifying again and again)
+    if state == last and state not in ("match", "waiting"):
+        return
+    last = state
+    tmp = OUT + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(f"{state} {int(time.time() * 1000)}\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, OUT)
+
+
+def main():
+    if not os.path.isdir(os.path.dirname(OUT)):
+        print(f"{os.path.dirname(OUT)} missing (tmpfiles mbp-tiny-dfr)", file=sys.stderr)
+        sys.exit(1)
+    write("idle")
+    p = subprocess.Popen(
+        ["dbus-monitor", "--system",
+         f"type='method_call',interface='{IFACE}'",
+         f"type='signal',interface='{IFACE}'",
+         # fprintd or the verifying client leaving the bus
+         "type='signal',sender='org.freedesktop.DBus',member='NameOwnerChanged'"],
+        stdout=subprocess.PIPE, text=True, bufsize=1)
+    pending = None    # "status" (VerifyStatus) or "owner" (NameOwnerChanged)
+    args = []         # its string/boolean arguments so far
+    client = None     # unique bus name of the client that is verifying
+    for line in p.stdout:
+        if not line.startswith(" "):
+            # a message header
+            pending, args = None, []
+            if "member=VerifyStart" in line:
+                client = next((w[7:] for w in line.split() if w.startswith("sender=")), None)
+                write("waiting")
+            elif "member=VerifyStop" in line or "member=Release" in line:
+                client = None
+                write("idle")
+            elif line.startswith("signal") and "member=VerifyStatus" in line:
+                pending = "status"
+            elif "member=NameOwnerChanged" in line:
+                pending = "owner"
+            continue
+        word = line.strip()
+        if word.startswith('string "'):
+            args.append(word[8:-1])
+        elif word.startswith("boolean "):
+            args.append(word[8:])
+        if pending == "status" and len(args) == 2:
+            result, done = args[0], args[1] == "true"
+            if result == "verify-match":
+                write("match")
+            elif result == "verify-no-match":
+                write("nomatch")
+            elif result in RETRY and not done:
+                write("retry")
+            else:
+                write("idle")
+            pending = None
+        elif pending == "owner" and len(args) == 3:
+            # name, old owner, new owner: fprintd or our client left
+            name, _old, new = args
+            if new == "" and (name == "net.reactivated.Fprint" or name == client):
+                if name == client:
+                    client = None
+                if last in ("waiting", "retry"):
+                    write("idle")
+            pending = None
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,15 @@
+# Before a kernel update: build our DKMS modules (sound, Touch Bar, ...)
+# against the new headers, in a scratch tree, and warn if one fails. It
+# never stops the update; see mbp-dkms-precheck.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = linux-headers
+Target = linux-lts-headers
+
+[Action]
+Description = Checking that the DKMS modules build for the new kernel...
+When = PreTransaction
+Exec = /usr/local/bin/mbp-dkms-precheck
+NeedsTargets

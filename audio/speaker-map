@@ -1,0 +1,7 @@
+# Hardware channel position of: left tweeter, right tweeter, left woofer, right woofer
+# on the "speakers" node (4 channels FL,FR,RL,RR = hw channels 0..3).
+# Checked 2026-10-16 by ear and with the internal mic (150-300 Hz noise only
+# from the woofers): hw 0 = left woofer, 1 = right tweeter, 2 = left tweeter,
+# 3 = right woofer. Same as the TDM slots of the SSM3515s in the driver
+# (0x14->0, 0x16->1, 0x15->2, 0x17->3) with Apple's names for the amps.
+RL,FR,FL,RR

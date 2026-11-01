@@ -1,0 +1,269 @@
+From b03d1df5b2a1713478481407bbaef13540a719c4 Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:30:25 +0100
+Subject: [PATCH] Keyboard layout key
+
+Live = "Layout" shows the keyboard layout the helper reports
+(/run/tiny-dfr/bridge/layout: the active number, then the short names) as
+upper-case text. With Command = "Layout" a tap switches to the next layout
+on release ("layout next" to the helper; without it the key's Action, for
+example the layout toggle keys), and holding and sliding goes through the
+layouts on the key itself, one per 90 px, picking one on release
+("layout <n>"). The PNG preview shows a made-up layout.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ share/tiny-dfr/config.toml |  5 +++
+ src/config.rs              |  6 ++-
+ src/main.rs                | 78 +++++++++++++++++++++++++++++++++++---
+ src/state.rs               | 10 ++++-
+ 4 files changed, 92 insertions(+), 7 deletions(-)
+
+diff --git a/share/tiny-dfr/config.toml b/share/tiny-dfr/config.toml
+index 45e4ced..93102cf 100644
+--- a/share/tiny-dfr/config.toml
++++ b/share/tiny-dfr/config.toml
+@@ -88,6 +88,11 @@ FontTemplate = ":bold"
+ # with a track (/run/tiny-dfr/bridge/nowplaying); a tap opens a panel right of
+ # Esc: close, previous, play/pause, next, title, artist, time and a scrubber
+ # (dragging it seeks on release). Without the helper the three are media keys.
++# Command = "Layout" with Live = "Layout" (and a Text, shown until the helper
++# reports): the keyboard layout's short name; a tap switches to the next one
++# ("layout next" to the helper, else the key's Action, e.g. the layout toggle
++# keys), holding and sliding goes through the layouts on the key itself and
++# picks one on release ("layout <n>").
+ # PixelShiftSmooth = true   # false: one whole pixel every 10 s instead of a
+ #                           # 4 s animation (fewer frames); no shifting at all
+ #                           # while the bar is dark
+diff --git a/src/config.rs b/src/config.rs
+index b7ee0e1..5bd581b 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -52,6 +52,8 @@ pub enum Live {
+     Volume,
+     /// MicIcons: muted, on
+     Mic,
++    /// the keyboard layout's short name as text (no icons)
++    Layout,
+ }
+ 
+ /// Which slider a key opens when held and slid (Slider = ...)
+@@ -118,6 +120,8 @@ pub enum Command {
+     KeyboardSlider,
+     /// shown while a media player has a track; opens the now-playing panel
+     NowPlaying,
++    /// the keyboard layout: a tap the next one, held and slid a choice
++    Layout,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -352,7 +356,7 @@ fn load_config(width: u16) -> (Config, Vec<FunctionLayer>) {
+             let (list, n, key) = match b.live {
+                 Some(Live::Volume) => (&base.volume_icons, 4, "VolumeIcons"),
+                 Some(Live::Mic) => (&base.mic_icons, 2, "MicIcons"),
+-                None => continue,
++                Some(Live::Layout) | None => continue,
+             };
+             match list {
+                 Some(l) if l.len() == n => b.live_icons = l.clone(),
+diff --git a/src/main.rs b/src/main.rs
+index 159105e..c45fecc 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -63,6 +63,8 @@ use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
+ use slider::{Hit as SliderHit, Kind as SliderKind, Layout as SliderLayout, Mode as SliderMode, Slider};
+ 
+ pub const DEFAULT_ICON_SIZE: i32 = 48;
++// the layout key slid: one layout per this many px
++const LAYOUT_STEP_PX: f64 = 90.0;
+ // rows from config::load_config (the key sets of [AppSets] follow)
+ const ROW_FKEYS: usize = 0;
+ const ROW_STRIP_COLLAPSED: usize = 1;
+@@ -303,13 +305,13 @@ impl Button {
+                 .iter()
+                 .map(|name| try_load_image(name, cfg.theme.as_ref(), w, h).expect("failed to load icon"))
+                 .collect();
+-            // until the helper says otherwise: on / loudest
+-            let shown = images.len() - 1;
++            // until the helper says otherwise: on / loudest (Layout: no images)
++            let shown = images.len().saturating_sub(1);
+             (kind, images, shown)
+         });
+         let slide = cfg.slider;
+         let mut button = Button::from_image_config(cfg, icon_size);
+-        if let Some((_, images, shown)) = &live {
++        if let Some((_, images, shown)) = live.as_ref().filter(|l| !l.1.is_empty()) {
+             button.image = images[*shown].clone();
+             if let (ButtonImage::Svg(_), true) = (&button.image, button.icon_width == 0.0) {
+                 button.icon_width = icon_size as f64;
+@@ -674,6 +676,12 @@ impl Button {
+             }
+         }
+         let Some((kind, images, shown)) = &mut self.live else { return };
++        if *kind == Live::Layout {
++            if let Some((i, names)) = &st.layout {
++                self.show_layout(&names[*i]);
++            }
++            return;
++        }
+         let want = match kind {
+             Live::Volume => match st.volume {
+                 Some((_, true)) => 0,
+@@ -687,6 +695,7 @@ impl Button {
+                 Some(false) => 1,
+                 None => return,
+             },
++            Live::Layout => return,
+         };
+         if want != *shown && want < images.len() {
+             *shown = want;
+@@ -694,6 +703,14 @@ impl Button {
+             self.changed = true;
+         }
+     }
++    /// Show a layout's short name (upper case) as the key's text
++    fn show_layout(&mut self, name: &str) {
++        let text = name.to_uppercase();
++        if !matches!(&self.image, ButtonImage::Text(t) if *t == text) {
++            self.image = ButtonImage::Text(text);
++            self.changed = true;
++        }
++    }
+     /// 0 released .. 1 pressed, on the way while it fades
+     fn highlight(&self) -> f64 {
+         let target = if self.active { 1.0 } else { 0.0 };
+@@ -1032,10 +1049,14 @@ where
+ fn render_preview(path: &std::ffi::OsStr) {
+     let (width, height) = (2170u16, 60u16);
+     let (cfg, mut layers) = ConfigManager::new().load_config(width);
+-    // no helper here: no player, the now-playing key stays hidden
++    // no helper here: no player, the now-playing key stays hidden; the
++    // layout key shows a made-up layout
+     for layer in layers.iter_mut() {
+         for (_, b) in &mut layer.buttons {
+             b.hidden = b.command == Some(Command::NowPlaying);
++            if b.live.as_ref().is_some_and(|l| l.0 == Live::Layout) {
++                b.show_layout("ua");
++            }
+         }
+     }
+     let gap = 12;
+@@ -1482,6 +1503,9 @@ fn real_main(drm: &mut DrmBackend) {
+     // a slider button held but not slid yet: (touch slot, x at touch, kind,
+     // key deferred to the release: a key with Slider)
+     let mut pending: Option<(u32, f64, SliderKind, bool)> = None;
++    // the layout key held: (touch slot, x at touch, layout it started on,
++    // the one shown now if it is sliding)
++    let mut layout_hold: Option<(u32, f64, usize, Option<usize>)> = None;
+     let mut needs_complete_redraw = true;
+ 
+     let mut input_tb = Libinput::new_with_udev(Interface);
+@@ -1923,7 +1947,12 @@ fn real_main(drm: &mut DrmBackend) {
+                             if let Some(btn) = hit {
+                                 touches.insert(dn.seat_slot(), (active_layer, btn));
+                                 let button = &mut layers[active_layer].buttons[btn].1;
+-                                if let Some(kind) = button.slide.map(slide_kind) {
++                                if button.command == Some(Command::Layout) {
++                                    // tap: the next layout on release; slid: a choice
++                                    let start = session.layout.as_ref().map_or(0, |l| l.0);
++                                    layout_hold = Some((dn.seat_slot(), x, start, None));
++                                    button.set_highlight(true);
++                                } else if let Some(kind) = button.slide.map(slide_kind) {
+                                     // slid it opens the slider, tapped it sends its key on release
+                                     pending = Some((dn.seat_slot(), x, kind, true));
+                                     button.set_highlight(true);
+@@ -1961,6 +1990,21 @@ fn real_main(drm: &mut DrmBackend) {
+                                     }
+                                 }
+                             }
++                            if let Some((slot, x0, start, shown)) = layout_hold {
++                                if slot == mtn.seat_slot() {
++                                    let names = session.layout.as_ref().map(|l| l.1.clone()).unwrap_or_default();
++                                    if !names.is_empty() && (shown.is_some() || (x - x0).abs() > slider::DRAG_THRESHOLD_PX) {
++                                        let n = names.len() as i64;
++                                        let step = ((x - x0) / LAYOUT_STEP_PX).round() as i64;
++                                        let i = (start as i64 + step).rem_euclid(n) as usize;
++                                        layout_hold = Some((slot, x0, start, Some(i)));
++                                        if let Some(&(layer, btn)) = touches.get(&slot) {
++                                            layers[layer].buttons[btn].1.show_layout(&names[i]);
++                                        }
++                                    }
++                                    continue;
++                                }
++                            }
+                             // a held slider button slid sideways: slide its value
+                             if let Some((slot, x0, kind, deferred)) = pending {
+                                 if slot == mtn.seat_slot() && (x - x0).abs() > slider::DRAG_THRESHOLD_PX {
+@@ -2033,6 +2077,28 @@ fn real_main(drm: &mut DrmBackend) {
+                                     }
+                                 }
+                             }
++                            if let Some((slot, _, _, shown)) = layout_hold {
++                                if slot == up.seat_slot() {
++                                    layout_hold = None;
++                                    if let Some((layer, btn)) = touches.remove(&slot) {
++                                        let button = &mut layers[layer].buttons[btn].1;
++                                        let sent = match shown {
++                                            Some(i) => slider::bridge_send(&format!("layout {i}")),
++                                            None if button.active => slider::bridge_send("layout next"),
++                                            None => Ok(()),
++                                        };
++                                        // no helper: a tap is the layout toggle keys (Action)
++                                        if sent.is_err() && shown.is_none() {
++                                            toggle_keys(&mut uinput, &button.action, 1);
++                                            toggle_keys(&mut uinput, &button.action, 0);
++                                        }
++                                        button.set_highlight(false);
++                                        // the helper reports the real one; until then what it was
++                                        button.follow(&session);
++                                    }
++                                    continue;
++                                }
++                            }
+                             let deferred = pending.is_some_and(|p| p.0 == up.seat_slot() && p.3);
+                             if pending.is_some_and(|p| p.0 == up.seat_slot()) {
+                                 pending = None;
+@@ -2063,6 +2129,8 @@ fn real_main(drm: &mut DrmBackend) {
+                                     expanded = false;
+                                     strip_animate = true;
+                                 }
++                                // handled with layout_hold above
++                                Some(Command::Layout) => {}
+                                 Some(Command::NowPlaying) => {
+                                     media = Some(media::Panel::new());
+                                     slider = None;
+diff --git a/src/state.rs b/src/state.rs
+index f1a409b..9640609 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -18,6 +18,8 @@ pub struct State {
+     pub mic_muted: Option<bool>,
+     /// the media player the helper follows (MPRIS), if it has a track
+     pub playing: Option<NowPlaying>,
++    /// keyboard layouts: the active one and their short names
++    pub layout: Option<(usize, Vec<String>)>,
+ }
+ 
+ /// .../nowplaying: "key value" lines
+@@ -97,7 +99,13 @@ impl StateWatch {
+         let playing = read_to_string(format!("{DIR}/nowplaying"))
+             .ok()
+             .and_then(|s| NowPlaying::parse(&s));
+-        State { volume, mic_muted, playing }
++        let layout = read_to_string(format!("{DIR}/layout")).ok().and_then(|s| {
++            let mut lines = s.lines();
++            let index = lines.next()?.trim().parse::<usize>().ok()?;
++            let names: Vec<String> = lines.next()?.split_whitespace().map(str::to_string).collect();
++            (index < names.len()).then_some((index, names))
++        });
++        State { volume, mic_muted, playing, layout }
+     }
+     pub fn fd(&self) -> &impl AsFd {
+         &self.inotify_fd
+-- 
+2.53.0
+

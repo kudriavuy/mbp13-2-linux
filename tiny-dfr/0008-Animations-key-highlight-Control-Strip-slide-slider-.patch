@@ -1,0 +1,793 @@
+From 9dd6a06b27295c7014b064f0b022d2e9a2851f9b Mon Sep 17 00:00:00 2001
+From: kudriavuy <169286443+kudriavuy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 21:31:33 +0100
+Subject: [PATCH] Animations: key highlight, Control Strip slide, slider
+ growing
+
+With Animations = true (off by default):
+- a pressed key fades to ButtonActiveColor in 60 ms and back in 150 ms;
+  only that key is redrawn;
+- when Expand/Collapse changes the strip, the new row fades in while it
+  slides 160 px into place and the old one fades out, 200 ms; Esc stays;
+- a slider grows out of its button to SliderWidth in 150 ms, its contents
+  and the round close button fading in while the row behind it fades
+  out; closing (close button, a touch beside it, the timeout, the end of
+  a slide) runs it backwards in 120 ms.
+Keys are sent at once, never after an animation, and a new touch ends any
+animation at once. While something moves the loop wakes every 16 ms (a
+full frame takes about 11 ms on the T1); otherwise nothing changes. With
+animations off the bar is drawn exactly as before.
+
+The PNG preview shows frames of each animation, and the render timing a
+frame of the strip transition.
+
+Local patch for MacBookPro13,2 (T1), not from upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream: https://github.com/AsahiLinux/tiny-dfr (applies to 285faff8b8cae893e9babd673b904929dd6f7f9c)
+---
+ share/tiny-dfr/config.toml |   5 +
+ src/anim.rs                |  91 +++++++++++++++
+ src/config.rs              |   6 +
+ src/main.rs                | 234 ++++++++++++++++++++++++++++++++++---
+ src/slider.rs              |  71 +++++++++--
+ 5 files changed, 383 insertions(+), 24 deletions(-)
+ create mode 100644 src/anim.rs
+
+diff --git a/share/tiny-dfr/config.toml b/share/tiny-dfr/config.toml
+index fc15d2c..bf741ca 100644
+--- a/share/tiny-dfr/config.toml
++++ b/share/tiny-dfr/config.toml
+@@ -69,6 +69,11 @@ FontTemplate = ":bold"
+ # px apart (default ButtonSpacing) and that gap in SeparatorColor (default
+ # "#2b2b2b"); only the outer corners are round. Background = false: no box,
+ # only the icon (for a round icon such as a close button).
++# Animations = false   # true: a pressed key fades in (60 ms) and out (150 ms),
++#                      # the Control Strip slides in when expanded or collapsed
++#                      # (200 ms), a slider grows out of its button (150 ms) and
++#                      # shrinks back (120 ms). Keys go out at once; a new touch
++#                      # ends any animation.
+ # SeparatorColor = "#2c2c2c"
+ # JoinedSpacing = 4
+ 
+diff --git a/src/anim.rs b/src/anim.rs
+new file mode 100644
+index 0000000..0130989
+--- /dev/null
++++ b/src/anim.rs
+@@ -0,0 +1,91 @@
++// Short animations (Animations = true): a pressed key fades in and out, the
++// Control Strip slides in when expanded or collapsed, the slider grows out of
++// its button and shrinks back. The bar takes a full frame in about 11 ms
++// (USB, appletbdrm), so frames come at most every FRAME. Keys are sent at
++// once, never after an animation, and a new touch ends any animation.
++use cairo::{Context, Format, ImageSurface};
++use std::{
++    sync::atomic::{AtomicBool, Ordering},
++    time::{Duration, Instant},
++};
++
++pub const FRAME: Duration = Duration::from_millis(16);
++pub const PRESS_IN: Duration = Duration::from_millis(60);
++pub const PRESS_OUT: Duration = Duration::from_millis(150);
++pub const STRIP: Duration = Duration::from_millis(200);
++pub const SLIDER_OPEN: Duration = Duration::from_millis(150);
++pub const SLIDER_CLOSE: Duration = Duration::from_millis(120);
++// how far the new row of the strip travels while it fades in
++pub const STRIP_SLIDE_PX: f64 = 160.0;
++
++// set from the config; read where no config is at hand (Button::set_active)
++static ENABLED: AtomicBool = AtomicBool::new(false);
++
++pub fn set_enabled(on: bool) {
++    ENABLED.store(on, Ordering::Relaxed);
++}
++
++pub fn enabled() -> bool {
++    ENABLED.load(Ordering::Relaxed)
++}
++
++/// 0..1 of the way from `start` through `length`
++pub fn progress(start: Instant, length: Duration) -> f64 {
++    (start.elapsed().as_secs_f64() / length.as_secs_f64()).clamp(0.0, 1.0)
++}
++
++/// ease-out cubic: fast start, gentle stop
++pub fn ease(t: f64) -> f64 {
++    1.0 - (1.0 - t).powi(3)
++}
++
++pub fn lerp(a: f64, b: f64, t: f64) -> f64 {
++    a + (b - a) * t
++}
++
++pub fn lerp_color(a: (f64, f64, f64), b: (f64, f64, f64), t: f64) -> (f64, f64, f64) {
++    (lerp(a.0, b.0, t), lerp(a.1, b.1, t), lerp(a.2, b.2, t))
++}
++
++/// A copy of what is on the bar now (the row an animation starts from)
++pub fn snapshot(src: &ImageSurface) -> ImageSurface {
++    let copy = ImageSurface::create(Format::ARgb32, src.width(), src.height()).unwrap();
++    let c = Context::new(&copy).unwrap();
++    c.set_source_surface(src, 0.0, 0.0).unwrap();
++    c.paint().unwrap();
++    drop(c);
++    copy
++}
++
++/// The strip changing rows: the old row fades out, the new one fades in
++/// while it slides `STRIP_SLIDE_PX` into place; left of `fixed_until` (Esc)
++/// nothing moves. Surfaces are the bar's portrait framebuffer, so a shift
++/// along the bar is a shift in y.
++pub struct RowTransition {
++    pub start: Instant,
++    pub from: ImageSurface,
++    pub to: ImageSurface,
++    // +1: the new row comes from the right (expanding), -1 from the left
++    pub direction: f64,
++    pub fixed_until: f64,
++}
++
++impl RowTransition {
++    pub fn done(&self) -> bool {
++        progress(self.start, STRIP) >= 1.0
++    }
++    pub fn compose(&self, onto: &ImageSurface) {
++        let e = ease(progress(self.start, STRIP));
++        let c = Context::new(onto).unwrap();
++        c.set_source_surface(&self.to, 0.0, 0.0).unwrap();
++        c.paint().unwrap();
++        c.rectangle(0.0, self.fixed_until, onto.width() as f64, onto.height() as f64 - self.fixed_until);
++        c.clip();
++        c.set_source_rgb(0.0, 0.0, 0.0);
++        c.paint().unwrap();
++        c.set_source_surface(&self.from, 0.0, 0.0).unwrap();
++        c.paint_with_alpha(1.0 - e).unwrap();
++        c.set_source_surface(&self.to, 0.0, self.direction * (1.0 - e) * STRIP_SLIDE_PX).unwrap();
++        c.paint_with_alpha(e).unwrap();
++    }
++}
+diff --git a/src/config.rs b/src/config.rs
+index f2dc6d8..8d8a6a3 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -38,6 +38,7 @@ pub struct Config {
+     pub slider_width: f64,
+     pub slider_fill_color: (f64, f64, f64),
+     pub slider_track_color: (f64, f64, f64),
++    pub animations: bool,
+ }
+ 
+ /// What a button does inside tiny-dfr instead of (or besides) sending keys
+@@ -83,6 +84,7 @@ struct ConfigProxy {
+     slider_width: Option<u32>,
+     slider_fill_color: Option<String>,
+     slider_track_color: Option<String>,
++    animations: Option<bool>,
+ }
+ 
+ fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<Key>, D::Error>
+@@ -206,6 +208,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 3]) {
+         base.slider_width = user.slider_width.or(base.slider_width);
+         base.slider_fill_color = user.slider_fill_color.or(base.slider_fill_color);
+         base.slider_track_color = user.slider_track_color.or(base.slider_track_color);
++        base.animations = user.animations.or(base.animations);
+     };
+     let media_layer_keys = base.media_layer_keys.unwrap();
+     let primary_layer_keys = base.primary_layer_keys.unwrap();
+@@ -276,7 +279,10 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 3]) {
+         slider_width: base.slider_width.unwrap_or(720) as f64,
+         slider_fill_color: parse_color("SliderFillColor", base.slider_fill_color, (0.22, 0.5, 0.82)),
+         slider_track_color: parse_color("SliderTrackColor", base.slider_track_color, (0.45, 0.45, 0.45)),
++        // off unless asked for: the upstream behaviour
++        animations: base.animations.unwrap_or(false),
+     };
++    crate::anim::set_enabled(cfg.animations);
+     (cfg, layers)
+ }
+ 
+diff --git a/src/main.rs b/src/main.rs
+index 8e87521..b656e6a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -43,6 +43,7 @@ use std::{
+ };
+ use udev::MonitorBuilder;
+ 
++mod anim;
+ mod backlight;
+ mod config;
+ mod display;
+@@ -122,6 +123,8 @@ struct Button {
+     background: bool,
+     // low and high icon of its slider
+     slider_icons: Option<Box<(Button, Button)>>,
++    // animations: the highlight was this high when it started to change
++    fade: Option<(Instant, f64)>,
+ }
+ 
+ fn try_load_svg(path: &str) -> Result<ButtonImage> {
+@@ -329,6 +332,7 @@ impl Button {
+             joined: false,
+             background: true,
+             slider_icons: None,
++            fade: None,
+         }
+     }
+     fn new_text(text: String, action: Vec<Key>) -> Button {
+@@ -345,6 +349,7 @@ impl Button {
+             joined: false,
+             background: true,
+             slider_icons: None,
++            fade: None,
+         }
+     }
+     fn new_icon(
+@@ -369,6 +374,7 @@ impl Button {
+             joined: false,
+             background: true,
+             slider_icons: None,
++            fade: None,
+         }
+     }
+     fn load_battery_image(icon: &str, theme: Option<impl AsRef<str>>) -> Handle {
+@@ -428,6 +434,7 @@ impl Button {
+             joined: false,
+             background: true,
+             slider_icons: None,
++            fade: None,
+         }
+     }
+ 
+@@ -461,6 +468,7 @@ impl Button {
+             joined: false,
+             background: true,
+             slider_icons: None,
++            fade: None,
+         }
+     }
+     fn needs_faster_refresh(&self) -> bool {
+@@ -590,12 +598,37 @@ impl Button {
+         F: AsRawFd,
+     {
+         if self.active != active {
++            // the key goes out now; the highlight follows
++            if anim::enabled() {
++                self.fade = Some((Instant::now(), self.highlight()));
++            }
+             self.active = active;
+             self.changed = true;
+ 
+             toggle_keys(uinput, &self.action, active as i32);
+         }
+     }
++    /// 0 released .. 1 pressed, on the way while it fades
++    fn highlight(&self) -> f64 {
++        let target = if self.active { 1.0 } else { 0.0 };
++        match self.fade {
++            Some((start, from)) => {
++                let length = if self.active { anim::PRESS_IN } else { anim::PRESS_OUT };
++                anim::lerp(from, target, anim::ease(anim::progress(start, length)))
++            }
++            None => target,
++        }
++    }
++    /// One more frame of its fade: true while it still changes
++    fn step_fade(&mut self) -> bool {
++        let Some((start, _)) = self.fade else { return false };
++        let length = if self.active { anim::PRESS_IN } else { anim::PRESS_OUT };
++        self.changed = true;
++        if anim::progress(start, length) >= 1.0 {
++            self.fade = None;
++        }
++        true
++    }
+     fn set_background_color(&self, c: &Context, (r, g, b): (f64, f64, f64)) {
+         if let ButtonImage::Battery(battery, _, _) = &self.image {
+             let (_, state) = get_battery_state(battery);
+@@ -738,13 +771,12 @@ impl FunctionLayer {
+             let left_edge = geometry[i].0 + pixel_shift_x + (pixel_shift_width / 2) as f64;
+             let button_width = geometry[i].1;
+ 
+-            let color = if button.active {
+-                config.button_active_color
+-            } else if config.show_button_outlines {
++            let resting = if config.show_button_outlines {
+                 config.button_color
+             } else {
+                 (0.0, 0.0, 0.0)
+             };
++            let color = anim::lerp_color(resting, config.button_active_color, button.highlight());
+             if !complete_redraw {
+                 // the whole column: the icon may sit a pixel shift lower
+                 c.set_source_rgb(0.0, 0.0, 0.0);
+@@ -898,11 +930,22 @@ where
+ /// collapsed strip, expanded strip, the same with its second button pressed,
+ /// F-keys (without ControlStripKeys the first two are the same media row),
+ /// then the volume and brightness sliders (at 40 % and 70 %) if a button of
+-/// the collapsed strip opens them.
++/// the collapsed strip opens them. With Animations: frames at 30 % and 60 % of
++/// the strip expanding and of the volume slider opening, and a key half way
++/// through its highlight.
+ fn render_preview(path: &std::ffi::OsStr) {
+     let (width, height) = (2170u16, 60u16);
+     let (cfg, mut layers) = ConfigManager::new().load_config(width);
+     let gap = 12;
++    enum Frame {
++        Strip(f64),
++        Slider(f64),
++        Press,
++    }
++    let mut frames = Vec::new();
++    if cfg.animations {
++        frames = vec![Frame::Strip(0.3), Frame::Strip(0.6), Frame::Slider(0.3), Frame::Slider(0.6), Frame::Press];
++    }
+     let mut rows = vec![
+         (ROW_STRIP_COLLAPSED, None, None),
+         (ROW_STRIP_EXPANDED, None, None),
+@@ -917,6 +960,7 @@ fn render_preview(path: &std::ffi::OsStr) {
+         if let Some(btn) = source {
+             let mut s = Slider::new(kind, SliderMode::Tap { deadline: Instant::now() }, (ROW_STRIP_COLLAPSED, btn));
+             s.value = value;
++            s.backdate(anim::SLIDER_OPEN); // fully open
+             rows.push((ROW_STRIP_COLLAPSED, None, Some(s)));
+         }
+     }
+@@ -924,12 +968,13 @@ fn render_preview(path: &std::ffi::OsStr) {
+     let out = ImageSurface::create(
+         Format::ARgb32,
+         width as i32,
+-        rows.len() as i32 * (height as i32 + gap) - gap,
++        (rows.len() + frames.len()) as i32 * (height as i32 + gap) - gap,
+     )
+     .unwrap();
+     let c = Context::new(&out).unwrap();
+     c.set_source_rgb(0.5, 0.5, 0.5);
+     c.paint().unwrap();
++    let rows_len = rows.len();
+     for (row, (layer, pressed, slider)) in rows.into_iter().enumerate() {
+         for (i, (_, b)) in layers[layer].buttons.iter_mut().enumerate() {
+             b.active = Some(i) == pressed;
+@@ -938,6 +983,8 @@ fn render_preview(path: &std::ffi::OsStr) {
+         if let Some(s) = slider {
+             let layout = slider_layout(&cfg, &layers[layer], width, s.source.1);
+             let bc = Context::new(&bar).unwrap();
++            bc.set_source_rgb(0.0, 0.0, 0.0);
++            bc.paint().unwrap();
+             bc.translate(height as f64, 0.0);
+             bc.rotate((90.0f64).to_radians());
+             let icons = slider_icons(&layers[s.source.0].buttons[s.source.1].1);
+@@ -953,6 +1000,64 @@ fn render_preview(path: &std::ffi::OsStr) {
+         c.paint().unwrap();
+         c.restore().unwrap();
+     }
++    // animation frames, time moved back by hand
++    let shift = (0.0, 0.0);
++    let n_rows = rows_len;
++    for (i, frame) in frames.into_iter().enumerate() {
++        match frame {
++            Frame::Strip(t) => {
++                layers[ROW_STRIP_COLLAPSED].draw(&cfg, width as i32, height as i32, &bar, shift, true);
++                let from = anim::snapshot(&bar);
++                let to = ImageSurface::create(Format::ARgb32, height as i32, width as i32).unwrap();
++                layers[ROW_STRIP_EXPANDED].draw(&cfg, width as i32, height as i32, &to, shift, true);
++                let avail = width as f64 - pixel_shift_width(&cfg);
++                let (l, w) = layers[ROW_STRIP_EXPANDED].geometry(&cfg, avail)[0];
++                let tr = anim::RowTransition {
++                    start: Instant::now() - anim::STRIP.mul_f64(t),
++                    from,
++                    to,
++                    direction: 1.0,
++                    fixed_until: l + w + pixel_shift_width(&cfg) / 2.0 + cfg.group_spacing / 2.0,
++                };
++                tr.compose(&bar);
++            }
++            Frame::Slider(t) => {
++                layers[ROW_STRIP_COLLAPSED].draw(&cfg, width as i32, height as i32, &bar, shift, true);
++                let backdrop = anim::snapshot(&bar);
++                let Some(btn) = layers[ROW_STRIP_COLLAPSED].buttons.iter().position(|(_, b)| b.command == Some(Command::VolumeSlider)) else { continue };
++                let mut s = Slider::new(SliderKind::Volume, SliderMode::Tap { deadline: Instant::now() }, (ROW_STRIP_COLLAPSED, btn));
++                s.value = 0.4;
++                s.backdate(anim::SLIDER_OPEN.mul_f64(t));
++                let bc = Context::new(&bar).unwrap();
++                bc.set_source_rgb(0.0, 0.0, 0.0);
++                bc.paint().unwrap();
++                bc.set_source_surface(&backdrop, 0.0, 0.0).unwrap();
++                bc.paint_with_alpha(1.0 - s.level()).unwrap();
++                bc.translate(height as f64, 0.0);
++                bc.rotate((90.0f64).to_radians());
++                let layout = slider_layout(&cfg, &layers[ROW_STRIP_COLLAPSED], width, btn);
++                let icons = slider_icons(&layers[ROW_STRIP_COLLAPSED].buttons[btn].1);
++                s.draw(&bc, &cfg, &layout, (width as f64, height as f64), (pixel_shift_width(&cfg) / 2.0, 0.0), true, icons);
++            }
++            Frame::Press => {
++                for (_, b) in layers[ROW_STRIP_EXPANDED].buttons.iter_mut() {
++                    b.active = false;
++                    b.fade = None;
++                }
++                let b = &mut layers[ROW_STRIP_EXPANDED].buttons[2].1;
++                b.active = true;
++                b.fade = Some((Instant::now() - anim::PRESS_IN.mul_f64(0.5), 0.0));
++                layers[ROW_STRIP_EXPANDED].draw(&cfg, width as i32, height as i32, &bar, shift, true);
++            }
++        }
++        bar.flush();
++        c.save().unwrap();
++        let y0 = ((n_rows + i) as i32 * (height as i32 + gap)) as f64;
++        c.transform(cairo::Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, y0 + height as f64));
++        c.set_source_surface(&bar, 0.0, 0.0).unwrap();
++        c.paint().unwrap();
++        c.restore().unwrap();
++    }
+     drop(c);
+     out.write_to_png(&mut File::create(path).unwrap()).unwrap();
+     // TINY_DFR_RENDER_BENCH=<n>: time n frames of each kind (drawing and the
+@@ -982,8 +1087,19 @@ fn render_preview(path: &std::ffi::OsStr) {
+             b.changed = true;
+             layers[ROW_STRIP_EXPANDED].draw(&cfg, width as i32, height as i32, &bar, (0.0, 0.0), false);
+         });
++        {
++            layers[ROW_STRIP_COLLAPSED].draw(&cfg, width as i32, height as i32, &bar, (0.0, 0.0), true);
++            let from = anim::snapshot(&bar);
++            let to = ImageSurface::create(Format::ARgb32, height as i32, width as i32).unwrap();
++            layers[ROW_STRIP_EXPANDED].draw(&cfg, width as i32, height as i32, &to, (0.0, 0.0), true);
++            let tr = anim::RowTransition { start: Instant::now(), from, to, direction: 1.0, fixed_until: 150.0 };
++            time!("strip transition frame", {
++                tr.compose(&bar);
++            });
++        }
+         if let Some(btn) = layers[ROW_STRIP_COLLAPSED].buttons.iter().position(|(_, b)| b.command == Some(Command::VolumeSlider)) {
+             let mut s = Slider::new(SliderKind::Volume, SliderMode::Tap { deadline: Instant::now() }, (ROW_STRIP_COLLAPSED, btn));
++            s.backdate(anim::SLIDER_OPEN); // fully open
+             let layout = slider_layout(&cfg, &layers[ROW_STRIP_COLLAPSED], width, btn);
+             let icons = slider_icons(&layers[ROW_STRIP_COLLAPSED].buttons[btn].1);
+             let shift = (pixel_shift_width(&cfg) / 2.0, 0.0);
+@@ -991,6 +1107,10 @@ fn render_preview(path: &std::ffi::OsStr) {
+                 time!(name, {
+                     s.value = (s.value + 0.013) % 1.0;
+                     let bc = Context::new(&bar).unwrap();
++                    if full {
++                        bc.set_source_rgb(0.0, 0.0, 0.0);
++                        bc.paint().unwrap();
++                    }
+                     bc.translate(height as f64, 0.0);
+                     bc.rotate((90.0f64).to_radians());
+                     s.draw(&bc, &cfg, &layout, (width as f64, height as f64), shift, full, icons);
+@@ -1122,6 +1242,11 @@ fn real_main(drm: &mut DrmBackend) {
+     let mut active_layer = row(base_is_media, fn_held, expanded);
+     let mut slider: Option<Slider> = None;
+     let mut slider_dirty = false;
++    // animations: the row under a slider as it opened (fades out behind it),
++    // the strip changing rows, and whether the next row change is the strip's
++    let mut slider_backdrop: Option<ImageSurface> = None;
++    let mut transition: Option<anim::RowTransition> = None;
++    let mut strip_animate = false;
+     // a slider button held but not slid yet: (touch slot, x at touch, kind)
+     let mut pending: Option<(u32, f64, SliderKind)> = None;
+     let mut needs_complete_redraw = true;
+@@ -1191,6 +1316,7 @@ fn real_main(drm: &mut DrmBackend) {
+             check_layer = true;
+             slider = None;
+             pending = None;
++            transition = None;
+         }
+         if layer_switch.changed() || check_layer {
+             check_layer = false;
+@@ -1209,22 +1335,50 @@ fn real_main(drm: &mut DrmBackend) {
+         if wanted_row != active_layer {
+             active_layer = wanted_row;
+             needs_complete_redraw = true;
++            transition = None;
+             // a slider belongs to the row it was opened on
+             if let Some(mut s) = slider.take() {
+                 apply_slider(&mut s, &mut uinput, true);
++            } else if strip_animate && anim::enabled() {
++                // the strip expanded or collapsed: slide the new row in
++                let shift = if cfg.enable_pixel_shift { pixel_shift.get() } else { (0.0, 0.0) };
++                let to = ImageSurface::create(Format::ARgb32, db_width as i32, db_height as i32).unwrap();
++                layers[active_layer].draw(&cfg, width as i32, height as i32, &to, shift, true);
++                let fixed_until = if width >= 2170 {
++                    let avail = width as f64 - pixel_shift_width(&cfg);
++                    let (l, w) = layers[active_layer].geometry(&cfg, avail)[0];
++                    l + w + pixel_shift_width(&cfg) / 2.0 + shift.0 + cfg.group_spacing / 2.0
++                } else {
++                    0.0
++                };
++                transition = Some(anim::RowTransition {
++                    start: Instant::now(),
++                    from: anim::snapshot(&surface),
++                    to,
++                    direction: if active_layer == ROW_STRIP_EXPANDED { 1.0 } else { -1.0 },
++                    fixed_until,
++                });
++                needs_complete_redraw = false;
+             }
++            slider_backdrop = None;
+             pending = None;
+         }
++        strip_animate = false;
+         // a tapped slider closes after SliderTimeout without a touch
+         if let Some(s) = &mut slider {
+             if let SliderMode::Tap { deadline } = s.mode {
+-                if s.slot.is_none() && Instant::now() >= deadline {
++                if s.slot.is_none() && s.closing.is_none() && Instant::now() >= deadline {
+                     apply_slider(s, &mut uinput, true);
+-                    slider = None;
+-                    needs_complete_redraw = true;
++                    s.closing = Some(Instant::now());
+                 }
+             }
+         }
++        // closed (at once, or after shrinking): the row comes back
++        if slider.as_ref().is_some_and(|s| s.closing.is_some() && s.closed()) {
++            slider = None;
++            slider_backdrop = None;
++            needs_complete_redraw = true;
++        }
+         if let Some(s) = &mut slider {
+             apply_slider(s, &mut uinput, false);
+         }
+@@ -1271,8 +1425,27 @@ fn real_main(drm: &mut DrmBackend) {
+             }
+         }
+ 
++        // fading keys: one more frame each
++        let mut fading = false;
++        for (_, b) in &mut layers[active_layer].buttons {
++            fading |= b.step_fade();
++        }
++        if let Some(t) = &transition {
++            if t.done() {
++                transition = None;
++                needs_complete_redraw = true;
++            } else {
++                t.compose(&surface);
++                let data = surface.data().unwrap();
++                drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
++                drm.dirty(&[ClipRect::new(0, 0, height, width)]).unwrap();
++            }
++        }
++        let slider_moving = slider.as_ref().is_some_and(|s| s.animating());
+         let layer_changed = layers[active_layer].buttons.iter().any(|b| b.1.changed);
+-        if needs_complete_redraw || layer_changed || (slider.is_some() && slider_dirty) {
++        if transition.is_some() {
++            // the transition frame is on the bar; keys under it wait for its end
++        } else if needs_complete_redraw || layer_changed || (slider.is_some() && (slider_dirty || slider_moving)) {
+             let shift = if cfg.enable_pixel_shift {
+                 pixel_shift.get()
+             } else {
+@@ -1294,11 +1467,21 @@ fn real_main(drm: &mut DrmBackend) {
+             if let Some(s) = &slider {
+                 let layout = slider_layout(&cfg, &layers[s.source.0], width, s.source.1);
+                 let sx = shift.0 + pixel_shift_width(&cfg) / 2.0;
++                let full = needs_complete_redraw || layer_changed || slider_moving;
++                if full {
++                    // dark around it; while it opens or closes the row shows through
++                    let c = Context::new(&surface).unwrap();
++                    c.set_source_rgb(0.0, 0.0, 0.0);
++                    c.paint().unwrap();
++                    if let (Some(bd), true) = (&slider_backdrop, slider_moving) {
++                        c.set_source_surface(bd, 0.0, 0.0).unwrap();
++                        c.paint_with_alpha(1.0 - s.level()).unwrap();
++                    }
++                }
+                 let c = Context::new(&surface).unwrap();
+                 c.translate(height as f64, 0.0);
+                 c.rotate((90.0f64).to_radians());
+                 let icons = slider_icons(&layers[s.source.0].buttons[s.source.1].1);
+-                let full = needs_complete_redraw || layer_changed;
+                 s.draw(&c, &cfg, &layout, (width as f64, height as f64), (sx, shift.1), full, icons);
+                 drop(c);
+                 if !full {
+@@ -1317,6 +1500,10 @@ fn real_main(drm: &mut DrmBackend) {
+             needs_complete_redraw = false;
+         }
+ 
++        // animating: come back for the next frame
++        if fading || transition.is_some() || slider.as_ref().is_some_and(|s| s.animating()) {
++            next_timeout_ms = min(next_timeout_ms, anim::FRAME.as_millis() as i32);
++        }
+         match epoll.wait(
+             &mut [EpollEvent::new(EpollFlags::EPOLLIN, 0)],
+             next_timeout_ms as u16,
+@@ -1359,14 +1546,22 @@ fn real_main(drm: &mut DrmBackend) {
+                         TouchEvent::Down(dn) => {
+                             let x = dn.x_transformed(width as u32);
+                             let y = dn.y_transformed(height as u32);
++                            // a new touch ends what is still moving
++                            if transition.take().is_some() {
++                                needs_complete_redraw = true;
++                            }
++                            if slider.as_ref().is_some_and(|s| s.closing.is_some()) {
++                                slider = None;
++                                slider_backdrop = None;
++                                needs_complete_redraw = true;
++                            }
+                             if let Some(s) = &mut slider {
+                                 let layout = slider_layout(&cfg, &layers[s.source.0], width, s.source.1);
+                                 match layout.hit(x - half_shift) {
+                                     // as on macOS a touch beside it closes it too
+                                     SliderHit::Close | SliderHit::Outside => {
+                                         apply_slider(s, &mut uinput, true);
+-                                        slider = None;
+-                                        needs_complete_redraw = true;
++                                        s.closing = Some(Instant::now());
+                                         continue;
+                                     }
+                                     SliderHit::Track => {
+@@ -1421,6 +1616,7 @@ fn real_main(drm: &mut DrmBackend) {
+                                     let layout = slider_layout(&cfg, &layers[layer], width, btn);
+                                     s.value = (s.value + (x - x0) / layout.track_len()).clamp(0.0, 1.0);
+                                     slider = Some(s);
++                                    slider_backdrop = Some(anim::snapshot(&surface));
+                                     needs_complete_redraw = true;
+                                     continue;
+                                 }
+@@ -1443,8 +1639,7 @@ fn real_main(drm: &mut DrmBackend) {
+                                     match s.mode {
+                                         // held and slid: back to the buttons
+                                         SliderMode::Drag { .. } => {
+-                                            slider = None;
+-                                            needs_complete_redraw = true;
++                                            s.closing = Some(Instant::now());
+                                         }
+                                         SliderMode::Tap { .. } => {
+                                             s.mode = SliderMode::Tap {
+@@ -1467,13 +1662,20 @@ fn real_main(drm: &mut DrmBackend) {
+                             let command = button.command.filter(|_| button.active);
+                             button.set_active(&mut uinput, false);
+                             match command {
+-                                Some(Command::Expand) => expanded = true,
+-                                Some(Command::Collapse) => expanded = false,
++                                Some(Command::Expand) => {
++                                    expanded = true;
++                                    strip_animate = true;
++                                }
++                                Some(Command::Collapse) => {
++                                    expanded = false;
++                                    strip_animate = true;
++                                }
+                                 Some(Command::VolumeSlider | Command::BrightnessSlider) => {
+                                     // a tap: open it for SliderTimeout
+                                     let kind = slider_kind(command).unwrap();
+                                     let deadline = Instant::now() + cfg.slider_timeout;
+                                     slider = Some(Slider::new(kind, SliderMode::Tap { deadline }, (layer, btn)));
++                                    slider_backdrop = Some(anim::snapshot(&surface));
+                                     needs_complete_redraw = true;
+                                 }
+                                 None => {}
+diff --git a/src/slider.rs b/src/slider.rs
+index 199ec99..9499882 100644
+--- a/src/slider.rs
++++ b/src/slider.rs
+@@ -10,7 +10,7 @@
+ // through the FIFO /run/tiny-dfr/bridge/cmd, which sets it the way the desktop
+ // does (PulseAudio volume of the default sink, KDE screen brightness). Without
+ // the helper tiny-dfr falls back to volume/brightness keys.
+-use crate::{config::Config, Button};
++use crate::{anim, config::Config, Button};
+ use cairo::Context;
+ use std::{
+     fs::{self, OpenOptions},
+@@ -91,6 +91,9 @@ pub struct Slider {
+     last_send: Option<Instant>,
+     // key fallback: the value the keys have reached so far
+     keys_value: f64,
++    // when it opened, and when it started closing (animations)
++    opened: Instant,
++    pub closing: Option<Instant>,
+ }
+ 
+ impl Layout {
+@@ -174,11 +177,39 @@ impl Slider {
+             sent_value: Some(value),
+             last_send: None,
+             keys_value: value,
++            opened: Instant::now(),
++            closing: None,
+         }
+     }
+ 
+-    /// `full`: the whole bar (when it opens), else only the capsule.
+-    /// `icons`: low and high icon (the button's own icon if it has no pair).
++    /// Pretend it opened `ago` earlier (PNG preview of the animation)
++    pub fn backdate(&mut self, ago: Duration) {
++        self.opened -= ago;
++    }
++
++    /// How far open, 0..1: grows after opening, shrinks while closing
++    pub fn level(&self) -> f64 {
++        if !anim::enabled() {
++            return 1.0;
++        }
++        match self.closing {
++            Some(t) => 1.0 - anim::ease(anim::progress(t, anim::SLIDER_CLOSE)),
++            None => anim::ease(anim::progress(self.opened, anim::SLIDER_OPEN)),
++        }
++    }
++    pub fn animating(&self) -> bool {
++        anim::enabled()
++            && (self.closing.is_some() || anim::progress(self.opened, anim::SLIDER_OPEN) < 1.0)
++    }
++    /// Closed to nothing: drop it now
++    pub fn closed(&self) -> bool {
++        !anim::enabled() || self.closing.is_some_and(|t| anim::progress(t, anim::SLIDER_CLOSE) >= 1.0)
++    }
++
++    /// `full`: the bar around it was cleared (the close button is drawn too),
++    /// else only the capsule. `icons`: low and high icon (the button's own icon
++    /// if it has no pair). While it opens or closes (`level` < 1) the capsule
++    /// grows from the button's width and its contents fade in.
+     pub fn draw(
+         &self,
+         c: &Context,
+@@ -195,12 +226,17 @@ impl Slider {
+             height * 0.7
+         };
+         let top = (height - button_height) / 2.0;
+-        c.set_source_rgb(0.0, 0.0, 0.0);
++        let level = self.level();
++        // fading needs a group; when fully open draw straight (the same pixels as without animations)
++        let grouped = level < 1.0;
++        let _ = width;
+         if full {
+-            c.paint().unwrap();
+             // the round close button where the slider button was
+             let cx = layout.close.0 + layout.close.1 / 2.0 + sx;
+             let cy = height / 2.0;
++            if grouped {
++                c.push_group();
++            }
+             c.set_source_rgb(CLOSE_COLOR, CLOSE_COLOR, CLOSE_COLOR);
+             c.arc(cx, cy, CLOSE_DIAMETER / 2.0, 0.0, std::f64::consts::TAU);
+             c.fill().unwrap();
+@@ -213,16 +249,30 @@ impl Slider {
+             c.move_to(cx + arm, cy - arm);
+             c.line_to(cx - arm, cy + arm);
+             c.stroke().unwrap();
++            if grouped {
++                c.pop_group_to_source().unwrap();
++                c.paint_with_alpha(level).unwrap();
++            }
+         } else {
++            c.set_source_rgb(0.0, 0.0, 0.0);
+             c.rectangle(layout.left + sx - 1.0, 0.0, layout.right - layout.left + 2.0, height);
+             c.fill().unwrap();
+         }
+-        let _ = width;
+-        // capsule
++        // capsule, grown from the button's width while opening
++        let full_width = layout.right - layout.left;
++        let width_now = anim::lerp(layout.close.1.min(full_width), full_width, level);
++        let left_now = layout.right - width_now;
+         let (r, g, b) = cfg.button_color;
+         c.set_source_rgb(r, g, b);
+-        rounded_rect(c, layout.left + sx, top, layout.right - layout.left, button_height, cfg.button_radius);
++        rounded_rect(c, left_now + sx, top, width_now, button_height, cfg.button_radius);
+         c.fill().unwrap();
++        // the contents only inside the capsule as it is now, fading in
++        c.save().unwrap();
++        c.rectangle(left_now + sx, 0.0, width_now, height);
++        c.clip();
++        if grouped {
++            c.push_group();
++        }
+         // icons: low left of the track, high right of it
+         c.set_source_rgb(1.0, 1.0, 1.0);
+         if let Some(low) = icons.0 {
+@@ -244,6 +294,11 @@ impl Slider {
+         c.set_source_rgb(1.0, 1.0, 1.0);
+         rounded_rect(c, knob_x - KNOB_WIDTH / 2.0, top, KNOB_WIDTH, button_height, KNOB_RADIUS);
+         c.fill().unwrap();
++        if grouped {
++            c.pop_group_to_source().unwrap();
++            c.paint_with_alpha(level * level).unwrap();
++        }
++        c.restore().unwrap();
+     }
+ 
+     /// Hand the value to the helper, at most every SEND_INTERVAL unless
+-- 
+2.53.0
+

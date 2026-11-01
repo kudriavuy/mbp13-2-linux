@@ -1,0 +1,87 @@
+#!/bin/bash
+# Built-in Wi-Fi (BCM43602) of the MacBookPro13,2: board NVRAM from the
+# chip's own SROM.
+#
+#   mbp-wifi nvram     read the SROM (read-only), build the NVRAM, reload brcmfmac
+#   mbp-wifi remove    delete the board NVRAM, reload brcmfmac (back to stock)
+#   mbp-wifi status
+#
+# Reloading brcmfmac drops the Wi-Fi link for a few seconds: over SSH run it
+# detached, e.g. sudo systemd-run --unit=mbp-wifi-nvram /usr/local/bin/mbp-wifi nvram
+#
+# Why the NVRAM is generated here and not shipped: it carries this board's
+# MAC address and calibration data. The recipe (w1.recipe) says which values
+# come from the SROM and which are fixed; README.md explains the fixed ones.
+# The fixed values were tuned on a MacBookPro13,2 only: other models are
+# refused (MBP_FORCE_MODEL=1 overrides, at your own risk).
+set -uo pipefail
+
+LIB=/usr/local/lib/mbp-wifi
+STATE=/var/lib/mbp-wifi
+BOARD="/lib/firmware/brcm/brcmfmac43602-pcie.Apple Inc.-MacBookPro13,2.txt"
+
+# under systemd stdout already goes to the journal
+log() { [[ -n ${INVOCATION_ID:-} ]] || echo "mbp-wifi: $*"; logger -t mbp-wifi -- "$*" 2>/dev/null || true; }
+die() { log "ERROR: $*"; exit 1; }
+model() { cat /sys/class/dmi/id/product_name 2>/dev/null || echo unknown; }
+[[ ${1:-status} == status ]] || [[ $EUID -eq 0 ]] || die "run as root"
+
+pcidev() {
+	local d
+	for d in /sys/bus/pci/devices/*; do
+		[[ $(cat "$d/vendor") == 0x14e4 && $(cat "$d/device") == 0x43ba ]] && { basename "$d"; return 0; }
+	done
+	return 1
+}
+
+unload_brcmfmac() {
+	local _
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		modprobe -r brcmfmac_wcc brcmfmac 2>/dev/null && return 0
+		sleep 1
+	done
+	return 1
+}
+
+cmd_nvram() {
+	local dev new
+	[[ $(model) == MacBookPro13,2 || ${MBP_FORCE_MODEL:-} == 1 ]] ||
+		die "this is a $(model): the NVRAM recipe is tuned for a MacBookPro13,2 only (MBP_FORCE_MODEL=1 to try anyway)"
+	dev=$(pcidev) || die "no BCM43602 (14e4:43ba) on PCI"
+	install -d -m700 "$STATE"
+	unload_brcmfmac || die "cannot unload brcmfmac"
+	python3 -I "$LIB/read_srom.py" "$dev" "$STATE/srom.bin.new" || { modprobe brcmfmac; die "SROM read failed"; }
+	new=$(mktemp)
+	if ! python3 -I "$LIB/mknvram.py" "$STATE/srom.bin.new" "$LIB/w1.recipe" > "$new"; then
+		rm -f "$new"; modprobe brcmfmac; die "NVRAM not generated, nothing installed"
+	fi
+	if [[ -e $STATE/srom.bin ]] && ! cmp -s "$STATE/srom.bin" "$STATE/srom.bin.new"; then
+		log "note: SROM image differs from the previous read ($STATE/srom.bin kept as srom.bin.old)"
+		mv "$STATE/srom.bin" "$STATE/srom.bin.old"
+	fi
+	mv "$STATE/srom.bin.new" "$STATE/srom.bin"
+	install -m644 "$new" "$BOARD" && rm -f "$new"
+	log "installed $BOARD ($(grep -vc '^#' "$BOARD") variables)"
+	modprobe brcmfmac
+}
+
+cmd_remove() {
+	[[ -e $BOARD ]] || { log "no board NVRAM installed"; return 0; }
+	unload_brcmfmac || die "cannot unload brcmfmac"
+	rm -f "$BOARD"
+	log "removed $BOARD: brcmfmac runs on the firmware's reference data again"
+	modprobe brcmfmac
+}
+
+cmd_status() {
+	echo "model:       $(model)"
+	echo "board NVRAM: $([[ -s $BOARD ]] && echo "installed ($(stat -c %y "$BOARD"))" || echo none)"
+	nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device | grep ':wifi:' || true
+}
+
+case "${1:-status}" in
+nvram) cmd_nvram ;;
+remove) cmd_remove ;;
+status) cmd_status ;;
+*) die "usage: mbp-wifi nvram|remove|status" ;;
+esac
